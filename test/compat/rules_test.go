@@ -394,10 +394,10 @@ func TestDroppedIndexGoesToSlowLane(t *testing.T) {
 func TestForcedGenericPlanGoesToSlowLane(t *testing.T) {
 	var logs lockedBuffer
 	conn := startFlipProxy(t, &logs).connect(t, "sslmode=disable")
-	// Ten rows in a million are rare: the plan for 'rare' uses the index, while one for any value reads the table in full.
-	// The filler makes reading it in full take over 100ms, long enough for a slow run to count.
-	mustExec(t, conn, "create temp table qg_skew as select g as id, case when g % 100000 = 0 then 'rare' else 'common' end as kind, "+
-		"repeat('x', 400) as filler from generate_series(1, 1000000) g")
+	// Forty rows in four million are rare: the plan for 'rare' uses the index, while one for any value reads the table in
+	// full, comparing every row's kind, which takes well over the 100ms a slow run needs, even on a fast machine.
+	mustExec(t, conn, "create temp table qg_skew as select g as id, case when g % 100000 = 0 then 'rare' else 'common' end as kind "+
+		"from generate_series(1, 4000000) g")
 	mustExec(t, conn, "create index on qg_skew (kind)")
 	// ANALYZE reads every row, so it always finds the rare value, and the column is said to hold one value, as a sample of it
 	// usually says, so a plan for any value expects nearly every row.
@@ -405,8 +405,8 @@ func TestForcedGenericPlanGoesToSlowLane(t *testing.T) {
 	mustExec(t, conn, "analyze qg_skew")
 	count := func() {
 		var n int
-		if err := conn.QueryRow(t.Context(), "select count(*) from qg_skew where kind = $1", "rare").Scan(&n); err != nil || n != 10 {
-			t.Fatalf("count = %d, %v; want 10", n, err)
+		if err := conn.QueryRow(t.Context(), "select count(*) from qg_skew where kind = $1", "rare").Scan(&n); err != nil || n != 40 {
+			t.Fatalf("count = %d, %v; want 40", n, err)
 		}
 	}
 	for range 5 {
