@@ -55,7 +55,7 @@ func TestParseRejects(t *testing.T) {
 
 func TestCacheExplainsOnceUntilTTL(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		c := &Cache{TTL: time.Minute}
+		c := &Cache{TTL: time.Minute, RefreshOneIn: -1}
 		calls := 0
 		explain := func() (Plan, error) {
 			calls++
@@ -77,6 +77,23 @@ func TestCacheExplainsOnceUntilTTL(t *testing.T) {
 			t.Errorf("Stats = %+v; want %+v", got, want)
 		}
 	})
+}
+
+func TestCacheExplainsSomeHitsAgain(t *testing.T) {
+	c := &Cache{RefreshOneIn: 1}
+	calls := 0
+	explain := func() (Plan, error) { calls++; return Plan{Cost: float64(calls)}, nil }
+
+	got := []float64{}
+	for range 4 {
+		p, _ := c.Get("a", explain)
+		got = append(got, p.Cost)
+	}
+
+	// One in one explains every hit again.
+	if !slices.Equal(got, []float64{1, 2, 3, 4}) || c.Stats().Misses != 4 {
+		t.Errorf("costs %v, stats %+v; want 1 2 3 4 from 4 explains", got, c.Stats())
+	}
 }
 
 func TestCacheKeepsNoFailures(t *testing.T) {

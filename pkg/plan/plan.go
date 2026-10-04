@@ -7,6 +7,7 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"log/slog"
+	"math/rand/v2"
 	"slices"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 // Defaults used when the matching field is zero.
 const (
 	DefaultTTL             = time.Minute
+	DefaultRefreshOneIn    = 100
 	DefaultSize            = 10_000
 	DefaultCatalogInterval = time.Minute
 )
@@ -76,8 +78,9 @@ func Parse(out string) (Plan, error) {
 
 // Cache keeps plans by key for TTL, so a statement seen recently isn't explained again; it is safe for concurrent use.
 type Cache struct {
-	TTL  time.Duration // how long a plan is used before the statement is explained again; 0 means DefaultTTL
-	Size int           // the most plans kept; 0 means DefaultSize
+	TTL          time.Duration // how long a plan is used before the statement is explained again; 0 means DefaultTTL
+	Size         int           // the most plans kept; 0 means DefaultSize
+	RefreshOneIn int           // explain about one hit in this many again, catching plans that change early; 0 means DefaultRefreshOneIn, negative never
 
 	mu      sync.Mutex
 	entries map[string]entry
@@ -100,7 +103,8 @@ type Stats struct {
 func (c *Cache) Get(key string, explain func() (Plan, error)) (Plan, error) {
 	c.mu.Lock()
 	e, ok := c.entries[key]
-	if ok && time.Now().Before(e.expires) {
+	// Explaining a small share of hits again catches a plan that changed before its entry expires.
+	if ok && time.Now().Before(e.expires) && !c.refreshNow() {
 		c.stats.Hits++
 		c.mu.Unlock()
 		return e.plan, nil
@@ -128,6 +132,11 @@ func (c *Cache) Get(key string, explain func() (Plan, error)) (Plan, error) {
 	}
 	c.entries[key] = entry{p, time.Now().Add(cmp.Or(c.TTL, DefaultTTL))}
 	return p, nil
+}
+
+// refreshNow says whether to explain a cached statement again.
+func (c *Cache) refreshNow() bool {
+	return c.RefreshOneIn >= 0 && rand.N(cmp.Or(c.RefreshOneIn, DefaultRefreshOneIn)) == 0
 }
 
 // evict drops expired plans, or, when none has expired, an arbitrary one; the caller holds mu.
