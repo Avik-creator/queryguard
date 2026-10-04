@@ -5,8 +5,9 @@ speaks the Postgres wire protocol. It estimates what each query will cost before
 it runs and gives every tenant a budget, so one tenant's expensive queries can't
 starve everyone else.
 
-> **Status:** early development (milestone M1). QueryGuard relays sessions,
-> cancel requests and TLS, but does not estimate or limit anything yet.
+> **Status:** early development. Milestone M1, a transparent proxy, is done:
+> QueryGuard relays sessions, cancel requests and TLS, but does not estimate
+> or limit anything yet.
 
 ## Planned features
 
@@ -84,6 +85,25 @@ all three versions:
 
 Every client also checks that its cancel key is the proxy's own, not the
 server's.
+
+## Overhead
+
+`make overhead` times 5,000 runs of each query straight to PostgreSQL and
+through QueryGuard. Ranges are over three runs on an Apple M1, with
+PostgreSQL 18 in Docker (OrbStack) and the proxy in the benchmark's process:
+
+| Query | Path | p50 | p99 |
+| --- | --- | --- | --- |
+| `select 1` | direct | 116–138 µs | 190–437 µs |
+| `select 1` | QueryGuard | 156–159 µs | 240–244 µs |
+| `select 1` | QueryGuard, TLS from the client | 153–158 µs | 219–257 µs |
+| 1,000 rows (about 50 KB) | direct | 933–936 µs | 1,197–1,324 µs |
+| 1,000 rows (about 50 KB) | QueryGuard | 1,043–1,106 µs | 1,318–1,462 µs |
+| 1,000 rows (about 50 KB) | QueryGuard, TLS from the client | 1,030–1,088 µs | 1,293–1,460 µs |
+
+The proxy adds about 20–40 µs to a round trip at p50, and 11–18% to the
+1,000-row result. TLS from the client adds nothing measurable here. These are
+laptop numbers; the full benchmark matrix comes with v1.0.
 
 ## License
 

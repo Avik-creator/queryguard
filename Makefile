@@ -8,7 +8,7 @@ PG ?= 18
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build test compat vet up down reset certs clean
+.PHONY: help build test compat overhead vet up down reset certs clean
 
 help: ## List the available targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-8s %s\n", $$1, $$2}'
@@ -21,6 +21,9 @@ test: ## Run the tests with the race detector
 
 compat: ## Run real clients through the proxy against Postgres (PG=16, 17 or 18; default 18)
 	QG_TEST_UPSTREAM=127.0.0.1:54$(PG) go test -race -count=1 ./test/compat/
+
+overhead: ## Measure p50/p99 query latency with and without the proxy (PG as for compat)
+	QG_TEST_UPSTREAM=127.0.0.1:54$(PG) go test -run '^$$' -bench Overhead -benchtime 5000x -count 1 ./test/compat/
 
 vet: ## Run go vet
 	go vet ./...
