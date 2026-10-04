@@ -3,12 +3,16 @@ package compat
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/proxy"
 	"github.com/jackc/pgx/v5"
@@ -97,6 +101,123 @@ func TestConnectionCap(t *testing.T) {
 	if sqlState(err) != "53300" {
 		t.Errorf("second connection got %v; want 53300 too_many_connections", err)
 	}
+}
+
+// costConfig blocks statements planned to cost more than a full read of tenants by far, and full reads of orders.
+const costConfig = `{"rules": [{"check": "max_cost", "cost": 50000}, {"check": "max_scan_rows", "rows": 100000}]}`
+
+func TestPgxCostRules(t *testing.T) {
+	conn := startCostProxy(t, nil).connect(t, "sslmode=disable")
+	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeCacheStatement, pgx.QueryExecModeExec, pgx.QueryExecModeSimpleProtocol} {
+		for _, tc := range []struct {
+			sql  string
+			arg  any
+			want string // the rule that blocks it
+		}{
+			{"select id from orders where id = $1", 7, ""},
+			{"select count(*) from orders where note = $1", "x", "max_cost"},
+			// Cheap, but it starts a full read of a 10M-row table that a WHERE clause would turn into a slow one.
+			{"select * from orders where total_cents > $1 limit 1", 0, "max_scan_rows"},
+			{"select * from tenants where name <> $1", "x", ""},
+		} {
+			_, err := conn.Exec(t.Context(), tc.sql, mode, tc.arg)
+			if tc.want == "" {
+				if err != nil {
+					t.Errorf("%s: %s failed: %v", mode, tc.sql, err)
+				}
+				continue
+			}
+			if pgErr, ok := errors.AsType[*pgconn.PgError](err); !ok || pgErr.Code != "54000" || !strings.Contains(pgErr.Message, tc.want) {
+				t.Errorf("%s: %s got %v; want 54000 from %s", mode, tc.sql, err, tc.want)
+			}
+			expectSelectOne(t, conn)
+		}
+	}
+}
+
+func TestCostCheckPassesOnPostgresErrors(t *testing.T) {
+	conn := startCostProxy(t, nil).connect(t, "sslmode=disable")
+	direct := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
+	const sql = "select id, nosuchcolumn from orders"
+
+	_, want := direct.Exec(t.Context(), sql, pgx.QueryExecModeSimpleProtocol)
+	_, got := conn.Exec(t.Context(), sql, pgx.QueryExecModeSimpleProtocol)
+
+	// The client sees the error its own statement would get, pointing into its own text.
+	wantErr, _ := errors.AsType[*pgconn.PgError](want)
+	gotErr, ok := errors.AsType[*pgconn.PgError](got)
+	if !ok || wantErr == nil || gotErr.Code != wantErr.Code || gotErr.Position != wantErr.Position {
+		t.Errorf("through the proxy: %v at %d; straight to Postgres: %v at %d", got, gotErr.Position, want, wantErr.Position)
+	}
+	expectSelectOne(t, conn)
+}
+
+func TestPgxCostRejectionInTransactionFailsIt(t *testing.T) {
+	conn := startCostProxy(t, nil).connect(t, "sslmode=disable")
+	ctx := t.Context()
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = tx.Exec(ctx, "select count(*) from orders where note = $1", "x")
+
+	if sqlState(err) != "54000" {
+		t.Errorf("costly statement got %v; want 54000", err)
+	}
+	if _, err := tx.Exec(ctx, "select 1"); sqlState(err) != "25P02" {
+		t.Errorf("next statement got %v; want 25P02 in_failed_sql_transaction", err)
+	}
+	tx.Rollback(ctx)
+	expectSelectOne(t, conn)
+}
+
+func TestPlanCacheServesRepeatedStatements(t *testing.T) {
+	var s *proxy.Server
+	conn := startCostProxy(t, func(srv *proxy.Server) { s = srv }).connect(t, "sslmode=disable")
+
+	for id := range 5 {
+		var got int64
+		if err := conn.QueryRow(t.Context(), "select id from orders where id = $1", id+1).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if st := s.PlanStats(); st.Misses != 1 || st.Hits != 4 {
+		t.Errorf("plan cache %+v; want 1 miss and 4 hits", st)
+	}
+}
+
+func TestCatalogReadsTableSizes(t *testing.T) {
+	c := &plan.Catalog{DSN: catalogDSN(t)}
+
+	rows, ok := c.Rows("queryguard", plan.Table{Schema: "public", Name: "orders"})
+
+	if !ok || rows < 1e6 {
+		t.Errorf("orders has %v rows (%v); want the test schema's millions", rows, ok)
+	}
+}
+
+// startCostProxy starts a proxy with costConfig and a catalog, letting configure see the server too.
+func startCostProxy(t testing.TB, configure func(*proxy.Server)) *queryGuard {
+	t.Helper()
+	return startProxyWith(t, func(s *proxy.Server) {
+		s.Policy = mustPolicy(t, costConfig)
+		s.Catalog = &plan.Catalog{DSN: catalogDSN(t)}
+		if configure != nil {
+			configure(s)
+		}
+	})
+}
+
+// catalogDSN connects straight to QG_TEST_UPSTREAM as the docker compose superuser.
+func catalogDSN(t testing.TB) string {
+	t.Helper()
+	host, port, err := net.SplitHostPort(os.Getenv("QG_TEST_UPSTREAM"))
+	if err != nil {
+		t.Skip("set QG_TEST_UPSTREAM to a Postgres host:port")
+	}
+	return fmt.Sprintf("host=%s port=%s user=postgres password=%s sslmode=disable", host, port, password())
 }
 
 // startRulesProxy starts a proxy with rulesConfig that logs to logs.

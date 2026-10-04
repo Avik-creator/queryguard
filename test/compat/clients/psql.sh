@@ -4,6 +4,7 @@ set -eu
 
 plain="host=$QG_HOST port=$QG_PORT user=postgres dbname=queryguard sslmode=disable"
 rules="host=$QG_HOST port=$QG_RULES_PORT user=postgres dbname=queryguard sslmode=disable"
+cost="host=$QG_HOST port=$QG_COST_PORT user=postgres dbname=queryguard sslmode=disable"
 tls="host=localhost port=$QG_PORT user=postgres dbname=queryguard sslmode=verify-full sslrootcert=$QG_CA"
 failed=0
 
@@ -38,6 +39,13 @@ got=$(psql "$rules" -XAt -c "begin" -c "delete from qg_no_such_table" -c "select
 case $got in
 *"require_where"*"current transaction is aborted"*ok) echo "ok   rejection fails the transaction" ;;
 *) echo "FAIL rejection fails the transaction: $got"; failed=1 ;;
+esac
+
+# QG_COST_PORT blocks statements planned to cost more than 50,000, such as a full read of the 10M-row orders table.
+got=$(psql "$cost" -XAt -c "select id from orders where id = 7" -c "select count(*) from orders where note = 'x'" -c "select 'ok'" 2>&1) || true
+case $got in
+7*"rule max_cost blocks this statement"*ok) echo "ok   costly statement" ;;
+*) echo "FAIL costly statement: $got"; failed=1 ;;
 esac
 
 exit $failed

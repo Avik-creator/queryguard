@@ -14,6 +14,7 @@ import (
 func TestClients(t *testing.T) {
 	qg := startProxy(t)
 	rules := startRulesProxy(t, io.Discard)
+	cost := startCostProxy(t, nil)
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker not found")
 	}
@@ -23,6 +24,7 @@ func TestClients(t *testing.T) {
 	}
 	_, port, _ := net.SplitHostPort(qg.addr)
 	_, rulesPort, _ := net.SplitHostPort(rules.addr)
+	_, costPort, _ := net.SplitHostPort(cost.addr)
 
 	for _, c := range []struct {
 		name, image string
@@ -40,7 +42,7 @@ func TestClients(t *testing.T) {
 				"run", "--rm", "--network", "host",
 				"-v", scripts + ":/scripts:ro",
 				"-v", filepath.Dir(qg.caFile) + ":/certs:ro",
-				"-e", "QG_HOST=127.0.0.1", "-e", "QG_PORT=" + port, "-e", "QG_RULES_PORT=" + rulesPort,
+				"-e", "QG_HOST=127.0.0.1", "-e", "QG_PORT=" + port, "-e", "QG_RULES_PORT=" + rulesPort, "-e", "QG_COST_PORT=" + costPort,
 				"-e", "QG_CA=/certs/ca.crt", "-e", "PGPASSWORD=" + password(),
 				"--entrypoint", c.cmd[0], c.image,
 			}

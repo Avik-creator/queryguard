@@ -11,6 +11,8 @@ const plain = {
 }
 // QG_RULES_PORT blocks UPDATE and DELETE without WHERE.
 const rules = { ...plain, port: Number(process.env.QG_RULES_PORT) }
+// QG_COST_PORT blocks statements planned to cost more than 50,000, such as a full read of the 10M-row orders table.
+const cost = { ...plain, port: Number(process.env.QG_COST_PORT) }
 const tls = { ...plain, host: 'localhost', ssl: { ca: fs.readFileSync(process.env.QG_CA), servername: 'localhost' } }
 
 let failed = false
@@ -95,6 +97,16 @@ await check('rejection fails the transaction', () =>
     expect(next?.code === '25P02', `next statement ended with ${next?.code ?? 'no error'}`)
     await c.query('rollback')
     await c.query('select 1')
+  }))
+
+await check('costly statement', () =>
+  withClient(cost, async (c) => {
+    for (const [text, values] of [["select count(*) from orders where note = 'x'", []], ['select count(*) from orders where note = $1', ['x']]]) {
+      const err = await c.query(text, values).then(() => null, (e) => e)
+      expect(err?.code === '54000', `${text} ended with ${err?.code ?? 'no error'}`)
+    }
+    const { rows } = await c.query('select id from orders where id = $1', [7])
+    expect(Number(rows[0].id) === 7, 'cheap statement did not run')
   }))
 
 process.exitCode = failed ? 1 : 0

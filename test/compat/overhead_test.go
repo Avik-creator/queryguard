@@ -12,6 +12,7 @@ import (
 func BenchmarkOverhead(b *testing.B) {
 	qg := startProxy(b)
 	rules := startRulesProxy(b, io.Discard)
+	cost := startCostProxy(b, nil)
 	upstream := os.Getenv("QG_TEST_UPSTREAM")
 
 	for _, q := range []struct{ name, sql string }{
@@ -25,6 +26,9 @@ func BenchmarkOverhead(b *testing.B) {
 			{"proxy_rules", rules.addr, "sslmode=disable"},
 			// The simple protocol sends the SQL every time, so every run is parsed and checked.
 			{"proxy_rules_simple", rules.addr, "sslmode=disable default_query_exec_mode=simple_protocol"},
+			// Every run is costed, nearly always from the plan cache.
+			{"proxy_cost", cost.addr, "sslmode=disable"},
+			{"proxy_cost_simple", cost.addr, "sslmode=disable default_query_exec_mode=simple_protocol"},
 		} {
 			b.Run(q.name+"/"+path.name, func(b *testing.B) {
 				conn := connectTo(b, path.addr, path.opts)

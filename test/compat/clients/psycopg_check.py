@@ -11,6 +11,8 @@ PLAIN = f"host={os.environ['QG_HOST']} port={os.environ['QG_PORT']} user=postgre
 TLS = f"host=localhost port={os.environ['QG_PORT']} user=postgres dbname=queryguard sslmode=verify-full sslrootcert={os.environ['QG_CA']}"
 # QG_RULES_PORT blocks DELETE without WHERE; the table doesn't exist, so a missed rejection fails with 42P01 instead.
 RULES = f"host={os.environ['QG_HOST']} port={os.environ['QG_RULES_PORT']} user=postgres dbname=queryguard sslmode=disable"
+# QG_COST_PORT blocks statements planned to cost more than 50,000, such as a full read of the 10M-row orders table.
+COST = f"host={os.environ['QG_HOST']} port={os.environ['QG_COST_PORT']} user=postgres dbname=queryguard sslmode=disable"
 BLOCKED = "delete from qg_no_such_table"
 LIBPQ = psycopg.pq.version()
 
@@ -120,6 +122,17 @@ def rejection_in_pipeline():
         assert rows == 0, f"table has {rows} rows; want the insert rolled back with the rejected delete"
 
 
+def costly_statement():
+    with psycopg.connect(COST, autocommit=True) as conn:
+        for prepare in (False, True):
+            try:
+                conn.execute("select count(*) from orders where note = %s", ["x"], prepare=prepare)
+                raise AssertionError("costly statement ran; want 54000 from rule max_cost")
+            except errors.ProgramLimitExceeded as err:
+                assert "max_cost" in str(err), f"rejected for another reason: {err}"
+            assert conn.execute("select id from orders where id = %s", [7], prepare=prepare).fetchone()[0] == 7
+
+
 print(f"psycopg {psycopg.__version__}, libpq {LIBPQ}")
 check("plaintext", lambda: select_one(PLAIN))
 check("SSLRequest", tls_in_use)
@@ -134,4 +147,5 @@ check("cancel over TLS", cancel(TLS))
 check("rejected statement", rejected_statement)
 check("rejection fails the transaction", rejection_fails_transaction)
 check("rejected statement in a pipeline", rejection_in_pipeline)
+check("costly statement", costly_statement)
 sys.exit(1 if failed else 0)
