@@ -17,6 +17,7 @@ const (
 	backendKeyDataType = 'K'
 	readyForQueryType  = 'Z'
 	errorResponseType  = 'E'
+	authOK             = 0
 	authSASL           = 10
 )
 
@@ -27,6 +28,8 @@ const maxKeyDataLen = 4 + 256
 type StartupOptions struct {
 	ChannelBinding bool                                                           // keep -PLUS SASL mechanisms
 	IssueKey       func(server *pgproto3.BackendKeyData) *pgproto3.BackendKeyData // the key data the client gets instead; nil keeps the server's
+	// Authenticated runs once AuthenticationOk has reached the client; an *Error it returns goes to the client as FATAL and ends the login.
+	Authenticated func() *Error
 }
 
 // RelayStartup copies server messages to client until ReadyForQuery or an ErrorResponse, reading nothing past it.
@@ -43,8 +46,8 @@ func RelayStartup(client io.Writer, server io.Reader, opts StartupOptions) error
 
 		var err error
 		switch {
-		case typ == authRequestType && !opts.ChannelBinding:
-			err = relayAuth(client, server, head, size)
+		case typ == authRequestType:
+			err = relayAuth(client, server, head, size, opts)
 		case typ == backendKeyDataType && opts.IssueKey != nil:
 			err = relayKey(client, server, size, opts.IssueKey)
 		default:
@@ -59,8 +62,9 @@ func RelayStartup(client io.Writer, server io.Reader, opts StartupOptions) error
 	}
 }
 
-// relayAuth forwards an authentication request of size bytes, removing -PLUS mechanisms from AuthenticationSASL.
-func relayAuth(client io.Writer, server io.Reader, head [5]byte, size int64) error {
+// relayAuth forwards an authentication request of size bytes, removing -PLUS mechanisms from AuthenticationSASL
+// unless opts allow channel binding, and runs opts.Authenticated after AuthenticationOk.
+func relayAuth(client io.Writer, server io.Reader, head [5]byte, size int64, opts StartupOptions) error {
 	if size < 4 {
 		return fmt.Errorf("authentication message too short")
 	}
@@ -68,7 +72,16 @@ func relayAuth(client io.Writer, server io.Reader, head [5]byte, size int64) err
 	if _, err := io.ReadFull(server, body); err != nil {
 		return unexpected(err)
 	}
-	if binary.BigEndian.Uint32(body) != authSASL {
+	switch code := binary.BigEndian.Uint32(body); {
+	case code == authOK && opts.Authenticated != nil:
+		if err := forward(client, server, append(head[:], body...), size-4); err != nil {
+			return err
+		}
+		if e := opts.Authenticated(); e != nil {
+			return fail(client, e.Code, e.Message)
+		}
+		return nil
+	case code != authSASL || opts.ChannelBinding:
 		return forward(client, server, append(head[:], body...), size-4)
 	}
 

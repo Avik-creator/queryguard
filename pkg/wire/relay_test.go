@@ -100,6 +100,34 @@ func TestRelayStartupForwardsOtherMessagesUnchanged(t *testing.T) {
 	}
 }
 
+func TestRelayStartupRefusesAfterAuthentication(t *testing.T) {
+	for _, binding := range []bool{false, true} {
+		ok := encode(t, &pgproto3.AuthenticationOk{})
+		rest := concat(encode(t, &pgproto3.ParameterStatus{Name: "server_version", Value: "18.0"}), encode(t, &pgproto3.ReadyForQuery{TxStatus: 'I'}))
+		server := bytes.NewReader(concat(encode(t, &pgproto3.AuthenticationSASLFinal{Data: []byte("v=proof")}), ok, rest))
+		var client bytes.Buffer
+		over := &Error{Code: "53300", Message: "queryguard: too many connections"}
+		calls := 0
+
+		err := RelayStartup(&client, server, StartupOptions{ChannelBinding: binding, Authenticated: func() *Error {
+			calls++
+			return over
+		}})
+
+		// Postgres too sends AuthenticationOk before refusing a role over its connection limit.
+		if e, isErr := errors.AsType[*Error](err); !isErr || *e != *over {
+			t.Errorf("binding %v: got %v; want %v", binding, err, over)
+		}
+		fatal := encode(t, &pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: over.Code, Message: over.Message})
+		if !bytes.HasSuffix(client.Bytes(), concat(ok, fatal)) {
+			t.Errorf("binding %v: client got %q; want AuthenticationOk then the FATAL error", binding, client.Bytes())
+		}
+		if left, _ := io.ReadAll(server); calls != 1 || !bytes.Equal(left, rest) {
+			t.Errorf("binding %v: %d calls, left %q unread; want 1 call and the rest unread", binding, calls, left)
+		}
+	}
+}
+
 func TestRelayStartupStopsAtEndOfStartup(t *testing.T) {
 	for name, end := range map[string]encoder{
 		"ready": &pgproto3.ReadyForQuery{TxStatus: 'I'},

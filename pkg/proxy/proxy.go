@@ -139,18 +139,27 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 // relay connects client to an upstream connection and relays messages both ways until either side closes.
 func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, startup *pgproto3.StartupMessage) {
 	role := startup.Parameters["user"]
-	var check session.Checker
+	var (
+		check         session.Checker
+		authenticated func() *wire.Error
+		release       = func() {}
+	)
 	if s.Policy != nil {
-		total, tenant := s.Policy.ConnectionLimits(role)
-		release, ok := s.sessions.add(role, total, tenant)
-		if !ok {
-			log.Warn("refused connection over the cap", "client", client.RemoteAddr(), "role", role)
-			wire.SendFatal(client, "53300", "queryguard: too many connections")
-			return
-		}
-		defer release()
 		check = s.Policy.Checker(role, log.With("client", client.RemoteAddr()))
+		total, tenant := s.Policy.ConnectionLimits(role)
+		// Like Postgres, count a session only once it has logged in, so a client without the password can't use up a role's cap.
+		authenticated = func() *wire.Error {
+			r, ok := s.sessions.add(role, total, tenant)
+			if !ok {
+				log.Warn("refused connection over the cap", "client", client.RemoteAddr(), "role", role)
+				return &wire.Error{Code: "53300", Message: "queryguard: too many connections"}
+			}
+			release = r
+			return nil
+		}
 	}
+	// Relay has returned, and with it the login that set release, by the time this runs.
+	defer func() { release() }()
 
 	s.addSettings(startup)
 	server, err := s.Upstream.Acquire(ctx, startup)
@@ -165,6 +174,7 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	forget := func() {}
 	opts := wire.StartupOptions{
 		ChannelBinding: sameCertificate(client, server, s.TLSConfig),
+		Authenticated:  authenticated,
 		IssueKey: func(key *pgproto3.BackendKeyData) *pgproto3.BackendKeyData {
 			forget()
 			issued, f := s.keys.issue(key)
@@ -182,7 +192,8 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 		return wire.RelayStartup(client, server, opts)
 	})
 	forget()
-	if !hungUp(err) {
+	// A login refused over the cap was logged when it was refused.
+	if _, refused := errors.AsType[*wire.Error](err); !refused && !hungUp(err) {
 		log.Warn("session ended", "client", client.RemoteAddr(), "err", err)
 	}
 }

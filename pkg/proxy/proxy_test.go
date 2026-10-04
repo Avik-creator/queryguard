@@ -123,11 +123,11 @@ func TestCapsConnectionsPerTenant(t *testing.T) {
 	addr, _ := startProxy(t, s)
 	first := startSession(t, addr)
 
-	expectFatal(t, sendStartupAs(t, dial(t, addr), "alice"), "53300")
+	expectOverCap(t, sendStartupAs(t, dial(t, addr), "alice"))
 	// bob has a cap of their own.
 	loginAs(t, dial(t, addr), "bob")
 	loginAs(t, dial(t, addr), "bob")
-	expectFatal(t, sendStartupAs(t, dial(t, addr), "bob"), "53300")
+	expectOverCap(t, sendStartupAs(t, dial(t, addr), "bob"))
 
 	first.Close()
 	waitForSessionSlot(t, addr)
@@ -139,7 +139,26 @@ func TestCapsConnectionsInTotal(t *testing.T) {
 	addr, _ := startProxy(t, s)
 	startSession(t, addr)
 
-	expectFatal(t, sendStartupAs(t, dial(t, addr), "bob"), "53300")
+	expectOverCap(t, sendStartupAs(t, dial(t, addr), "bob"))
+}
+
+func TestCountsOnlyLoggedInSessions(t *testing.T) {
+	pg := serveFakePostgres(t, &fakePostgres{greetingFor: map[string][]encoder{"stall": {&pgproto3.AuthenticationCleartextPassword{}}}})
+	s := newServer(t, pg.addr)
+	s.Policy = mustPolicy(t, `{"tenant_max_connections": 1}`)
+	addr, _ := startProxy(t, s)
+
+	// Anyone can claim to be alice; connections left at the password prompt must not take alice's slot.
+	for range 3 {
+		conn := dial(t, addr)
+		send(t, conn, &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30, Parameters: map[string]string{"user": "alice", "database": "stall"}})
+		if msg := receive(t, conn); !isType[*pgproto3.AuthenticationCleartextPassword](msg) {
+			t.Fatalf("got %#v; want a password prompt", msg)
+		}
+	}
+
+	startSession(t, addr)
+	expectOverCap(t, sendStartupAs(t, dial(t, addr), "alice"))
 }
 
 func TestGivesClientItsOwnCancelKey(t *testing.T) {
@@ -455,10 +474,11 @@ func newServer(t *testing.T, upstream string) *Server {
 
 // fakePostgres records each client's startup packet, sends its greeting, then echoes bytes back.
 type fakePostgres struct {
-	addr     string
-	received chan pgproto3.FrontendMessage
-	tls      *tls.Config // when set, plaintext connections are dropped
-	greeting []encoder   // sent after a startup message; a trust login with fakeServerKey when empty
+	addr        string
+	received    chan pgproto3.FrontendMessage
+	tls         *tls.Config          // when set, plaintext connections are dropped
+	greeting    []encoder            // sent after a startup message; a trust login with fakeServerKey when empty
+	greetingFor map[string][]encoder // replaces greeting for logins to these databases
 }
 
 // fakeServerKey is the cancel key data fakePostgres gives every session.
@@ -495,10 +515,15 @@ func serveFakePostgres(t *testing.T, pg *fakePostgres) *fakePostgres {
 					return
 				}
 				pg.received <- msg
-				if _, ok := msg.(*pgproto3.StartupMessage); !ok {
+				startup, ok := msg.(*pgproto3.StartupMessage)
+				if !ok {
 					return
 				}
-				for _, m := range greeting {
+				reply := greeting
+				if g, ok := pg.greetingFor[startup.Parameters["database"]]; ok {
+					reply = g
+				}
+				for _, m := range reply {
 					buf, _ := m.Encode(nil)
 					conn.Write(buf)
 				}
@@ -565,7 +590,8 @@ func waitForSessionSlot(t *testing.T, addr string) {
 	t.Helper()
 	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(20 * time.Millisecond) {
 		conn := sendStartupAs(t, dial(t, addr), "alice")
-		if _, ok := receive(t, conn).(*pgproto3.AuthenticationOk); ok {
+		receive(t, conn)
+		if !isType[*pgproto3.ErrorResponse](receive(t, conn)) {
 			return
 		}
 		if time.Now().After(deadline) {
@@ -721,6 +747,20 @@ func receive(t *testing.T, conn net.Conn) pgproto3.BackendMessage {
 		t.Fatal(err)
 	}
 	return msg
+}
+
+// expectOverCap fails the test unless conn logs in and is then refused as over a connection cap, as Postgres refuses.
+func expectOverCap(t *testing.T, conn net.Conn) {
+	t.Helper()
+	if msg := receive(t, conn); !isType[*pgproto3.AuthenticationOk](msg) {
+		t.Fatalf("got %#v; want AuthenticationOk", msg)
+	}
+	expectFatal(t, conn, "53300")
+}
+
+func isType[T any](v any) bool {
+	_, ok := v.(T)
+	return ok
 }
 
 // expectFatal fails the test unless conn gets a FATAL error with code and is then closed.
