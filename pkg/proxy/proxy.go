@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"strconv"
 	"strings"
@@ -41,6 +42,8 @@ type Server struct {
 
 	// ClientCheckInterval is sent as client_connection_check_interval unless the client set it; 0 sends nothing.
 	ClientCheckInterval time.Duration
+	// KeepAlive is set on client sockets and sent to Postgres for its side; a disabled config leaves both alone.
+	KeepAlive net.KeepAliveConfig
 
 	keys cancelKeys
 }
@@ -94,6 +97,9 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 	defer client.Close()
 	stop := context.AfterFunc(ctx, func() { client.Close() })
 	defer stop()
+	if err := setKeepAlive(client, s.KeepAlive); err != nil {
+		log.Warn("set keepalive on client connection", "client", client.RemoteAddr(), "err", err)
+	}
 
 	// The deadline covers the TLS handshake too, since the TLS connection reads through client.
 	client.SetDeadline(time.Now().Add(cmp.Or(s.StartupTimeout, DefaultStartupTimeout)))
@@ -126,7 +132,7 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 
 // relay connects client to an upstream connection and copies bytes both ways until either side closes.
 func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, startup *pgproto3.StartupMessage) {
-	s.addCheckInterval(startup)
+	s.addSettings(startup)
 	server, err := s.Upstream.Acquire(ctx, startup)
 	if err != nil {
 		log.Error("connect to upstream", "client", client.RemoteAddr(), "err", err)
@@ -173,17 +179,20 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	forget()
 }
 
-// addCheckInterval sets client_connection_check_interval in startup unless the client set it, directly or in options.
-func (s *Server) addCheckInterval(startup *pgproto3.StartupMessage) {
-	ms := s.ClientCheckInterval.Milliseconds()
-	if ms <= 0 {
-		return
+// addSettings adds the proxy's Postgres settings to startup, keeping any the client set directly or in options.
+func (s *Server) addSettings(startup *pgproto3.StartupMessage) {
+	settings := map[string]string{}
+	maps.Copy(settings, keepAliveSettings(s.KeepAlive))
+	if ms := s.ClientCheckInterval.Milliseconds(); ms > 0 {
+		settings[checkIntervalParam] = strconv.FormatInt(ms, 10)
 	}
-	// A startup parameter beats the same setting in options, so ours would silently replace the client's.
-	if _, set := startup.Parameters[checkIntervalParam]; set || strings.Contains(startup.Parameters["options"], checkIntervalParam) {
-		return
+	for name, value := range settings {
+		// A startup parameter beats the same setting in options, so ours would silently replace the client's.
+		if _, set := startup.Parameters[name]; set || strings.Contains(startup.Parameters["options"], name) {
+			continue
+		}
+		startup.Parameters[name] = value
 	}
-	startup.Parameters[checkIntervalParam] = strconv.FormatInt(ms, 10)
 }
 
 // sameCertificate reports whether both sides use TLS and the server presented the proxy's own certificate, so channel binding works end to end.

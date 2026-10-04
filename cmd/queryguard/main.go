@@ -31,6 +31,7 @@ type options struct {
 	upstreamSSL     string
 	upstreamCA      string
 	clientCheck     time.Duration
+	keepAlive       bool
 	shutdownTimeout time.Duration
 }
 
@@ -44,6 +45,8 @@ func main() {
 	flag.StringVar(&opts.upstreamCA, "upstream-ca", "", "PEM CA certificates for verify-full; default is the system roots")
 	flag.DurationVar(&opts.clientCheck, "client-check-interval", proxy.DefaultClientCheckInterval,
 		"how often Postgres checks that a client is still there during a query; 0 leaves Postgres's setting alone")
+	flag.BoolVar(&opts.keepAlive, "tcp-keepalive", true,
+		"find silently dead clients and servers in about 30s; false keeps the operating system's timing")
 	flag.DurationVar(&opts.shutdownTimeout, "shutdown-timeout", proxy.DefaultShutdownTimeout,
 		"how long open sessions may continue after a shutdown signal")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -82,10 +85,15 @@ func run(opts options, log *slog.Logger) error {
 	log.Info("queryguard started", "version", version, "listen", ln.Addr(), "upstream", opts.upstream,
 		"tls", tlsConfig != nil, "upstream_sslmode", opts.upstreamSSL)
 
+	var keepAlive net.KeepAliveConfig
+	if opts.keepAlive {
+		keepAlive = proxy.DefaultKeepAlive
+	}
 	s := &proxy.Server{
-		Upstream:            proxy.Dialer{Addr: opts.upstream, TLSConfig: upstreamTLSConfig},
+		Upstream:            proxy.Dialer{Addr: opts.upstream, TLSConfig: upstreamTLSConfig, KeepAlive: keepAlive},
 		TLSConfig:           tlsConfig,
 		ClientCheckInterval: opts.clientCheck,
+		KeepAlive:           keepAlive,
 		ShutdownTimeout:     opts.shutdownTimeout,
 		Logger:              log,
 	}

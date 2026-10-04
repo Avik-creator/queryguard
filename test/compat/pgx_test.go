@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -145,6 +146,30 @@ func TestPostgresStopsQueryWhenClientVanishes(t *testing.T) {
 	t.Logf("Postgres stopped the query %v after the client vanished", time.Since(start).Round(100*time.Millisecond))
 }
 
+func TestPostgresUsesProxyKeepalive(t *testing.T) {
+	conn := startProxy(t).connect(t, "sslmode=disable")
+
+	got := map[string]string{}
+	var name, setting string
+	rows, _ := conn.Query(t.Context(), `select name, setting from pg_settings where name like 'tcp\_%' and source = 'client'`)
+	if _, err := pgx.ForEachRow(rows, []any{&name, &setting}, func() error {
+		got[name] = setting
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]string{
+		"tcp_keepalives_idle":     "15",
+		"tcp_keepalives_interval": "5",
+		"tcp_keepalives_count":    "3",
+		"tcp_user_timeout":        "30000",
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("session settings from the client are %v; want %v", got, want)
+	}
+}
+
 // activeQueries counts running queries from sessions named app.
 func activeQueries(t *testing.T, conn *pgx.Conn, app string) int {
 	t.Helper()
@@ -191,9 +216,10 @@ func startProxy(t testing.TB) *queryGuard {
 		t.Fatal(err)
 	}
 	s := &proxy.Server{
-		Upstream:            proxy.Dialer{Addr: upstream},
+		Upstream:            proxy.Dialer{Addr: upstream, KeepAlive: proxy.DefaultKeepAlive},
 		TLSConfig:           wire.ServerTLSConfig(cert),
 		ClientCheckInterval: proxy.DefaultClientCheckInterval,
+		KeepAlive:           proxy.DefaultKeepAlive,
 		Logger:              slog.New(slog.NewTextHandler(t.Output(), nil)),
 	}
 	ctx, cancel := context.WithCancel(context.Background())

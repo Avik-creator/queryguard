@@ -24,6 +24,8 @@ type Upstream interface {
 type Dialer struct {
 	Addr      string      // host:port of the Postgres server
 	TLSConfig *tls.Config // nil means plaintext; otherwise TLS is required
+
+	KeepAlive net.KeepAliveConfig // a disabled config keeps Go's defaults
 }
 
 func (d Dialer) Acquire(ctx context.Context, startup *pgproto3.StartupMessage) (net.Conn, error) {
@@ -52,8 +54,15 @@ func (d Dialer) Cancel(ctx context.Context, req *pgproto3.CancelRequest) error {
 func (d Dialer) dial(ctx context.Context) (net.Conn, error) {
 	var nd net.Dialer
 	conn, err := nd.DialContext(ctx, "tcp", d.Addr)
-	if err != nil || d.TLSConfig == nil {
-		return conn, err
+	if err != nil {
+		return nil, err
+	}
+	if err := setKeepAlive(conn, d.KeepAlive); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if d.TLSConfig == nil {
+		return conn, nil
 	}
 	tlsConn, err := startTLS(ctx, conn, d.TLSConfig)
 	if err != nil {

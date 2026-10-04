@@ -47,15 +47,45 @@ func TestAsksPostgresToNoticeClosedClients(t *testing.T) {
 			pg := startFakePostgres(t)
 			s := newServer(t, pg.addr)
 			s.ClientCheckInterval = tc.interval
-			addr, _ := startProxy(t, s)
-			params := map[string]string{"user": "alice"}
-			maps.Copy(params, tc.params)
 
-			send(t, dial(t, addr), &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30, Parameters: params})
+			got := upstreamParams(t, s, pg, tc.params)
 
-			got := mustReceive[*pgproto3.StartupMessage](t, pg.received)
-			if v := got.Parameters[checkIntervalParam]; v != tc.want {
+			if v := got[checkIntervalParam]; v != tc.want {
 				t.Errorf("upstream got %s=%q; want %q", checkIntervalParam, v, tc.want)
+			}
+		})
+	}
+}
+
+func TestAsksPostgresForTighterKeepalive(t *testing.T) {
+	defaults := map[string]string{
+		"tcp_keepalives_idle":     "15",
+		"tcp_keepalives_interval": "5",
+		"tcp_keepalives_count":    "3",
+		"tcp_user_timeout":        "30000",
+	}
+	for name, tc := range map[string]struct {
+		keepAlive net.KeepAliveConfig
+		params    map[string]string
+		want      map[string]string
+	}{
+		"added":               {DefaultKeepAlive, nil, defaults},
+		"client's value kept": {DefaultKeepAlive, map[string]string{"tcp_keepalives_idle": "60"}, with(defaults, "tcp_keepalives_idle", "60")},
+		"client's options kept": {DefaultKeepAlive, map[string]string{"options": "-c tcp_user_timeout=0"},
+			with(defaults, "tcp_user_timeout", "")},
+		"off when disabled": {net.KeepAliveConfig{}, nil, map[string]string{}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pg := startFakePostgres(t)
+			s := newServer(t, pg.addr)
+			s.KeepAlive = tc.keepAlive
+
+			got := upstreamParams(t, s, pg, tc.params)
+
+			for param := range defaults {
+				if got[param] != tc.want[param] {
+					t.Errorf("upstream got %s=%q; want %q", param, got[param], tc.want[param])
+				}
 			}
 		})
 	}
@@ -461,13 +491,45 @@ func offeredMechanisms(t *testing.T, proxyCert, pgCert tls.Certificate, clientTL
 	return sasl.AuthMechanisms
 }
 
+// upstreamParams logs in through s as alice with extra startup params and returns the params pg received.
+func upstreamParams(t *testing.T, s *Server, pg *fakePostgres, extra map[string]string) map[string]string {
+	t.Helper()
+	addr, _ := startProxy(t, s)
+	params := map[string]string{"user": "alice"}
+	maps.Copy(params, extra)
+	send(t, dial(t, addr), &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30, Parameters: params})
+	return mustReceive[*pgproto3.StartupMessage](t, pg.received).Parameters
+}
+
+// with returns a copy of m with key set to v; an empty v removes key.
+func with(m map[string]string, key, v string) map[string]string {
+	m = maps.Clone(m)
+	m[key] = v
+	if v == "" {
+		delete(m, key)
+	}
+	return m
+}
+
 // startProxy runs s.Serve on a free port and returns its address and a stop function.
 func startProxy(t *testing.T, s *Server) (addr string, stop func() error) {
+	t.Helper()
+	return startProxyOn(t, s, listen(t))
+}
+
+// listen opens a listener on a free local port.
+func listen(t *testing.T) net.Listener {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	return ln
+}
+
+// startProxyOn runs s.Serve on ln and returns its address and a stop function.
+func startProxyOn(t *testing.T, s *Server, ln net.Listener) (addr string, stop func() error) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
 	go func() { errc <- s.Serve(ctx, ln) }()
