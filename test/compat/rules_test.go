@@ -229,6 +229,35 @@ func TestCatalogReadsTableSizes(t *testing.T) {
 	}
 }
 
+func TestCatalogSeesStaleStatistics(t *testing.T) {
+	dsn := catalogDSN(t)
+	direct := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
+	name := fmt.Sprintf("qg_stale_%d", time.Now().UnixNano())
+	t.Cleanup(func() { direct.Exec(context.Background(), "drop table "+name) })
+	// Autovacuum would analyze the table again before the test looks.
+	mustExec(t, direct, "create table "+name+" (id int) with (autovacuum_enabled = false)")
+	// A session reports its changes at most once a second, as it goes idle; forcing it makes them count before the next step.
+	insert := func() {
+		mustExec(t, direct, "insert into "+name+" select generate_series(1, 1000)")
+		mustExec(t, direct, "select pg_stat_force_next_flush()")
+	}
+	insert()
+	mustExec(t, direct, "analyze "+name)
+	table := plan.Table{Schema: "public", Name: name}
+	fresh := &plan.Catalog{DSN: dsn}
+	if _, ok := fresh.Rows("queryguard", table); !ok || fresh.Stale("queryguard", table) {
+		t.Fatal("a table just analyzed is stale, or has no size")
+	}
+
+	insert()
+
+	stale := &plan.Catalog{DSN: dsn}
+	stale.Rows("queryguard", table)
+	if !stale.Stale("queryguard", table) {
+		t.Error("a table that doubled since it was analyzed is not stale")
+	}
+}
+
 func TestBudgetRejectsTenantThatSpentIt(t *testing.T) {
 	// Each statement costs at least 100 units, and 250 are saved up, so the fourth finds the budget spent.
 	conn := startPolicyProxy(t, `{"tenants": {"postgres": {"budget": {"rate": 1, "burst": 250, "min_charge": 100, "when_over": "reject"}}}}`).
@@ -334,6 +363,80 @@ func TestBusyWhenNoSlotComesFree(t *testing.T) {
 
 	if sqlState(err) != "53000" {
 		t.Errorf("statement with the only slot taken got %v; want 53000", err)
+	}
+}
+
+func TestDroppedIndexGoesToSlowLane(t *testing.T) {
+	var logs lockedBuffer
+	conn := startFlipProxy(t, &logs).connect(t, "sslmode=disable")
+	mustExec(t, conn, "create temp table qg_flip as select g as id, md5(g::text) as note from generate_series(1, 200000) g")
+	mustExec(t, conn, "alter table qg_flip add primary key (id)")
+	mustExec(t, conn, "analyze qg_flip")
+	lookup := func(id int) {
+		var note string
+		if err := conn.QueryRow(t.Context(), "select note from qg_flip where id = $1", id).Scan(&note); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for id := range 5 {
+		lookup(id + 1)
+	}
+
+	// Dropping the index through the proxy makes it explain the lookup again before it next runs.
+	mustExec(t, conn, "alter table qg_flip drop constraint qg_flip_pkey")
+	lookup(6)
+
+	if got := logs.String(); !strings.Contains(got, `msg="plan flip"`) || !strings.Contains(got, "in full") || !strings.Contains(got, "slow_lane=true") {
+		t.Errorf("log %q; want the full read flagged as a plan flip and run in the slow lane", got)
+	}
+}
+
+func TestForcedGenericPlanGoesToSlowLane(t *testing.T) {
+	var logs lockedBuffer
+	conn := startFlipProxy(t, &logs).connect(t, "sslmode=disable")
+	// Ten rows in a million are rare: the plan for 'rare' uses the index, while one for any value reads the table in full.
+	// The filler makes reading it in full take over 100ms, long enough for a slow run to count.
+	mustExec(t, conn, "create temp table qg_skew as select g as id, case when g % 100000 = 0 then 'rare' else 'common' end as kind, "+
+		"repeat('x', 400) as filler from generate_series(1, 1000000) g")
+	mustExec(t, conn, "create index on qg_skew (kind)")
+	// ANALYZE reads every row, so it always finds the rare value, and the column is said to hold one value, as a sample of it
+	// usually says, so a plan for any value expects nearly every row.
+	mustExec(t, conn, "alter table qg_skew alter column kind set statistics 10000, alter column kind set (n_distinct = 1)")
+	mustExec(t, conn, "analyze qg_skew")
+	count := func() {
+		var n int
+		if err := conn.QueryRow(t.Context(), "select count(*) from qg_skew where kind = $1", "rare").Scan(&n); err != nil || n != 10 {
+			t.Fatalf("count = %d, %v; want 10", n, err)
+		}
+	}
+	for range 5 {
+		count()
+	}
+
+	// The proxy explains with the bound value, so only the time the generic plan takes gives it away.
+	mustExec(t, conn, "set plan_cache_mode = force_generic_plan")
+	count()
+	count()
+
+	if got := logs.String(); !strings.Contains(got, `msg="plan flip"`) || !strings.Contains(got, "slow_lane=true") {
+		t.Errorf("log %q; want the generic plan's run flagged and the next one run in the slow lane", got)
+	}
+}
+
+// startFlipProxy starts a proxy whose statements are explained for slots, logging to logs.
+func startFlipProxy(t testing.TB, logs io.Writer) *queryGuard {
+	t.Helper()
+	return startProxyWith(t, func(s *proxy.Server) {
+		s.Policy = mustPolicy(t, `{"scheduler": {"max_active": 10, "slow_lane": {"max_active": 2}}}`)
+		s.Plans.RefreshOneIn = -1
+		s.Logger = slog.New(slog.NewTextHandler(io.MultiWriter(logs, t.Output()), nil))
+	})
+}
+
+func mustExec(t testing.TB, conn *pgx.Conn, sql string) {
+	t.Helper()
+	if _, err := conn.Exec(t.Context(), sql); err != nil {
+		t.Fatalf("%s: %v", sql, err)
 	}
 }
 
