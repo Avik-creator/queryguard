@@ -39,19 +39,45 @@ func TestRelaysBytesBothWays(t *testing.T) {
 	roundTrip(t, conn, "hello")
 }
 
-func TestForwardsCancelRequest(t *testing.T) {
+func TestGivesClientItsOwnCancelKey(t *testing.T) {
+	addr, _ := startProxy(t, newServer(t, startFakePostgres(t).addr))
+
+	key := login(t, dial(t, addr))
+
+	if key.ProcessID == fakeServerKey.ProcessID || bytes.Equal(key.SecretKey, fakeServerKey.SecretKey) {
+		t.Errorf("client got %+v; want key data other than the server's", key)
+	}
+	if len(key.SecretKey) != len(fakeServerKey.SecretKey) {
+		t.Errorf("client got a %d-byte key; want %d bytes like the server's", len(key.SecretKey), len(fakeServerKey.SecretKey))
+	}
+}
+
+func TestForwardsCancelRequestWithServerKey(t *testing.T) {
+	pg := startFakePostgres(t)
+	addr, _ := startProxy(t, newServer(t, pg.addr))
+	key := login(t, dial(t, addr))
+	conn := dial(t, addr)
+
+	send(t, conn, &pgproto3.CancelRequest{ProcessID: key.ProcessID, SecretKey: key.SecretKey})
+
+	mustReceive[*pgproto3.StartupMessage](t, pg.received)
+	expectServerKey(t, mustReceive[*pgproto3.CancelRequest](t, pg.received))
+	expectClosed(t, conn)
+}
+
+func TestIgnoresCancelRequestWithUnknownKey(t *testing.T) {
 	pg := startFakePostgres(t)
 	addr, _ := startProxy(t, newServer(t, pg.addr))
 	conn := dial(t, addr)
-	key := bytes.Repeat([]byte{9}, 32)
 
-	send(t, conn, &pgproto3.CancelRequest{ProcessID: 42, SecretKey: key})
+	send(t, conn, &pgproto3.CancelRequest{ProcessID: fakeServerKey.ProcessID, SecretKey: fakeServerKey.SecretKey})
 
-	got := mustReceive[*pgproto3.CancelRequest](t, pg.received)
-	if got.ProcessID != 42 || !bytes.Equal(got.SecretKey, key) {
-		t.Errorf("upstream got %+v; want process 42 and the same key", got)
-	}
 	expectClosed(t, conn)
+	select {
+	case msg := <-pg.received:
+		t.Fatalf("upstream got %#v; want nothing", msg)
+	case <-time.After(200 * time.Millisecond):
+	}
 }
 
 func TestRelaysOverDirectTLS(t *testing.T) {
@@ -61,7 +87,8 @@ func TestRelaysOverDirectTLS(t *testing.T) {
 	addr, _ := startProxy(t, s)
 
 	clientTLS.NextProtos = []string{"postgresql"}
-	conn := login(t, tls.Client(dial(t, addr), clientTLS))
+	conn := tls.Client(dial(t, addr), clientTLS)
+	login(t, conn)
 
 	roundTrip(t, conn, "hello over TLS")
 }
@@ -72,6 +99,7 @@ func TestForwardsCancelRequestOverTLS(t *testing.T) {
 	s := newServer(t, pg.addr)
 	s.TLSConfig = wire.ServerTLSConfig(cert)
 	addr, _ := startProxy(t, s)
+	key := login(t, dial(t, addr))
 
 	raw := dial(t, addr)
 	send(t, raw, &pgproto3.SSLRequest{})
@@ -79,11 +107,10 @@ func TestForwardsCancelRequestOverTLS(t *testing.T) {
 	if _, err := io.ReadFull(raw, reply); err != nil || reply[0] != 'S' {
 		t.Fatalf("got %q, %v; want 'S'", reply, err)
 	}
-	send(t, tls.Client(raw, clientTLS), &pgproto3.CancelRequest{ProcessID: 42, SecretKey: []byte{1, 2, 3, 4}})
+	send(t, tls.Client(raw, clientTLS), &pgproto3.CancelRequest{ProcessID: key.ProcessID, SecretKey: key.SecretKey})
 
-	if got := mustReceive[*pgproto3.CancelRequest](t, pg.received); got.ProcessID != 42 {
-		t.Errorf("upstream got process %d; want 42", got.ProcessID)
-	}
+	mustReceive[*pgproto3.StartupMessage](t, pg.received)
+	expectServerKey(t, mustReceive[*pgproto3.CancelRequest](t, pg.received))
 }
 
 func TestPassesChannelBindingWhenProxyHasPostgresCertificate(t *testing.T) {
@@ -155,12 +182,12 @@ func TestForwardsCancelRequestToUpstreamOverTLS(t *testing.T) {
 	s := newServer(t, pg.addr)
 	s.Upstream = Dialer{Addr: pg.addr, TLSConfig: clientTLS}
 	addr, _ := startProxy(t, s)
+	key := login(t, dial(t, addr))
 
-	send(t, dial(t, addr), &pgproto3.CancelRequest{ProcessID: 42, SecretKey: []byte{1, 2, 3, 4}})
+	send(t, dial(t, addr), &pgproto3.CancelRequest{ProcessID: key.ProcessID, SecretKey: key.SecretKey})
 
-	if got := mustReceive[*pgproto3.CancelRequest](t, pg.received); got.ProcessID != 42 {
-		t.Errorf("upstream got process %d; want 42", got.ProcessID)
-	}
+	mustReceive[*pgproto3.StartupMessage](t, pg.received)
+	expectServerKey(t, mustReceive[*pgproto3.CancelRequest](t, pg.received))
 }
 
 func TestFailsWhenUpstreamRefusesTLS(t *testing.T) {
@@ -308,8 +335,11 @@ type fakePostgres struct {
 	addr     string
 	received chan pgproto3.FrontendMessage
 	tls      *tls.Config // when set, plaintext connections are dropped
-	greeting []encoder   // sent after a startup message; AuthenticationOk when empty
+	greeting []encoder   // sent after a startup message; a trust login with fakeServerKey when empty
 }
+
+// fakeServerKey is the cancel key data fakePostgres gives every session.
+var fakeServerKey = &pgproto3.BackendKeyData{ProcessID: 4242, SecretKey: bytes.Repeat([]byte{7}, 32)}
 
 func startFakePostgres(t *testing.T) *fakePostgres { return serveFakePostgres(t, &fakePostgres{}) }
 
@@ -324,7 +354,7 @@ func serveFakePostgres(t *testing.T, pg *fakePostgres) *fakePostgres {
 	pg.received = make(chan pgproto3.FrontendMessage, 10)
 	greeting := pg.greeting
 	if len(greeting) == 0 {
-		greeting = []encoder{&pgproto3.AuthenticationOk{}}
+		greeting = []encoder{&pgproto3.AuthenticationOk{}, fakeServerKey, &pgproto3.ReadyForQuery{TxStatus: 'I'}}
 	}
 	go func() {
 		for {
@@ -419,17 +449,38 @@ func dial(t *testing.T, addr string) net.Conn {
 // startSession connects to the proxy and logs in.
 func startSession(t *testing.T, addr string) net.Conn {
 	t.Helper()
-	return login(t, dial(t, addr))
+	conn := dial(t, addr)
+	login(t, conn)
+	return conn
 }
 
-// login sends a startup message on conn and waits for AuthenticationOk.
-func login(t *testing.T, conn net.Conn) net.Conn {
+// login sends a startup message on conn, reads up to ReadyForQuery and returns the cancel key data the client got.
+func login(t *testing.T, conn net.Conn) *pgproto3.BackendKeyData {
 	t.Helper()
 	sendStartup(t, conn)
-	if msg, ok := receive(t, conn).(*pgproto3.AuthenticationOk); !ok {
-		t.Fatalf("got %#v; want AuthenticationOk", msg)
+	var key *pgproto3.BackendKeyData
+	for {
+		switch msg := receive(t, conn).(type) {
+		case *pgproto3.AuthenticationOk, *pgproto3.ParameterStatus:
+		case *pgproto3.BackendKeyData:
+			key = msg
+		case *pgproto3.ReadyForQuery:
+			if key == nil {
+				t.Fatal("login ended without BackendKeyData")
+			}
+			return key
+		default:
+			t.Fatalf("got %#v during login", msg)
+		}
 	}
-	return conn
+}
+
+// expectServerKey fails the test unless req carries fakeServerKey.
+func expectServerKey(t *testing.T, req *pgproto3.CancelRequest) {
+	t.Helper()
+	if req.ProcessID != fakeServerKey.ProcessID || !bytes.Equal(req.SecretKey, fakeServerKey.SecretKey) {
+		t.Errorf("upstream got cancel %+v; want the server's own key data", req)
+	}
 }
 
 // sendStartup sends a startup message for alice and the shop database.

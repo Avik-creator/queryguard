@@ -30,6 +30,8 @@ type Server struct {
 	StartupTimeout  time.Duration // how long a new client has to send its startup message
 	ShutdownTimeout time.Duration // how long sessions may drain after Serve stops
 	Logger          *slog.Logger  // nil means slog.Default()
+
+	keys cancelKeys
 }
 
 // Serve accepts on ln until ctx is cancelled, then drains sessions for up to ShutdownTimeout.
@@ -96,7 +98,12 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 
 	switch msg := msg.(type) {
 	case *pgproto3.CancelRequest:
-		if err := s.Upstream.Cancel(ctx, msg); err != nil {
+		req, ok := s.keys.lookup(msg)
+		if !ok {
+			log.Info("ignored cancel request with unknown key", "client", client.RemoteAddr())
+			return
+		}
+		if err := s.Upstream.Cancel(ctx, req); err != nil {
 			log.Warn("forward cancel request", "client", client.RemoteAddr(), "err", err)
 		}
 	case *pgproto3.StartupMessage:
@@ -114,7 +121,17 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	}
 	defer s.Upstream.Release(server)
 
-	channelBinding := sameCertificate(client, server, s.TLSConfig)
+	// The startup copy sets forget; it is called once both copies are done.
+	forget := func() {}
+	opts := wire.StartupOptions{
+		ChannelBinding: sameCertificate(client, server, s.TLSConfig),
+		IssueKey: func(key *pgproto3.BackendKeyData) *pgproto3.BackendKeyData {
+			forget()
+			issued, f := s.keys.issue(key)
+			forget = f
+			return issued
+		},
+	}
 	closeBoth := func() {
 		client.Close()
 		server.Close()
@@ -129,16 +146,17 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 		closeBoth()
 	})
 	copies.Go(func() {
-		err := wire.RelayAuth(client, server, channelBinding)
+		err := wire.RelayStartup(client, server, opts)
 		if err == nil {
 			io.Copy(client, server)
 		} else if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 			// Either side hanging up mid-login is normal; psql does it before every password prompt.
-			log.Warn("relay authentication", "client", client.RemoteAddr(), "err", err)
+			log.Warn("relay startup", "client", client.RemoteAddr(), "err", err)
 		}
 		closeBoth()
 	})
 	copies.Wait()
+	forget()
 }
 
 // sameCertificate reports whether both sides use TLS and the server presented the proxy's own certificate, so channel binding works end to end.
