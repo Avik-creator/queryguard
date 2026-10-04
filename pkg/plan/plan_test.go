@@ -3,7 +3,9 @@ package plan
 import (
 	"context"
 	"errors"
+	"math"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -121,9 +123,9 @@ func TestCacheStaysWithinSize(t *testing.T) {
 func TestCatalogLoadsOnFirstUseAndRefreshesInBackground(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var loads atomic.Int32
-		c := &Catalog{Interval: time.Minute, load: func(_ context.Context, database string) (map[Table]float64, error) {
+		c := &Catalog{Interval: time.Minute, load: func(_ context.Context, database string) (map[Table]stats, error) {
 			n := loads.Add(1)
-			return map[Table]float64{{"public", database}: float64(n * 100)}, nil
+			return map[Table]stats{{"public", database}: {rows: float64(n * 100)}}, nil
 		}}
 		orders := Table{"public", "shop"}
 
@@ -147,8 +149,8 @@ func TestCatalogLoadsOnFirstUseAndRefreshesInBackground(t *testing.T) {
 }
 
 func TestCatalogKeepsDatabasesApart(t *testing.T) {
-	c := &Catalog{load: func(_ context.Context, database string) (map[Table]float64, error) {
-		return map[Table]float64{{"public", "t"}: float64(len(database))}, nil
+	c := &Catalog{load: func(_ context.Context, database string) (map[Table]stats, error) {
+		return map[Table]stats{{"public", "t"}: {rows: float64(len(database))}}, nil
 	}}
 	a, _ := c.Rows("ab", Table{"public", "t"})
 	b, _ := c.Rows("abcd", Table{"public", "t"})
@@ -158,8 +160,348 @@ func TestCatalogKeepsDatabasesApart(t *testing.T) {
 }
 
 func TestCatalogWithoutSizesAfterFailedLoad(t *testing.T) {
-	c := &Catalog{load: func(context.Context, string) (map[Table]float64, error) { return nil, errors.New("refused") }}
+	c := &Catalog{load: func(context.Context, string) (map[Table]stats, error) { return nil, errors.New("refused") }}
 	if rows, ok := c.Rows("shop", Table{"public", "orders"}); ok {
 		t.Errorf("Rows = %v after a failed load; want unknown", rows)
+	}
+}
+
+// lookup reads one order through its primary key; fullRead is the same statement once the index is gone.
+const (
+	lookup   = `[{"Plan": {"Node Type": "Index Scan", "Relation Name": "orders", "Schema": "public", "Index Name": "orders_pkey", "Total Cost": 8.44}}]`
+	fullRead = `[{"Plan": {"Node Type": "Seq Scan", "Relation Name": "orders", "Schema": "public", "Total Cost": 241255.31}}]`
+	bitmap   = `[{"Plan": {"Node Type": "Bitmap Heap Scan", "Relation Name": "orders", "Schema": "public", "Total Cost": 912.5,
+		"Plans": [{"Node Type": "Bitmap Index Scan", "Index Name": "orders_customer_idx", "Total Cost": 12.1}]}}]`
+)
+
+func mustParse(t *testing.T, out string) Plan {
+	t.Helper()
+	p, err := Parse(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestParseShape(t *testing.T) {
+	a, cheaper, full := mustParse(t, lookup), mustParse(t, strings.Replace(lookup, "8.44", "4.45", 1)), mustParse(t, fullRead)
+
+	if a.Shape == 0 || a.Shape != cheaper.Shape || a.Shape == full.Shape {
+		t.Errorf("shapes %x, %x, %x; want the first two equal, since only the estimate differs, and the third apart", a.Shape, cheaper.Shape, full.Shape)
+	}
+}
+
+func TestParseTablesReadThroughAnIndex(t *testing.T) {
+	for out, want := range map[string][]Table{
+		lookup:   {{"public", "orders"}},
+		bitmap:   {{"public", "orders"}},
+		join:     {{"public", "customers"}},
+		fullRead: nil,
+	} {
+		if got := mustParse(t, out).Indexed; !slices.Equal(got, want) {
+			t.Errorf("Indexed = %v; want %v in %s", got, want, out)
+		}
+	}
+}
+
+func TestHistoryFactorStartsAtOne(t *testing.T) {
+	var h History
+	if f := h.Judge("a", mustParse(t, lookup), Tuning{}).Factor; f != 1 {
+		t.Errorf("Factor = %v with no runs; want 1", f)
+	}
+}
+
+func TestHistoryCalibratesByMeasuredTime(t *testing.T) {
+	for _, tc := range []struct {
+		credibility float64
+		weight      float64 // the share of a statement's own timing in its factor after 10 runs
+	}{{0, 10.0 / 20}, {30, 10.0 / 40}} {
+		var h History
+		tune := Tuning{Credibility: tc.credibility}
+		fast, slow := Plan{Cost: 100, Shape: 1}, Plan{Cost: 100, Shape: 2}
+		for range 10 {
+			h.Ran("fast", fast, 10*time.Millisecond, true, tune)
+			h.Ran("slow", slow, 100*time.Millisecond, true, tune)
+		}
+
+		// Averaged in log terms, a cost unit takes 316µs; fast takes about 3.16 times less, slow 3.16 times more.
+		got := []float64{h.Judge("fast", fast, tune).Factor, h.Judge("slow", slow, tune).Factor}
+		want := []float64{math.Pow(10, -tc.weight/2), math.Pow(10, tc.weight/2)}
+		for i := range got {
+			if math.Abs(got[i]-want[i]) > 1e-9 {
+				t.Errorf("credibility %v: factors %v; want %v", tc.credibility, got, want)
+				break
+			}
+		}
+	}
+}
+
+func TestHistoryLearnsCostOnlyFromLongRuns(t *testing.T) {
+	var h History
+	quick, long := Plan{Cost: 100, Shape: 1}, Plan{Cost: 100, Shape: 2}
+	for range 10 {
+		h.Ran("quick", quick, time.Millisecond, true, Tuning{})
+		h.Ran("long", long, 100*time.Millisecond, true, Tuning{})
+	}
+
+	// A run of a millisecond is mostly the round trip and the work every statement does, so it says little about its plan.
+	if q, l := h.Judge("quick", quick, Tuning{}).Factor, h.Judge("long", long, Tuning{}).Factor; q != 1 || math.Abs(l-1) > 1e-9 {
+		t.Errorf("factors %v and %v; want 1 for both, the quick plan unlearned and the long one the server's only timing", q, l)
+	}
+}
+
+func TestHistoryServerTimingWeighsRunsByCost(t *testing.T) {
+	var h History
+	big := Plan{Cost: 100_000, Shape: 1}
+	for range 10 {
+		h.Ran("big", big, time.Second, true, Tuning{})
+	}
+	before := h.Judge("big", big, Tuning{}).Factor
+
+	// A cheap statement that waited ten seconds on a lock says little about how fast the server works through cost units.
+	h.Ran("cheap", Plan{Cost: 1, Shape: 2}, 10*time.Second, true, Tuning{})
+
+	if after := h.Judge("big", big, Tuning{}).Factor; math.Abs(after-before) > 0.01 {
+		t.Errorf("factor %v, then %v after one cheap statement's long wait; want it about the same", before, after)
+	}
+}
+
+func TestHistoryNewPlanLearnsItsOwnFactor(t *testing.T) {
+	var h History
+	p := mustParse(t, lookup)
+	for range 10 {
+		h.Ran("a", p, time.Millisecond, true, Tuning{})
+		h.Ran("b", Plan{Cost: 100, Shape: 7}, 100*time.Millisecond, true, Tuning{})
+	}
+
+	if f := h.Judge("a", mustParse(t, fullRead), Tuning{}).Factor; f != 1 {
+		t.Errorf("Factor = %v for a plan never run; want 1", f)
+	}
+}
+
+func TestHistoryFlagsIndexScanTurningIntoFullRead(t *testing.T) {
+	var h History
+	usual, full := mustParse(t, lookup), mustParse(t, fullRead)
+	for range minRuns - 1 {
+		h.Ran("a", usual, time.Millisecond, true, Tuning{})
+	}
+	if v := h.Judge("a", full, Tuning{}); v.Flip != "" {
+		t.Errorf("flagged %q after %d runs; want a flip only after %d", v.Flip, minRuns-1, minRuns)
+	}
+	h.Ran("a", usual, time.Millisecond, true, Tuning{})
+
+	first, again, back := h.Judge("a", full, Tuning{}), h.Judge("a", full, Tuning{}), h.Judge("a", usual, Tuning{})
+
+	if !strings.Contains(first.Flip, "public.orders") || !first.First || again.First || again.Flip != first.Flip {
+		t.Errorf("full read judged %+v, then %+v; want a flip naming public.orders, first only once", first, again)
+	}
+	if back.Flip != "" {
+		t.Errorf("the usual plan was flagged: %q", back.Flip)
+	}
+}
+
+func TestHistoryTakesPlanForOtherValuesAsAnAlternative(t *testing.T) {
+	var h History
+	usual, full := mustParse(t, lookup), mustParse(t, fullRead)
+	for range minRuns {
+		h.Ran("a", usual, time.Millisecond, true, Tuning{})
+	}
+
+	// A common value reads the table in full while rare ones keep using the index: that is data, not a regression.
+	var flagged []bool
+	for range minRuns + 1 {
+		flagged = append(flagged, h.Judge("a", full, Tuning{}).Flip != "")
+		h.Ran("a", full, time.Second, true, Tuning{})
+		h.Judge("a", usual, Tuning{})
+		h.Ran("a", usual, time.Millisecond, true, Tuning{})
+	}
+
+	if !flagged[0] || flagged[minRuns] {
+		t.Errorf("full read flagged %v run by run; want it flagged at first and taken as an alternative once it ran %d times beside the usual plan",
+			flagged, minRuns)
+	}
+}
+
+func TestHistoryDoesNotFlagABetterPlan(t *testing.T) {
+	var h History
+	for range minRuns {
+		h.Ran("a", mustParse(t, fullRead), time.Second, true, Tuning{})
+	}
+	if v := h.Judge("a", mustParse(t, lookup), Tuning{}); v.Flip != "" {
+		t.Errorf("an index scan replacing a full read was flagged: %q", v.Flip)
+	}
+}
+
+func TestHistoryTakesANewPlanAsUsualAfterQuarantine(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var h History
+		tune := Tuning{Quarantine: 10 * time.Minute}
+		usual, full := mustParse(t, lookup), mustParse(t, fullRead)
+		for range 10 {
+			h.Ran("a", usual, time.Millisecond, true, tune)
+		}
+
+		var flagged []bool
+		for range 30 {
+			time.Sleep(time.Minute)
+			flagged = append(flagged, h.Judge("a", full, tune).Flip != "")
+			h.Ran("a", full, time.Second, true, tune)
+		}
+
+		// The old plan's runs fade with the quarantine as half-life, so the new one outweighs them in about that time.
+		if !flagged[0] || !flagged[5] || flagged[29] {
+			t.Errorf("full read flagged %v minute by minute; want it flagged at first and taken as usual by the end", flagged)
+		}
+	})
+}
+
+func TestHistoryFlagsRunFarSlowerThanPlanned(t *testing.T) {
+	var h History
+	p := mustParse(t, lookup)
+	if h.Ran("a", p, time.Millisecond, true, Tuning{}) || h.Ran("a", p, 5*time.Second, true, Tuning{}) {
+		t.Fatal("a slow run was flagged before the plan had a timing to compare with")
+	}
+	h = History{}
+	for range minRuns {
+		h.Ran("a", p, time.Millisecond, true, Tuning{})
+	}
+
+	slow := h.Ran("a", p, 2*time.Second, true, Tuning{})
+	flagged := h.Judge("a", p, Tuning{})
+	again := h.Ran("a", p, 2*time.Second, true, Tuning{})
+	h.Ran("a", p, time.Millisecond, true, Tuning{})
+	cleared := h.Judge("a", p, Tuning{})
+
+	// Only the run that turns the plan slow is reported, so a plan that stays slow isn't reported on every run.
+	if !slow || again || !strings.Contains(flagged.Flip, "slower") || !flagged.First || cleared.Flip != "" {
+		t.Errorf("slow runs %v and %v, judged %+v, then %+v after a normal run; want the first reported and flagged, then cleared",
+			slow, again, flagged, cleared)
+	}
+}
+
+func TestHistoryDoesNotFlagShortSlowRun(t *testing.T) {
+	var h History
+	p := mustParse(t, lookup)
+	for range minRuns {
+		h.Ran("a", p, time.Millisecond, true, Tuning{})
+	}
+
+	// Under load a lookup now and then takes tens of milliseconds, which is no reason to move it to the slow lane.
+	if h.Ran("a", p, 50*time.Millisecond, true, Tuning{}) || h.Judge("a", p, Tuning{}).Flip != "" {
+		t.Error("a run 50 times slower than usual but only 50ms long was flagged")
+	}
+}
+
+func TestHistoryUnfinishedRunCountsOnlyWhenSlow(t *testing.T) {
+	var h History
+	p := mustParse(t, lookup)
+	for range minRuns {
+		h.Ran("a", p, 10*time.Millisecond, true, Tuning{})
+		h.Ran("b", Plan{Cost: 1, Shape: 1}, time.Second, true, Tuning{})
+	}
+	before := h.Judge("a", p, Tuning{}).Factor
+
+	quick := h.Ran("a", p, 30*time.Millisecond, false, Tuning{})
+	timedOut := h.Ran("a", p, 30*time.Second, false, Tuning{})
+
+	// A failed run says nothing about the plan's timing, unless it ran far too long first, as a cancelled one does.
+	if before == 1 {
+		t.Fatal("the plan learned nothing to change")
+	}
+	if quick || !timedOut || h.Judge("a", p, Tuning{}).Factor != before {
+		t.Errorf("quick failure flagged %v, timeout %v, factor %v then %v; want only the timeout flagged and the factor unchanged",
+			quick, timedOut, before, h.Judge("a", p, Tuning{}).Factor)
+	}
+}
+
+func TestHistoryIgnoresRunOfUnknownLength(t *testing.T) {
+	var h History
+	p := mustParse(t, lookup)
+	for range minRuns {
+		h.Ran("a", p, 10*time.Millisecond, true, Tuning{})
+		h.Ran("b", Plan{Cost: 1, Shape: 1}, time.Second, true, Tuning{})
+	}
+	before := h.Judge("a", p, Tuning{}).Factor
+
+	h.Ran("a", p, 0, true, Tuning{})
+
+	if after := h.Judge("a", p, Tuning{}).Factor; after != before {
+		t.Errorf("factor %v, then %v after a run of unknown length; want it unchanged", before, after)
+	}
+}
+
+func TestHistoryStaysWithinSize(t *testing.T) {
+	h := History{Size: 2}
+	for _, key := range []string{"a", "b", "c", "d"} {
+		h.Ran(key, Plan{Cost: 1, Shape: 1}, time.Millisecond, true, Tuning{})
+	}
+	if n := len(h.statements); n > 2 {
+		t.Errorf("history holds %d statements; want at most 2", n)
+	}
+}
+
+func TestCacheForget(t *testing.T) {
+	c := &Cache{RefreshOneIn: -1}
+	calls := 0
+	explain := func() (Plan, error) { calls++; return Plan{}, nil }
+	for _, key := range []string{"shop\x00a", "shop\x00b", "crm\x00a"} {
+		c.Get(key, explain)
+	}
+
+	c.Forget(func(key string) bool { return strings.HasPrefix(key, "shop\x00") })
+	for _, key := range []string{"shop\x00a", "shop\x00b", "crm\x00a"} {
+		c.Get(key, explain)
+	}
+
+	if calls != 5 {
+		t.Errorf("%d explains; want 3, then 2 more for the forgotten plans", calls)
+	}
+}
+
+func TestCatalogStaleNeverWaitsForAFirstLoad(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		c := &Catalog{load: func(context.Context, string) (map[Table]stats, error) {
+			<-release
+			return map[Table]stats{{"public", "t"}: {rows: 10, modified: 1000}}, nil
+		}}
+
+		// It answers while a session waits on it, so it reports nothing until the sizes arrive.
+		early := c.Stale("shop", Table{"public", "t"})
+		close(release)
+		synctest.Wait()
+		late := c.Stale("shop", Table{"public", "t"})
+
+		if early || !late {
+			t.Errorf("Stale = %v before the first load and %v after; want false, then true", early, late)
+		}
+	})
+}
+
+func TestCatalogStaleTables(t *testing.T) {
+	c := &Catalog{load: func(context.Context, string) (map[Table]stats, error) {
+		return map[Table]stats{
+			{"public", "fresh"}:   {rows: 10_000, modified: 1000},
+			{"public", "stale"}:   {rows: 10_000, modified: 5000},
+			{"public", "new"}:     {rows: -1, modified: 100},
+			{"public", "unused"}:  {rows: -1},
+			{"public", "smaller"}: {rows: 10, modified: 40},
+		}, nil
+	}}
+	// Rows waits for the first load, which Stale doesn't.
+	c.Rows("shop", Table{"public", "fresh"})
+	got := map[string]bool{}
+	for _, name := range []string{"fresh", "stale", "new", "unused", "smaller", "missing"} {
+		got[name] = c.Stale("shop", Table{"public", name})
+	}
+	want := map[string]bool{"stale": true, "new": true}
+	for name := range got {
+		if got[name] != want[name] {
+			t.Errorf("Stale = %v; want %v", got, want)
+			break
+		}
+	}
+	if _, ok := c.Rows("shop", Table{"public", "new"}); ok {
+		t.Error("a table never analyzed has a size")
 	}
 }
