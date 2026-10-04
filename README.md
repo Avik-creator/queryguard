@@ -5,10 +5,11 @@ speaks the Postgres wire protocol. It estimates what each query will cost before
 it runs and gives every tenant a budget, so one tenant's expensive queries can't
 starve everyone else.
 
-> **Status:** early development. Milestones M1 (a transparent proxy) and M2
-> (rules and connection caps) are done: QueryGuard relays sessions, cancel
-> requests and TLS, and can block statements by rule, but does not estimate
-> cost or enforce budgets yet.
+> **Status:** early development. Milestones M1 (a transparent proxy), M2
+> (rules and connection caps) and M3 (plans and cost rules) are done:
+> QueryGuard relays sessions, cancel requests and TLS, and can block
+> statements by rule or by their planned cost, but does not enforce tenant
+> budgets yet.
 
 ## Planned features
 
@@ -125,6 +126,72 @@ blocks writes to a busy table. They are not a security boundary: functions,
 views and triggers run SQL that QueryGuard never sees. Grant each role only
 the privileges it needs in PostgreSQL itself.
 
+## Cost rules
+
+Two more checks judge a statement on its plan, which QueryGuard gets from
+PostgreSQL just before the statement runs:
+
+```json
+{
+  "rules": [
+    {"check": "max_cost", "cost": 100000},
+    {"check": "max_scan_rows", "rows": 1000000}
+  ]
+}
+```
+
+| Check | Blocks |
+| --- | --- |
+| `max_cost` | A statement whose planned total cost, in the planner's own units, is over `cost` |
+| `max_scan_rows` | A plan that reads more than `rows` rows in full (sequential scans), added up over every table and partition it reads that way; reading a small table in full is the right plan, so only the tables' sizes count, not the scan itself |
+
+A blocked statement fails with SQLSTATE `54000` (`program_limit_exceeded`),
+and the detail gives the planned cost or the table's size next to the limit.
+Like the other rules, these can run in `warn` mode.
+
+How QueryGuard gets the plan:
+
+- It runs `EXPLAIN (FORMAT JSON, VERBOSE)` on the client's own connection, so
+  the plan sees the same role, row-level security, `search_path`, temporary
+  tables and settings as the statement. With the extended protocol it
+  explains the statement at `Bind`, with the values being bound; values over
+  1 MB are not sent twice, and it asks for the generic plan instead. A
+  statement with a backslash or non-ASCII text is explained at `Bind` only
+  while `standard_conforming_strings` and `client_encoding` are known to be
+  what they were at `Parse`, since `EXPLAIN` reads its text again.
+- A statement that rules rewrite into several queries has a plan for each;
+  their costs and full reads add up.
+- Plans are cached for a minute by database, role and statement fingerprint,
+  so a statement run again with other values isn't explained again. Every
+  minute QueryGuard logs the cache's hit rate and the average time spent
+  explaining, which is the latency the cost check adds.
+- If PostgreSQL refuses the `EXPLAIN`, say because a column doesn't exist, the
+  client gets that error as its statement's answer, since the statement would
+  have failed the same way. Inside a transaction this fails the transaction,
+  just as the statement would have.
+
+Only a query string holding a single `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
+`MERGE`, `DECLARE` or `CREATE TABLE AS` is costed: `EXPLAIN` plans one
+statement at a time, and a later statement may need what an earlier one
+creates. `EXECUTE` of a statement made with SQL `PREPARE`, and the client's own
+`EXPLAIN ANALYZE`, are not costed either, and `EXPLAIN` has no time limit of
+its own yet.
+
+### Table sizes
+
+`max_scan_rows` reads table sizes (`pg_class.reltuples`) over QueryGuard's own
+connection to each database, refreshed every minute. Any role can read
+`pg_class`; pass the connection string with `-catalog-dsn`, and the password
+in `PGPASSWORD` or a `.pgpass` file:
+
+```sh
+PGPASSWORD=… ./bin/queryguard -config queryguard.json \
+  -catalog-dsn "host=db.internal port=5432 user=queryguard_catalog"
+```
+
+QueryGuard won't start with `max_scan_rows` and no `-catalog-dsn`. A table
+that has never been analyzed has no size yet, and isn't judged.
+
 ## Connection caps
 
 `max_connections` caps all sessions through QueryGuard, `tenant_max_connections`
@@ -166,10 +233,10 @@ all three versions:
 
 | Client | Checked |
 | --- | --- |
-| pgx 5.11 | plaintext, TLS, direct TLS, protocol 3.2, prepared statements, COPY, cancel on 3.0, 3.2 and 3.2 over TLS, keepalive settings; rejections in all three query modes, in a transaction and in a pipeline; warn mode; connection cap |
-| psql 18 | plaintext, TLS, direct TLS, protocol 3.2, Ctrl-C; rejection, in a transaction |
-| node-postgres 8 | plaintext, TLS, parameters, cancel; rejection, in a transaction |
-| psycopg 3.3 (libpq 18) | plaintext, TLS, direct TLS, protocol 3.2, parameters, cancel, cancel over TLS; rejection, in a transaction and in a pipeline |
+| pgx 5.11 | plaintext, TLS, direct TLS, protocol 3.2, prepared statements, COPY, cancel on 3.0, 3.2 and 3.2 over TLS, keepalive settings; rejections in all three query modes, in a transaction and in a pipeline; warn mode; connection cap; cost rules in all three query modes and in a transaction, errors from `EXPLAIN`, the plan cache, table sizes |
+| psql 18 | plaintext, TLS, direct TLS, protocol 3.2, Ctrl-C; rejection, in a transaction; costly statement |
+| node-postgres 8 | plaintext, TLS, parameters, cancel; rejection, in a transaction; costly statement, with and without parameters |
+| psycopg 3.3 (libpq 18) | plaintext, TLS, direct TLS, protocol 3.2, parameters, cancel, cancel over TLS; rejection, in a transaction and in a pipeline; costly statement, prepared and not |
 
 Every client also checks that its cancel key is the proxy's own, not the
 server's, and that the connection stays usable after a rejection.
@@ -177,30 +244,38 @@ server's, and that the connection stays usable after a rejection.
 ## Overhead
 
 `make overhead` times 5,000 runs of each query straight to PostgreSQL and
-through QueryGuard, without rules and with the rules from the compatibility
-tests. Ranges are over three runs on an Apple M1, with PostgreSQL 18 in Docker
-(OrbStack) and the proxy in the benchmark's process:
+through QueryGuard: without rules, with the rules from the compatibility
+tests, and with the cost rules. Ranges are over three runs on an Apple M1,
+with PostgreSQL 18 in Docker (OrbStack) and the proxy in the benchmark's
+process:
 
 | Query | Path | p50 | p99 |
 | --- | --- | --- | --- |
-| `select 1` | direct | 113–134 µs | 275–362 µs |
-| `select 1` | QueryGuard | 144–163 µs | 231–332 µs |
-| `select 1` | QueryGuard, TLS from the client | 158–168 µs | 255–416 µs |
-| `select 1` | QueryGuard with rules | 160–163 µs | 236–320 µs |
-| `select 1` | QueryGuard with rules, simple protocol | 155–180 µs | 205–351 µs |
-| 1,000 rows (about 50 KB) | direct | 925–989 µs | 1,157–1,481 µs |
-| 1,000 rows (about 50 KB) | QueryGuard | 1,029–1,056 µs | 1,210–1,516 µs |
-| 1,000 rows (about 50 KB) | QueryGuard, TLS from the client | 1,045–1,092 µs | 1,462–1,597 µs |
-| 1,000 rows (about 50 KB) | QueryGuard with rules | 1,037–1,039 µs | 1,457–1,913 µs |
-| 1,000 rows (about 50 KB) | QueryGuard with rules, simple protocol | 1,092–1,173 µs | 1,458–4,524 µs |
+| `select 1` | direct | 134–140 µs | 269–395 µs |
+| `select 1` | QueryGuard | 161–166 µs | 242–285 µs |
+| `select 1` | QueryGuard, TLS from the client | 155–161 µs | 241–278 µs |
+| `select 1` | QueryGuard with rules | 145–159 µs | 236–261 µs |
+| `select 1` | QueryGuard with rules, simple protocol | 173–180 µs | 266–330 µs |
+| `select 1` | QueryGuard with cost rules | 158–164 µs | 245–316 µs |
+| `select 1` | QueryGuard with cost rules, simple protocol | 178–182 µs | 257–351 µs |
+| 1,000 rows (about 50 KB) | direct | 932–933 µs | 1,253–1,263 µs |
+| 1,000 rows (about 50 KB) | QueryGuard | 1,032–1,096 µs | 1,321–1,433 µs |
+| 1,000 rows (about 50 KB) | QueryGuard, TLS from the client | 1,035–1,074 µs | 1,355–4,754 µs |
+| 1,000 rows (about 50 KB) | QueryGuard with rules | 1,029–1,034 µs | 1,319–1,420 µs |
+| 1,000 rows (about 50 KB) | QueryGuard with rules, simple protocol | 1,092–1,093 µs | 1,488–1,609 µs |
+| 1,000 rows (about 50 KB) | QueryGuard with cost rules | 1,034–1,103 µs | 1,393–1,546 µs |
+| 1,000 rows (about 50 KB) | QueryGuard with cost rules, simple protocol | 1,100–1,168 µs | 1,537–1,675 µs |
 
-The proxy adds about 20–40 µs to a round trip at p50, and 4–14% to the
-1,000-row result. pgx prepares each statement once, so with rules on only the
-first run is parsed and checked. With the simple protocol every run is, and
-p50 rose by up to about 20 µs for `select 1` and 120 µs for the 1,000-row
-query. The 4.5 ms p99 came from one noisy
-run; the other two were 1.5–1.8 ms. These are laptop numbers; the full
-benchmark matrix comes with v1.0.
+The proxy adds about 20–30 µs to a round trip at p50, and 10–18% to the
+1,000-row result. pgx prepares each statement once, so rules parse it only
+then, and the cost check finds its plan in the cache: neither adds anything
+measurable. With the simple protocol every run is parsed, which adds up to
+about 20 µs for `select 1` and 60 µs for the 1,000-row query; the cost check
+adds a few microseconds more, for the fingerprint. Each of these runs
+explains a statement only once, so they show the cache's cost, not
+`EXPLAIN`'s; the proxy logs the time spent explaining every minute. The
+4.8 ms p99 came from one noisy run; the other two were under 1.4 ms. These
+are laptop numbers; the full benchmark matrix comes with v1.0.
 
 ## License
 
