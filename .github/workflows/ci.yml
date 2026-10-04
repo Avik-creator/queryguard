@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only token: CI never writes to the repository.
+permissions:
+  contents: read
+
+# A new push to the same branch or pull request cancels the older run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go vet and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          # Latest 1.27 patch release; go.mod's "go 1.27.0" is only the minimum.
+          go-version: "1.27.x"
+          # Caches downloaded modules and compiled packages. The key changes
+          # when either file changes. go.sum appears with the first dependency.
+          cache-dependency-path: |
+            go.mod
+            go.sum
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      - run: make vet
+      - run: make test
+
+  postgres:
+    name: Load test data on Postgres ${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Keep testing the other versions when one fails.
+      fail-fast: false
+      matrix:
+        pg: [16, 17, 18]
+    env:
+      # A small data set so the load takes seconds, not minutes.
+      QG_CUSTOMERS: 10000
+      QG_ORDERS: 100000
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start Postgres ${{ matrix.pg }}
+        run: docker compose up -d --wait pg${{ matrix.pg }}
+
+      - name: Check the data loaded
+        run: |
+          orders=$(docker compose exec -T pg${{ matrix.pg }} \
+            psql -U postgres -d queryguard -Atc "select count(*) from orders")
+          echo "orders: $orders"
+          test "$orders" = "$QG_ORDERS"
+
+      - name: Show Postgres logs
+        if: failure()
+        run: docker compose logs pg${{ matrix.pg }}
