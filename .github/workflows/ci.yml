@@ -38,7 +38,7 @@ jobs:
       - run: make test
 
   postgres:
-    name: Load test data on Postgres ${{ matrix.pg }}
+    name: Postgres ${{ matrix.pg }}
     runs-on: ubuntu-latest
     strategy:
       # Keep testing the other versions when one fails.
@@ -61,6 +61,16 @@ jobs:
             psql -U postgres -d queryguard -Atc "select count(*) from orders")
           echo "orders: $orders"
           test "$orders" = "$QG_ORDERS"
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.x"
+          cache-dependency-path: |
+            go.mod
+            go.sum
+
+      - name: Run clients through the proxy
+        run: make compat PG=${{ matrix.pg }}
 
       - name: Show Postgres logs
         if: failure()
