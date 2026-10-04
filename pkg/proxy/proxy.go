@@ -63,6 +63,8 @@ type Server struct {
 	Catalog *plan.Catalog
 	// Plans caches statement plans for every session's cost rules.
 	Plans plan.Cache
+	// History learns how each statement's plans run, for calibrated costs and plan flips.
+	History plan.History
 
 	keys     cancelKeys
 	sessions sessionCount
@@ -172,7 +174,7 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	if p := s.ActivePolicy(); p != nil {
 		c := s.policies.Checker(role, log.With("client", client.RemoteAddr()))
 		// Postgres connects a client that names no database to the one named after its role.
-		c.Env = policy.Env{Database: cmp.Or(startup.Parameters["database"], role), Client: clientAddr(client), Plans: &s.Plans, Scheduler: s.scheduler()}
+		c.Env = policy.Env{Database: cmp.Or(startup.Parameters["database"], role), Client: clientAddr(client), Plans: &s.Plans, History: &s.History, Scheduler: s.scheduler()}
 		if s.Catalog != nil {
 			c.Env.Tables = s.Catalog
 		}

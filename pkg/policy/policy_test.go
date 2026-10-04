@@ -243,8 +243,13 @@ func TestCostCheckOnlyForStatementsEXPLAINCanPlan(t *testing.T) {
 		"select 1; select * from orders":  false,
 		"create index on orders (status)": false,
 	} {
-		if _, cost := c.Check(sql, standard); (cost != nil) != want {
-			t.Errorf("Check(%q) gave a cost check = %v; want %v", sql, cost != nil, want)
+		explained := false
+		// DDL passes a gate too, which explains nothing but forgets cached plans once it ran.
+		if _, gate := c.Check(sql, standard); gate != nil {
+			gate(t.Context(), session.Explain{Run: func() (string, error) { explained = true; return orderLookup, nil }}, false)
+		}
+		if explained != want {
+			t.Errorf("Check(%q) explained = %v; want %v", sql, explained, want)
 		}
 	}
 	if _, cost := mustParse(t, allRules).Checker("alice", discard).Check("select * from orders", standard); cost != nil {
@@ -504,6 +509,174 @@ func TestNoGateWithoutSchedulingOrCostRules(t *testing.T) {
 	}
 }
 
+// orderLookup is a lookup through the primary key; orderFullRead is the same statement once that index is gone.
+const (
+	orderLookup   = `[{"Plan": {"Node Type": "Index Scan", "Schema": "public", "Relation Name": "orders", "Index Name": "orders_pkey", "Total Cost": 8.44}}]`
+	orderFullRead = `[{"Plan": {"Node Type": "Seq Scan", "Schema": "public", "Relation Name": "orders", "Total Cost": 241255.31}}]`
+	lookupSQL     = "select * from orders where id = 1"
+)
+
+// train runs sql n times through c's gate, each run taking took.
+func train(t *testing.T, c *Checker, sql string, e session.Explain, n int, took time.Duration) {
+	t.Helper()
+	for range n {
+		a := pass(t, c, sql, e, false)
+		if a.Ran == nil {
+			t.Fatal("the gate asked for no report of how the statement ran")
+		}
+		a.Ran(took, true)
+		if a.Release != nil {
+			a.Release()
+		}
+	}
+}
+
+func TestGateChargesCalibratedCost(t *testing.T) {
+	for mode, want := range map[string][]string{"on": {"", "53000"}, "off": {"", ""}} {
+		history := &plan.History{}
+		trainer := gateChecker(t, `{"scheduler": {"max_active": 100}}`, "alice", discard)
+		trainer.Env.History = history
+		train(t, trainer, "select 1", costing(100), 10, 10*time.Millisecond)
+		train(t, trainer, lookupSQL, costing(100), 10, 100*time.Millisecond)
+
+		// The lookup takes 3.16 times the server's average time per cost unit, so with calibration it costs about 285, not 100.
+		c := gateChecker(t, `{"calibration": {"mode": "`+mode+`", "credibility": 1},
+			"tenants": {"alice": {"budget": {"rate": 1, "burst": 150, "when_over": "reject"}}}}`, "alice", discard)
+		c.Env.History = history
+		var got []string
+		for range 2 {
+			got = append(got, codeOf(pass(t, c, lookupSQL, costing(100), false).Reject))
+		}
+
+		if !slices.Equal(got, want) {
+			t.Errorf("calibration %s: rejections %q; want %q", mode, got, want)
+		}
+	}
+}
+
+func TestGateSendsPlanFlipToSlowLane(t *testing.T) {
+	var logs bytes.Buffer
+	c := gateChecker(t, `{"scheduler": {"slow_lane": {"max_active": 1, "queue_timeout": "10ms"}}}`, "alice", logger(&logs))
+	train(t, c, lookupSQL, explained(orderLookup, nil), 5, time.Millisecond)
+	// The index was dropped, so explaining the statement again gives a full read.
+	c.Env.Plans = &plan.Cache{RefreshOneIn: -1}
+
+	first := pass(t, c, lookupSQL, explained(orderFullRead, nil), false)
+	second := pass(t, c, lookupSQL, explained(orderFullRead, nil), false)
+
+	// The slow lane has one slot, so the second full read finds it taken.
+	if first.Reject != nil || first.Release == nil || codeOf(second.Reject) != "53000" || !strings.Contains(second.Reject.Detail, "slow lane") {
+		t.Errorf("first %+v, second %+v; want the first in the slow lane's only slot and the second turned away from it", first, second.Reject)
+	}
+	if n := strings.Count(logs.String(), `msg="plan flip"`); n != 1 || !strings.Contains(logs.String(), "slow_lane=true") {
+		t.Errorf("log %q; want one plan flip, moved to the slow lane", logs.String())
+	}
+}
+
+func TestPlanFlipInWarnModeOnlyLogs(t *testing.T) {
+	var logs bytes.Buffer
+	c := gateChecker(t, `{"plan_flips": {"mode": "warn"}, "scheduler": {"slow_lane": {"max_active": 1, "queue_timeout": "10ms"}}}`, "alice", logger(&logs))
+	train(t, c, lookupSQL, explained(orderLookup, nil), 5, time.Millisecond)
+	c.Env.Plans = &plan.Cache{RefreshOneIn: -1}
+
+	for range 2 {
+		if a := pass(t, c, lookupSQL, explained(orderFullRead, nil), false); a.Reject != nil {
+			t.Fatalf("got %v; want the full read to run in the fast lane", a.Reject)
+		}
+	}
+	if !strings.Contains(logs.String(), `msg="plan flip"`) || !strings.Contains(logs.String(), "slow_lane=false") {
+		t.Errorf("log %q; want the flip logged, not acted on", logs.String())
+	}
+}
+
+func TestPlanFlipWithoutSchedulerOnlyLogs(t *testing.T) {
+	var logs bytes.Buffer
+	c := costChecker(t, `{"rules": [{"check": "max_cost", "cost": 1000000}]}`, nil, logger(&logs))
+	train(t, c, lookupSQL, explained(orderLookup, nil), 5, time.Millisecond)
+	c.Env.Plans = &plan.Cache{RefreshOneIn: -1}
+
+	pass(t, c, lookupSQL, explained(orderFullRead, nil), false)
+
+	if !strings.Contains(logs.String(), `msg="plan flip"`) || !strings.Contains(logs.String(), "slow_lane=false") {
+		t.Errorf("log %q; want the flip logged with no slow lane to send it to", logs.String())
+	}
+}
+
+func TestPlanFlipLogNamesStaleTables(t *testing.T) {
+	var logs bytes.Buffer
+	c := gateChecker(t, `{"scheduler": {"max_active": 100}}`, "alice", logger(&logs))
+	c.Env.Tables = staleTables{"public.orders"}
+	train(t, c, lookupSQL, explained(orderLookup, nil), 5, time.Millisecond)
+	c.Env.Plans = &plan.Cache{RefreshOneIn: -1}
+
+	pass(t, c, lookupSQL, explained(orderFullRead, nil), false)
+
+	if !strings.Contains(logs.String(), "stale_tables=[public.orders]") {
+		t.Errorf("log %q; want the stale table named", logs.String())
+	}
+}
+
+func TestSlowRunExplainsStatementAgain(t *testing.T) {
+	var logs bytes.Buffer
+	c := gateChecker(t, `{"scheduler": {"slow_lane": {"max_active": 1, "queue_timeout": "10ms"}}}`, "alice", logger(&logs))
+	explains := 0
+	lookup := session.Explain{Run: func() (string, error) { explains++; return orderLookup, nil }}
+	train(t, c, lookupSQL, lookup, 5, time.Millisecond)
+
+	// Postgres ran a generic plan, or the index went away outside the proxy, so the cached plan no longer says how it runs.
+	a := pass(t, c, lookupSQL, lookup, false)
+	a.Ran(3*time.Second, true)
+	a.Release()
+	next := pass(t, c, lookupSQL, lookup, false)
+	taken := pass(t, c, lookupSQL, lookup, false)
+
+	if explains != 2 {
+		t.Errorf("%d explains; want the cached plan explained again after the slow run", explains)
+	}
+	if next.Release == nil || codeOf(taken.Reject) != "53000" || !strings.Contains(logs.String(), "far slower") {
+		t.Errorf("next %+v, then %v, log %q; want the statement held in the slow lane after its slow run", next, taken.Reject, logs.String())
+	}
+}
+
+func TestGenericStandInIsNotLearned(t *testing.T) {
+	c := gateChecker(t, `{"scheduler": {"max_active": 100}}`, "alice", discard)
+	e := explained(orderLookup, nil)
+	e.Generic = true
+
+	if a := pass(t, c, lookupSQL, e, false); a.Ran != nil {
+		t.Error("a generic plan, explained because the values were too large, was recorded as the statement's plan")
+	}
+}
+
+func TestCursorIsNotLearned(t *testing.T) {
+	c := gateChecker(t, `{"scheduler": {"max_active": 100}}`, "alice", discard)
+
+	// Opening a cursor runs nothing; the work happens in FETCH, which isn't timed.
+	if a := pass(t, c, "declare c cursor for "+lookupSQL, explained(orderLookup, nil), false); a.Ran != nil {
+		t.Error("DECLARE's run was to be recorded as its plan's timing")
+	}
+}
+
+func TestSchemaChangeForgetsCachedPlans(t *testing.T) {
+	c := costChecker(t, `{"rules": [{"check": "max_cost", "cost": 1000000}]}`, nil, discard)
+	explains := 0
+	lookup := session.Explain{Run: func() (string, error) { explains++; return orderLookup, nil }}
+	for _, sql := range []string{lookupSQL, lookupSQL, "drop index orders_pkey", lookupSQL, "analyze orders", lookupSQL} {
+		_, gate := c.Check(sql, standard)
+		if gate == nil {
+			t.Fatalf("Check(%q) gave no gate", sql)
+		}
+		// Plans are forgotten once the change is committed, as another session's EXPLAIN may run before that.
+		if a := gate(t.Context(), lookup, false); a.Settled != nil {
+			a.Settled()
+		}
+	}
+
+	if explains != 3 {
+		t.Errorf("%d explains; want the lookup explained again after DROP INDEX and after ANALYZE", explains)
+	}
+}
+
 func TestHolderAppliesReloadToExistingCheckers(t *testing.T) {
 	var h Holder
 	h.Store(mustParse(t, `{}`))
@@ -573,6 +746,10 @@ func TestParseRejectsBadConfig(t *testing.T) {
 		`{"tenant_defaults": {"mode": "warn"}}`:                                     "tenant_defaults",
 		`{"scheduler": {"max_active": -1}}`:                                         "max_active",
 		`{"rules": [{"check": "deny_ddl", "match": {"clients": ["10.0.0.0/33"]}}]}`: "10.0.0.0/33",
+		`{"calibration": {"mode": "maybe"}}`:                                        "maybe",
+		`{"calibration": {"credibility": -1}}`:                                      "credibility",
+		`{"plan_flips": {"mode": "loud"}}`:                                          "loud",
+		`{"plan_flips": {"quarantine": "-1m"}}`:                                     "quarantine",
 	} {
 		if _, err := Parse([]byte(config)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("Parse(%s) = %v; want an error mentioning %q", config, err, want)
@@ -656,6 +833,14 @@ func (ts tables) Rows(_ string, t plan.Table) (float64, bool) {
 	n, ok := ts[t.String()]
 	return n, ok
 }
+
+func (ts tables) Stale(string, plan.Table) bool { return false }
+
+// staleTables have no known size, and the listed ones have stale statistics.
+type staleTables []string
+
+func (ts staleTables) Rows(string, plan.Table) (float64, bool) { return 0, false }
+func (ts staleTables) Stale(_ string, t plan.Table) bool       { return slices.Contains(ts, t.String()) }
 
 // standard is how Postgres reads SQL by default, which is how the parser reads it.
 var standard = session.Settings{StandardConformingStrings: "on", ClientEncoding: "UTF8"}

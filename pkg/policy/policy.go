@@ -37,6 +37,8 @@ type Config struct {
 	TrustedRoles         []string          `json:"trusted_roles"`          // roles whose statements may name their tenant in a tag
 	TenantTag            string            `json:"tenant_tag"`             // the sqlcommenter key naming the tenant; "" means "tenant"
 	Scheduler            Scheduler         `json:"scheduler"`
+	Calibration          Calibration       `json:"calibration"`
+	PlanFlips            PlanFlips         `json:"plan_flips"`
 	TenantDefaults       Tenant            `json:"tenant_defaults"` // the budget and timeouts of tenants that set none
 	Rules                []Rule            `json:"rules"`
 	Tenants              map[string]Tenant `json:"tenants"` // keyed by tenant: a role, or a tag from a trusted role
@@ -90,6 +92,18 @@ type Scheduler struct {
 type Lane struct {
 	MaxActive    int      `json:"max_active"`    // 0 means no limit
 	QueueTimeout Duration `json:"queue_timeout"` // 0 means 60s
+}
+
+// Calibration sets how measured run times correct the planner's costs.
+type Calibration struct {
+	Mode        string  `json:"mode"`        // "on" (the default) charges budgets the calibrated cost; "off" charges the planner's
+	Credibility float64 `json:"credibility"` // runs a plan needs before its own timing counts as much as the server's; 0 means 10
+}
+
+// PlanFlips sets what happens to a statement whose plan looks like a regression from its usual one.
+type PlanFlips struct {
+	Mode       Mode     `json:"mode"`       // enforce (the default) runs it in the slow lane; warn only logs it
+	Quarantine Duration `json:"quarantine"` // about how long a new plan is held as a flip before it is taken as the usual one; 0 means 10m
 }
 
 // Duration is a time.Duration written in JSON as a string such as "5s" or "1m30s".
@@ -265,6 +279,18 @@ func (p *Policy) compile() error {
 		budgeted = budgeted || t.Budget != nil
 		timed = timed || t.StatementTimeout > 0 || t.IdleInTransactionTimeout > 0
 	}
+	if m := c.Calibration.Mode; m != "" && m != "on" && m != "off" {
+		errs = append(errs, fmt.Errorf("calibration mode %q: want on or off", m))
+	}
+	if c.Calibration.Credibility < 0 {
+		errs = append(errs, errors.New("calibration credibility must not be negative"))
+	}
+	if !c.PlanFlips.Mode.valid() {
+		errs = append(errs, fmt.Errorf("plan_flips mode %q: want enforce or warn", c.PlanFlips.Mode))
+	}
+	if c.PlanFlips.Quarantine < 0 {
+		errs = append(errs, errors.New("plan_flips quarantine must not be negative"))
+	}
 	slots := s.MaxActive > 0 || s.SlowLane.MaxActive > 0
 	// Fair shares of slots go by cost too, so limited slots need plans as budgets do.
 	p.needsCost = p.costRules || budgeted || slots
@@ -351,6 +377,11 @@ func (b *Budget) sched() sched.Budget {
 	return sched.Budget{Rate: b.Rate, Burst: b.Burst, Share: b.Share, MinCharge: b.MinCharge, WhenOver: sched.Action(b.WhenOver)}
 }
 
+// tuning returns how the plan history judges.
+func (p *Policy) tuning() plan.Tuning {
+	return plan.Tuning{Credibility: p.cfg.Calibration.Credibility, Quarantine: time.Duration(p.cfg.PlanFlips.Quarantine)}
+}
+
 // tenant returns a tenant's settings, with tenant_defaults' budget and timeouts where it sets none.
 func (p *Policy) tenant(name string) Tenant {
 	t, d := p.cfg.Tenants[name], p.cfg.TenantDefaults
@@ -380,9 +411,10 @@ func newChecker(policy func() *Policy, role string, log *slog.Logger) *Checker {
 	return &Checker{policy: policy, role: role, log: log.With("role", role)}
 }
 
-// TableSizes knows the planner's row count of each table.
+// TableSizes knows the planner's row count of each table, and whether its statistics are stale.
 type TableSizes interface {
 	Rows(database string, t plan.Table) (rows float64, known bool)
+	Stale(database string, t plan.Table) bool
 }
 
 // Env is what a Checker works with besides its policy.
@@ -390,6 +422,7 @@ type Env struct {
 	Database  string           // the session's database, part of every plan's cache key
 	Client    netip.Addr       // the client's address, for rules that match on it
 	Plans     *plan.Cache      // shared by every session; nil gives the Checker a cache of its own
+	History   *plan.History    // shared by every session; nil gives the Checker a history of its own
 	Tables    TableSizes       // needed by max_scan_rows; nil leaves every table's size unknown
 	Scheduler *sched.Scheduler // shared by every session; nil admits every statement at once
 }
@@ -450,7 +483,7 @@ func (c *Checker) Check(sql string, set session.Settings) (*pgproto3.ErrorRespon
 			checks[blocked.Check].hint), nil
 	}
 	// EXPLAIN plans one statement at a time, and a later statement may need what an earlier one creates.
-	if !p.gated && !(p.costRules && q.Explainable) {
+	if !p.gated && !(p.costRules && (q.Explainable || q.DDL || q.Analyzes)) {
 		return nil, nil
 	}
 	return nil, c.gate(p, sql, q, who)
@@ -489,9 +522,11 @@ func (c *Checker) gate(p *Policy, sql string, q sqlparse.Query, who subject) ses
 		}
 
 		var cost float64
+		var flipped bool
 		// A session that can't explain the statement here passes no Run, and it is judged without a plan.
 		if q.Explainable && e.Run != nil && (p.costRules || (s != nil && p.needsCost)) {
-			pl, rej, ok := c.plan(p, sql, who, warn, e)
+			fingerprint := sqlparse.Fingerprint(sql)
+			pl, rej, ok := c.plan(p, sql, fingerprint, who, warn, e)
 			switch {
 			case rej != nil:
 				return session.Admission{Reject: rej}
@@ -500,6 +535,17 @@ func (c *Checker) gate(p *Policy, sql string, q sqlparse.Query, who subject) ses
 				return session.Admission{}
 			}
 			cost = pl.Cost
+			// A generic plan standing in for one with values too large to send twice says nothing of how the statement runs,
+			// and nor does opening a cursor, whose query runs in later FETCHes.
+			if !e.Generic && !q.Cursor {
+				cost, flipped, a.Ran = c.learn(p, sql, fingerprint, who, warn, pl)
+			}
+		}
+		if q.DDL || q.Analyzes {
+			// Plans may change once the statement is committed, so they are explained again; forgetting them sooner would let
+			// another session cache an old plan in between.
+			plans, prefix := c.plans(), c.Env.Database+"\x00"
+			a.Settled = func() { plans.Forget(func(k string) bool { return strings.HasPrefix(k, prefix) }) }
 		}
 		if s == nil {
 			return a
@@ -519,6 +565,9 @@ func (c *Checker) gate(p *Policy, sql string, q sqlparse.Query, who subject) ses
 			}
 			lane = l
 		}
+		if flipped {
+			lane = sched.Slow
+		}
 		if !running {
 			release, err := s.Acquire(ctx, who.tenant, lane)
 			switch {
@@ -537,14 +586,10 @@ func (c *Checker) gate(p *Policy, sql string, q sqlparse.Query, who subject) ses
 }
 
 // plan gets sql's plan, cached or explained by the session, and judges it by the cost rules; ok is false when Postgres refused sql.
-func (c *Checker) plan(p *Policy, sql string, who subject, warn bool, e session.Explain) (_ plan.Plan, rej *pgproto3.ErrorResponse, ok bool) {
-	if c.Env.Plans == nil {
-		c.Env.Plans = &plan.Cache{}
-	}
-	fingerprint := sqlparse.Fingerprint(sql)
-	// Plans differ by database and, through row-level security, by role; a generic plan holds for any values.
-	key := strings.Join([]string{c.Env.Database, c.role, fingerprint, strconv.FormatBool(e.Generic)}, "\x00")
-	pl, err := c.Env.Plans.Get(key, func() (plan.Plan, error) {
+func (c *Checker) plan(p *Policy, sql, fingerprint string, who subject, warn bool, e session.Explain) (_ plan.Plan, rej *pgproto3.ErrorResponse, ok bool) {
+	// A generic plan holds for any values.
+	key := c.statementKey(fingerprint) + "\x00" + strconv.FormatBool(e.Generic)
+	pl, err := c.plans().Get(key, func() (plan.Plan, error) {
 		out, err := e.Run()
 		if err != nil {
 			return plan.Plan{}, err
@@ -575,6 +620,65 @@ func (c *Checker) plan(p *Policy, sql string, who subject, warn bool, e session.
 	why := checks[blocked.Check].overBy(pl, rows, *blocked)
 	return pl, rejection("54000", "queryguard: rule "+blocked.Check+" blocks this statement",
 		"Statement fingerprint "+fingerprint+". "+why, checks[blocked.Check].hint), true
+}
+
+// learn looks pl up in its statement's history; it returns the cost to charge, whether to run it in the slow lane, and what to record once it ran.
+func (c *Checker) learn(p *Policy, sql, fingerprint string, who subject, warn bool, pl plan.Plan) (cost float64, slow bool, ran func(time.Duration, bool)) {
+	if c.Env.History == nil {
+		c.Env.History = &plan.History{}
+	}
+	history, plans, tune, key := c.Env.History, c.plans(), p.tuning(), c.statementKey(fingerprint)
+	v := history.Judge(key, pl, tune)
+	cost = pl.Cost
+	if p.cfg.Calibration.Mode != "off" {
+		cost *= v.Factor
+	}
+	if v.Flip != "" {
+		slow = p.cfg.PlanFlips.Mode != Warn && !warn && c.Env.Scheduler != nil
+		if v.First {
+			c.log.Warn("plan flip", append([]any{"rule", "plan_flips", "tenant", who.tenant, "fingerprint", fingerprint,
+				"query", sqlparse.Normalize(sql), "why", v.Flip, "cost", pl.Cost, "slow_lane", slow}, c.stale(pl)...)...)
+		}
+	}
+	return cost, slow, func(took time.Duration, finished bool) {
+		if !history.Ran(key, pl, took, finished, tune) {
+			return
+		}
+		// The cached plan may be out of date, as after an index was dropped, so the statement is explained again.
+		plans.Forget(func(k string) bool { return strings.HasPrefix(k, key+"\x00") })
+		c.log.Warn("statement ran far slower than its plan predicts", append([]any{"tenant", who.tenant, "fingerprint", fingerprint,
+			"took", took, "cost", pl.Cost}, c.stale(pl)...)...)
+	}
+}
+
+// stale returns log attributes naming the tables pl reads whose statistics are stale, a likely cause of a bad plan.
+func (c *Checker) stale(pl plan.Plan) []any {
+	if c.Env.Tables == nil {
+		return nil
+	}
+	var stale []plan.Table
+	for _, t := range slices.Concat(pl.SeqScans, pl.Indexed) {
+		if c.Env.Tables.Stale(c.Env.Database, t) {
+			stale = append(stale, t)
+		}
+	}
+	if stale == nil {
+		return nil
+	}
+	return []any{"stale_tables", stale, "hint", "Run ANALYZE on them."}
+}
+
+// statementKey names a statement in the plan cache and history: plans differ by database and, through row-level security, by role.
+func (c *Checker) statementKey(fingerprint string) string {
+	return strings.Join([]string{c.Env.Database, c.role, fingerprint}, "\x00")
+}
+
+// plans returns the plan cache, making one of the Checker's own when it has none.
+func (c *Checker) plans() *plan.Cache {
+	if c.Env.Plans == nil {
+		c.Env.Plans = &plan.Cache{}
+	}
+	return c.Env.Plans
 }
 
 // CheckStartup checks the settings a client asks for at login, which no statement shows; it returns a FATAL error to refuse the login.
