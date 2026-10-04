@@ -69,6 +69,22 @@ stops within about 2 seconds. A value the client sets, directly or in
 server's setting alone, and is needed on platforms where PostgreSQL rejects a
 non-zero value.
 
+## Compatibility
+
+`make compat` runs these clients through QueryGuard against a real PostgreSQL
+(`PG=16`, `17` or `18`; start the servers with `make up`), and CI runs it on
+all three versions:
+
+| Client | Checked |
+| --- | --- |
+| pgx 5.11 | plaintext, TLS, direct TLS, protocol 3.2, prepared statements, COPY, cancel on 3.0, 3.2 and 3.2 over TLS |
+| psql 18 | plaintext, TLS, direct TLS, protocol 3.2, Ctrl-C |
+| node-postgres 8 | plaintext, TLS, parameters, cancel |
+| psycopg 3.3 (libpq 18) | plaintext, TLS, direct TLS, protocol 3.2, parameters, cancel, cancel over TLS |
+
+Every client also checks that its cancel key is the proxy's own, not the
+server's.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

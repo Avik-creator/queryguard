@@ -105,7 +105,7 @@ func TestPgxCancel(t *testing.T) {
 				t.Errorf("client was given the real backend pid %d", realPID)
 			}
 
-			time.AfterFunc(300*time.Millisecond, func() { conn.PgConn().CancelRequest(context.Background()) })
+			time.AfterFunc(300*time.Millisecond, func() { conn.PgConn().CancelRequest(t.Context()) })
 			start := time.Now()
 			// A cancel that never arrives fails here after 10s rather than after the whole sleep.
 			sleepCtx, stop := context.WithTimeout(ctx, 10*time.Second)
@@ -132,7 +132,7 @@ func TestPostgresStopsQueryWhenClientVanishes(t *testing.T) {
 	running := make(chan struct{})
 	go func() {
 		defer close(running)
-		victim.Exec(context.Background(), "select count(*) from generate_series(1, 3000000000)")
+		victim.Exec(t.Context(), "select count(*) from generate_series(1, 3000000000)")
 	}()
 	waitFor(t, 5*time.Second, func() bool { return activeQueries(t, watcher, app) == 1 })
 
@@ -173,7 +173,7 @@ type queryGuard struct {
 	caFile string // PEM that verifies the proxy's certificate for localhost
 }
 
-func startProxy(t *testing.T) *queryGuard {
+func startProxy(t testing.TB) *queryGuard {
 	t.Helper()
 	upstream := os.Getenv("QG_TEST_UPSTREAM")
 	if upstream == "" {
@@ -209,14 +209,19 @@ func startProxy(t *testing.T) *queryGuard {
 }
 
 // connect opens a pgx connection through the proxy as the docker compose superuser, with extra connection options.
-func (qg *queryGuard) connect(t *testing.T, opts string) *pgx.Conn {
+func (qg *queryGuard) connect(t testing.TB, opts string) *pgx.Conn {
 	t.Helper()
-	host, port, _ := net.SplitHostPort(qg.addr)
+	return connectTo(t, qg.addr, opts)
+}
+
+// connectTo opens a pgx connection to addr; verify-full connections use the name localhost so the test certificate matches.
+func connectTo(t testing.TB, addr, opts string) *pgx.Conn {
+	t.Helper()
+	host, port, _ := net.SplitHostPort(addr)
 	if strings.Contains(opts, "verify-full") {
 		host = "localhost"
 	}
-	password := cmp.Or(os.Getenv("PGPASSWORD"), "queryguard")
-	dsn := fmt.Sprintf("host=%s port=%s user=postgres password=%s dbname=queryguard connect_timeout=5 %s", host, port, password, opts)
+	dsn := fmt.Sprintf("host=%s port=%s user=postgres password=%s dbname=queryguard connect_timeout=5 %s", host, port, password(), opts)
 	conn, err := pgx.Connect(t.Context(), dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -224,3 +229,6 @@ func (qg *queryGuard) connect(t *testing.T, opts string) *pgx.Conn {
 	t.Cleanup(func() { conn.Close(context.Background()) })
 	return conn
 }
+
+// password is the docker compose superuser's password.
+func password() string { return cmp.Or(os.Getenv("PGPASSWORD"), "queryguard") }
