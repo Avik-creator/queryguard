@@ -59,6 +59,16 @@ checks its own, so with TLS on both sides:
 
 Clients connecting to QueryGuard without TLS always work.
 
+## Clients that disconnect mid-query
+
+PostgreSQL normally keeps running a query after its client has gone, until
+the query next reads or writes the socket. QueryGuard sends
+`client_connection_check_interval=2000` with each new session, so the query
+stops within about 2 seconds. A value the client sets, directly or in
+`options`, is kept. Change it with `-client-check-interval`; `0` leaves the
+server's setting alone, and is needed on platforms where PostgreSQL rejects a
+non-zero value.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

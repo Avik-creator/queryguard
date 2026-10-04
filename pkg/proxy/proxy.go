@@ -10,6 +10,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +25,12 @@ const (
 	DefaultShutdownTimeout = 30 * time.Second
 )
 
+// DefaultClientCheckInterval is the suggested ClientCheckInterval; zero there means off.
+const DefaultClientCheckInterval = 2 * time.Second
+
+// checkIntervalParam makes Postgres poll the socket during a query and stop it once the connection is closed.
+const checkIntervalParam = "client_connection_check_interval"
+
 // Server relays client connections to Upstream, one server connection per client.
 type Server struct {
 	Upstream        Upstream
@@ -30,6 +38,9 @@ type Server struct {
 	StartupTimeout  time.Duration // how long a new client has to send its startup message
 	ShutdownTimeout time.Duration // how long sessions may drain after Serve stops
 	Logger          *slog.Logger  // nil means slog.Default()
+
+	// ClientCheckInterval is sent as client_connection_check_interval unless the client set it; 0 sends nothing.
+	ClientCheckInterval time.Duration
 
 	keys cancelKeys
 }
@@ -113,6 +124,7 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 
 // relay connects client to an upstream connection and copies bytes both ways until either side closes.
 func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, startup *pgproto3.StartupMessage) {
+	s.addCheckInterval(startup)
 	server, err := s.Upstream.Acquire(ctx, startup)
 	if err != nil {
 		log.Error("connect to upstream", "client", client.RemoteAddr(), "err", err)
@@ -157,6 +169,19 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	})
 	copies.Wait()
 	forget()
+}
+
+// addCheckInterval sets client_connection_check_interval in startup unless the client set it, directly or in options.
+func (s *Server) addCheckInterval(startup *pgproto3.StartupMessage) {
+	ms := s.ClientCheckInterval.Milliseconds()
+	if ms <= 0 {
+		return
+	}
+	// A startup parameter beats the same setting in options, so ours would silently replace the client's.
+	if _, set := startup.Parameters[checkIntervalParam]; set || strings.Contains(startup.Parameters["options"], checkIntervalParam) {
+		return
+	}
+	startup.Parameters[checkIntervalParam] = strconv.FormatInt(ms, 10)
 }
 
 // sameCertificate reports whether both sides use TLS and the server presented the proxy's own certificate, so channel binding works end to end.

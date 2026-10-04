@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"slices"
@@ -28,6 +29,35 @@ func TestForwardsStartupToUpstream(t *testing.T) {
 	got := mustReceive[*pgproto3.StartupMessage](t, pg.received)
 	if got.Parameters["user"] != "alice" || got.Parameters["database"] != "shop" {
 		t.Errorf("upstream got %v; want user alice, database shop", got.Parameters)
+	}
+}
+
+func TestAsksPostgresToNoticeClosedClients(t *testing.T) {
+	for name, tc := range map[string]struct {
+		interval time.Duration
+		params   map[string]string
+		want     string
+	}{
+		"added":                  {2 * time.Second, nil, "2000"},
+		"client's value kept":    {2 * time.Second, map[string]string{checkIntervalParam: "500"}, "500"},
+		"client's options kept":  {2 * time.Second, map[string]string{"options": "-c client_connection_check_interval=500"}, ""},
+		"off when interval is 0": {0, nil, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pg := startFakePostgres(t)
+			s := newServer(t, pg.addr)
+			s.ClientCheckInterval = tc.interval
+			addr, _ := startProxy(t, s)
+			params := map[string]string{"user": "alice"}
+			maps.Copy(params, tc.params)
+
+			send(t, dial(t, addr), &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30, Parameters: params})
+
+			got := mustReceive[*pgproto3.StartupMessage](t, pg.received)
+			if v := got.Parameters[checkIntervalParam]; v != tc.want {
+				t.Errorf("upstream got %s=%q; want %q", checkIntervalParam, v, tc.want)
+			}
+		})
 	}
 }
 

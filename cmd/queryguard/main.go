@@ -30,6 +30,7 @@ type options struct {
 	tlsKey          string
 	upstreamSSL     string
 	upstreamCA      string
+	clientCheck     time.Duration
 	shutdownTimeout time.Duration
 }
 
@@ -41,6 +42,8 @@ func main() {
 	flag.StringVar(&opts.tlsKey, "tls-key", "", "PEM private key for client TLS; needs -tls-cert")
 	flag.StringVar(&opts.upstreamSSL, "upstream-sslmode", "disable", "TLS to Postgres: disable, require or verify-full")
 	flag.StringVar(&opts.upstreamCA, "upstream-ca", "", "PEM CA certificates for verify-full; default is the system roots")
+	flag.DurationVar(&opts.clientCheck, "client-check-interval", proxy.DefaultClientCheckInterval,
+		"how often Postgres checks that a client is still there during a query; 0 leaves Postgres's setting alone")
 	flag.DurationVar(&opts.shutdownTimeout, "shutdown-timeout", proxy.DefaultShutdownTimeout,
 		"how long open sessions may continue after a shutdown signal")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -80,10 +83,11 @@ func run(opts options, log *slog.Logger) error {
 		"tls", tlsConfig != nil, "upstream_sslmode", opts.upstreamSSL)
 
 	s := &proxy.Server{
-		Upstream:        proxy.Dialer{Addr: opts.upstream, TLSConfig: upstreamTLSConfig},
-		TLSConfig:       tlsConfig,
-		ShutdownTimeout: opts.shutdownTimeout,
-		Logger:          log,
+		Upstream:            proxy.Dialer{Addr: opts.upstream, TLSConfig: upstreamTLSConfig},
+		TLSConfig:           tlsConfig,
+		ClientCheckInterval: opts.clientCheck,
+		ShutdownTimeout:     opts.shutdownTimeout,
+		Logger:              log,
 	}
 	if err := s.Serve(ctx, ln); err != nil {
 		return err
