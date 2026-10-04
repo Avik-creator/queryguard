@@ -1,0 +1,51 @@
+# Local Postgres servers for development and integration tests: one per
+# supported major version. PG19 joins as experimental once it is released.
+
+# Settings shared by every server, merged in below with "<<: *postgres".
+x-postgres: &postgres
+  environment:
+    POSTGRES_DB: queryguard
+    POSTGRES_USER: postgres
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-queryguard}
+  command:
+    - -c
+    - shared_preload_libraries=pg_stat_statements
+    - -c
+    - track_io_timing=on
+  # Parallel query workers share memory through /dev/shm. Docker's 64 MB
+  # default is too small for parallel hash joins over the 10M-row test tables.
+  shm_size: 256mb
+  healthcheck:
+    # Check over TCP, not the Unix socket: during first-time setup Postgres
+    # runs a temporary server on the socket only, which would pass too early.
+    test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d queryguard"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+    start_period: 30s
+
+services:
+  pg16:
+    <<: *postgres
+    image: postgres:16
+    ports: ["127.0.0.1:5416:5432"]
+    volumes: ["pg16:/var/lib/postgresql/data"]
+
+  pg17:
+    <<: *postgres
+    image: postgres:17
+    ports: ["127.0.0.1:5417:5432"]
+    volumes: ["pg17:/var/lib/postgresql/data"]
+
+  pg18:
+    <<: *postgres
+    image: postgres:18
+    ports: ["127.0.0.1:5418:5432"]
+    # From 18 the image keeps data under /var/lib/postgresql/18/docker, so the
+    # volume mounts one level higher than for 16 and 17.
+    volumes: ["pg18:/var/lib/postgresql"]
+
+volumes:
+  pg16:
+  pg17:
+  pg18:
