@@ -5,9 +5,11 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Avik-creator/queryguard/internal/testcert"
+	"github.com/Avik-creator/queryguard/pkg/policy"
 )
 
 func TestUpstreamTLSDisable(t *testing.T) {
@@ -89,6 +91,25 @@ func TestLoadPolicy(t *testing.T) {
 	writeFile(t, bad, []byte(`{"rules": [{"check": "nope"}]}`))
 	if _, err := loadPolicy(bad); err == nil {
 		t.Error("invalid config gave no error")
+	}
+}
+
+func TestNewCatalog(t *testing.T) {
+	scans, err := policy.Parse([]byte(`{"rules": [{"check": "max_scan_rows", "rows": 1000}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c, err := newCatalog("", nil, nil); c != nil || err != nil {
+		t.Errorf("no -catalog-dsn gave %v, %v; want nil, nil", c, err)
+	}
+	if _, err := newCatalog("", scans, nil); err == nil || !strings.Contains(err.Error(), "-catalog-dsn") {
+		t.Errorf("max_scan_rows without -catalog-dsn gave %v; want an error naming the flag", err)
+	}
+	if _, err := newCatalog("host=db port=notanumber", scans, nil); err == nil {
+		t.Error("an invalid -catalog-dsn gave no error")
+	}
+	if c, err := newCatalog("host=db user=qg_monitor", scans, nil); c == nil || err != nil || c.DSN != "host=db user=qg_monitor" {
+		t.Errorf("valid -catalog-dsn gave %+v, %v", c, err)
 	}
 }
 

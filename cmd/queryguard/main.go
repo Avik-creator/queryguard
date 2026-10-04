@@ -15,9 +15,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/proxy"
 	"github.com/Avik-creator/queryguard/pkg/wire"
+	"github.com/jackc/pgx/v5"
 )
 
 // version is set at build time with -ldflags "-X main.version=v0.1.0".
@@ -34,6 +36,7 @@ type options struct {
 	clientCheck     time.Duration
 	keepAlive       bool
 	config          string
+	catalogDSN      string
 	shutdownTimeout time.Duration
 }
 
@@ -48,6 +51,8 @@ func main() {
 	flag.DurationVar(&opts.clientCheck, "client-check-interval", proxy.DefaultClientCheckInterval,
 		"how often Postgres checks that a client is still there during a query; 0 leaves Postgres's setting alone")
 	flag.StringVar(&opts.config, "config", "", "JSON policy file with rules and connection caps; none means no checks")
+	flag.StringVar(&opts.catalogDSN, "catalog-dsn", "",
+		"connection string for reading table sizes, needed by max_scan_rows; the password can come from PGPASSWORD or a .pgpass file")
 	flag.BoolVar(&opts.keepAlive, "tcp-keepalive", true,
 		"find silently dead clients and servers in about 30s; false keeps the operating system's timing")
 	flag.DurationVar(&opts.shutdownTimeout, "shutdown-timeout", proxy.DefaultShutdownTimeout,
@@ -80,6 +85,10 @@ func run(opts options, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	catalog, err := newCatalog(opts.catalogDSN, pol, log)
+	if err != nil {
+		return err
+	}
 
 	// Ctrl-C or a SIGTERM from Docker or systemd starts a clean shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -102,6 +111,7 @@ func run(opts options, log *slog.Logger) error {
 		ClientCheckInterval: opts.clientCheck,
 		KeepAlive:           keepAlive,
 		Policy:              pol,
+		Catalog:             catalog,
 		ShutdownTimeout:     opts.shutdownTimeout,
 		Logger:              log,
 	}
@@ -118,6 +128,20 @@ func loadPolicy(path string) (*policy.Policy, error) {
 		return nil, nil
 	}
 	return policy.Load(path)
+}
+
+// newCatalog returns the table-size reader for dsn, or nil without one, which a policy with max_scan_rows can't do without.
+func newCatalog(dsn string, pol *policy.Policy, log *slog.Logger) (*plan.Catalog, error) {
+	if dsn == "" {
+		if pol != nil && pol.NeedsCatalog() {
+			return nil, errors.New("rule max_scan_rows needs table sizes: set -catalog-dsn")
+		}
+		return nil, nil
+	}
+	if _, err := pgx.ParseConfig(dsn); err != nil {
+		return nil, fmt.Errorf("-catalog-dsn: %w", err)
+	}
+	return &plan.Catalog{DSN: dsn, Log: log}, nil
 }
 
 // loadTLS returns the client TLS config, or nil when neither file is given.

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/session"
 	"github.com/Avik-creator/queryguard/pkg/wire"
@@ -31,6 +32,9 @@ const (
 
 // DefaultClientCheckInterval is the suggested ClientCheckInterval; zero there means off.
 const DefaultClientCheckInterval = 2 * time.Second
+
+// planStatsInterval is how often the plan cache's hit rate and explain time are logged.
+const planStatsInterval = time.Minute
 
 // checkIntervalParam makes Postgres poll the socket during a query and stop it once the connection is closed.
 const checkIntervalParam = "client_connection_check_interval"
@@ -49,9 +53,12 @@ type Server struct {
 	KeepAlive net.KeepAliveConfig
 	// Policy holds the statement rules and connection caps; nil checks nothing.
 	Policy *policy.Policy
+	// Catalog gives the cost rules table sizes; nil leaves every size unknown.
+	Catalog *plan.Catalog
 
 	keys     cancelKeys
 	sessions sessionCount
+	plans    plan.Cache
 }
 
 // Serve accepts on ln until ctx is cancelled, then drains sessions for up to ShutdownTimeout.
@@ -65,6 +72,10 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	// Sessions outlive ctx while draining; this context ends them when the timeout runs out.
 	sessionCtx, closeSessions := context.WithCancel(context.WithoutCancel(ctx))
 	defer closeSessions()
+
+	if s.Policy != nil {
+		go s.logPlanStats(ctx, log, time.Tick(planStatsInterval))
+	}
 
 	var sessions sync.WaitGroup
 	for {
@@ -151,6 +162,11 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 				client.Write(buf)
 			}
 			return
+		}
+		// Postgres connects a client that names no database to the one named after its role.
+		c.Costs = policy.Costs{Database: cmp.Or(startup.Parameters["database"], role), Plans: &s.plans}
+		if s.Catalog != nil {
+			c.Costs.Tables = s.Catalog
 		}
 		check = c
 		total, tenant := s.Policy.ConnectionLimits(role)
@@ -240,3 +256,29 @@ func sameCertificate(client, server net.Conn, cfg *tls.Config) bool {
 	peer := serverTLS.ConnectionState().PeerCertificates
 	return len(peer) > 0 && bytes.Equal(peer[0].Raw, cfg.Certificates[0].Certificate[0])
 }
+
+// logPlanStats logs at each tick the cache hit rate and average explain time, the latency the cost check adds, since the last line.
+func (s *Server) logPlanStats(ctx context.Context, log *slog.Logger, tick <-chan time.Time) {
+	var last plan.Stats
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick:
+		}
+		now := s.plans.Stats()
+		hits, misses := now.Hits-last.Hits, now.Misses-last.Misses
+		if hits+misses == 0 {
+			continue
+		}
+		attrs := []any{"hits", hits, "misses", misses, "hit_rate", float64(hits) / float64(hits+misses)}
+		if misses > 0 {
+			attrs = append(attrs, "explain_avg", (now.Explaining-last.Explaining)/time.Duration(misses), "explain_slowest", now.Slowest)
+		}
+		log.Info("plan cache", attrs...)
+		last = now
+	}
+}
+
+// PlanStats returns what the plan cache has done since the server started.
+func (s *Server) PlanStats() plan.Stats { return s.plans.Stats() }

@@ -12,10 +12,13 @@ import (
 	"net"
 	"os"
 	"slices"
+	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Avik-creator/queryguard/internal/testcert"
+	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/wire"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -202,6 +205,40 @@ func TestChecksStatementsWithSettingsFromLogin(t *testing.T) {
 			t.Fatalf("standard_conforming_strings %s: got %#v; want the statement rejected unchecked", scs, e)
 		}
 	}
+}
+
+func TestLogsPlanCacheStats(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var logs bytes.Buffer
+		s := &Server{}
+		tick := make(chan time.Time)
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.logPlanStats(ctx, slog.New(slog.NewTextHandler(&logs, nil)), tick)
+		}()
+		explain := func() (plan.Plan, error) { time.Sleep(2 * time.Millisecond); return plan.Plan{}, nil }
+
+		s.plans.Get("a", explain)
+		s.plans.Get("a", explain)
+		s.plans.Get("a", explain)
+		s.plans.Get("b", explain)
+		tick <- time.Now()
+		// Nothing new since the last tick, so nothing is logged.
+		tick <- time.Now()
+		tick <- time.Now()
+		cancel()
+		<-done
+
+		lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+		if len(lines) != 1 || !strings.Contains(lines[0], "hits=2 misses=2 hit_rate=0.5") || !strings.Contains(lines[0], "explain_avg=2ms") {
+			t.Errorf("logged %q; want one line with 2 hits, 2 misses and 2ms per explain", logs.String())
+		}
+		if got := s.PlanStats(); got.Hits != 2 || got.Misses != 2 {
+			t.Errorf("PlanStats = %+v; want 2 hits and 2 misses", got)
+		}
+	})
 }
 
 func TestGivesClientItsOwnCancelKey(t *testing.T) {
