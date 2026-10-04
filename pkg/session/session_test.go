@@ -153,6 +153,57 @@ func TestStatementTooLongToCheck(t *testing.T) {
 	}
 }
 
+func TestTellsCheckerTheReportedSettings(t *testing.T) {
+	seen := make(chan Settings, 4)
+	h := start(t, fakeChecker{seen: seen})
+
+	h.send(&pgproto3.Query{String: "set standard_conforming_strings = off"})
+	h.serverGets(&pgproto3.Query{String: "set standard_conforming_strings = off"})
+	expectSettings(t, seen, loginSettings)
+	changed := &pgproto3.ParameterStatus{Name: "standard_conforming_strings", Value: "off"}
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("SET")}, changed, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.CommandComplete{CommandTag: []byte("SET")}, changed, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	h.send(&pgproto3.Query{String: "select 1"})
+	h.serverGets(&pgproto3.Query{String: "select 1"})
+	expectSettings(t, seen, Settings{StandardConformingStrings: "off", ClientEncoding: "UTF8"})
+}
+
+func TestSettingsAreUnknownWhileStatementsAreInFlight(t *testing.T) {
+	seen := make(chan Settings, 4)
+	h := start(t, fakeChecker{seen: seen})
+
+	// The first query may change a setting, and Postgres reads the second only after running it.
+	h.send(&pgproto3.Query{String: "select 1"}, &pgproto3.Query{String: "select 2"})
+	h.serverGets(&pgproto3.Query{String: "select 1"}, &pgproto3.Query{String: "select 2"})
+	expectSettings(t, seen, loginSettings)
+	expectSettings(t, seen, Settings{})
+	h.reply(&pgproto3.ReadyForQuery{TxStatus: 'I'}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.ReadyForQuery{TxStatus: 'I'}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	// Postgres reports changed settings just before ReadyForQuery, so they stay unknown until a Sync is answered.
+	h.send(&pgproto3.Parse{Query: "select 3"}, &pgproto3.Flush{})
+	h.serverGets(&pgproto3.Parse{Query: "select 3"}, &pgproto3.Flush{})
+	expectSettings(t, seen, loginSettings)
+	h.reply(&pgproto3.ParseComplete{})
+	h.clientGets(&pgproto3.ParseComplete{})
+	h.send(&pgproto3.Parse{Query: "select 4"}, &pgproto3.Sync{})
+	h.serverGets(&pgproto3.Parse{Query: "select 4"}, &pgproto3.Sync{})
+	expectSettings(t, seen, Settings{})
+}
+
+func expectSettings(t *testing.T, seen <-chan Settings, want Settings) {
+	t.Helper()
+	select {
+	case got := <-seen:
+		if got != want {
+			t.Fatalf("checker was told %+v; want %+v", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("checker was not called")
+	}
+}
+
 func TestPassesEverythingWithoutChecker(t *testing.T) {
 	h := start(t, nil)
 
@@ -186,9 +237,18 @@ const wantDo = `DO 'BEGIN RAISE EXCEPTION USING ERRCODE = ''42501'', MESSAGE = '
 // postgresError stands for whatever error Postgres sends.
 var postgresError = &pgproto3.ErrorResponse{Severity: "ERROR", Code: "42601", Message: "syntax error"}
 
-type fakeChecker struct{ allowTooLong bool }
+// loginSettings are the settings the harness's login reports.
+var loginSettings = Settings{StandardConformingStrings: "on", ClientEncoding: "UTF8"}
 
-func (fakeChecker) Check(sql string) *pgproto3.ErrorResponse {
+type fakeChecker struct {
+	allowTooLong bool
+	seen         chan<- Settings // gets the settings of each checked statement, when set
+}
+
+func (c fakeChecker) Check(sql string, set Settings) *pgproto3.ErrorResponse {
+	if c.seen != nil {
+		c.seen <- set
+	}
 	if strings.Contains(sql, "bad") {
 		return rejected
 	}
@@ -217,7 +277,12 @@ func start(t *testing.T, check Checker) *harness {
 	h := &harness{t: t, client: client, pg: pg, done: make(chan struct{})}
 	go func() {
 		defer close(h.done)
-		Relay(proxyClient, proxyServer, check, func(io.Writer, io.Reader) error { return nil })
+		Relay(proxyClient, proxyServer, check, func(_ io.Writer, _ io.Reader, report func(name, value string)) error {
+			report("standard_conforming_strings", loginSettings.StandardConformingStrings)
+			report("client_encoding", loginSettings.ClientEncoding)
+			report("TimeZone", "UTC")
+			return nil
+		})
 	}()
 	t.Cleanup(func() {
 		client.Close()

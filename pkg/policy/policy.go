@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/Avik-creator/queryguard/pkg/session"
 	"github.com/Avik-creator/queryguard/pkg/sqlparse"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -169,13 +170,16 @@ type Checker struct {
 }
 
 // Check returns the error to send instead of running sql, or nil to run it; every match is logged.
-func (c *Checker) Check(sql string) *pgproto3.ErrorResponse {
+func (c *Checker) Check(sql string, set session.Settings) *pgproto3.ErrorResponse {
 	if len(c.rules) == 0 {
 		return nil
 	}
+	if reason := misread(sql, set); reason != "" {
+		return c.unchecked(reason)
+	}
 	q, err := sqlparse.Analyze(sql)
 	if err != nil {
-		return c.unchecked("err", err)
+		return c.unchecked("The parser cannot read it.", "err", err)
 	}
 	var blocked, fingerprint, normalized string
 	for _, r := range c.rules {
@@ -204,18 +208,42 @@ func (c *Checker) CheckTooLong(size int) *pgproto3.ErrorResponse {
 	if len(c.rules) == 0 {
 		return nil
 	}
-	return c.unchecked("size", size)
+	return c.unchecked("It is too long to read.", "size", size)
 }
 
-// unchecked logs a statement that could not be checked and rejects it unless unchecked is allow.
-func (c *Checker) unchecked(attrs ...any) *pgproto3.ErrorResponse {
+// unchecked logs a statement that could not be checked, and why, and rejects it unless unchecked is allow.
+func (c *Checker) unchecked(reason string, attrs ...any) *pgproto3.ErrorResponse {
 	reject := !c.allowUnchecked && !c.warnOnly
-	c.log.Warn("could not check statement", append(attrs, "rejected", reject)...)
+	c.log.Warn("could not check statement", append([]any{"reason", reason, "rejected", reject}, attrs...)...)
 	if !reject {
 		return nil
 	}
-	return rejection("queryguard: statement could not be checked", "",
+	return rejection("queryguard: statement could not be checked", reason,
 		"QueryGuard rejects statements it cannot check unless unchecked is allow in its config.")
+}
+
+// sameBytes are the client encodings Postgres reads without converting, so its parser sees the bytes QueryGuard's does.
+var sameBytes = []string{"UTF8", "SQL_ASCII"}
+
+// misread says why Postgres may read sql differently from the parser, which assumes the default settings, or returns "".
+func misread(sql string, set session.Settings) string {
+	switch {
+	case set.StandardConformingStrings != "on" && sqlparse.BackslashInString(sql):
+		return "Its backslashes may be escapes, since standard_conforming_strings is off or may change."
+	case !slices.Contains(sameBytes, set.ClientEncoding) && !ascii(sql):
+		// In SJIS, BIG5 and GBK the second byte of a character can be a backslash or a letter.
+		return "Its non-ASCII bytes may read differently, since client_encoding is not UTF8 or may change."
+	}
+	return ""
+}
+
+func ascii(s string) bool {
+	for i := range len(s) {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
 }
 
 // rejection is an insufficient_privilege error, the code Postgres itself uses for a refused action.

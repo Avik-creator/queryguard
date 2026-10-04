@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Avik-creator/queryguard/pkg/session"
 	"github.com/Avik-creator/queryguard/pkg/sqlparse"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -42,7 +43,7 @@ func TestRulesBlockStatements(t *testing.T) {
 		"create index on billing.orders (customer_id)":                         "deny_ddl",
 		"create unique index on orders (id) where id > 1000":                   "deny_ddl",
 	} {
-		got := c.Check(sql)
+		got := c.Check(sql, standard)
 		if gotRule := ruleOf(got); gotRule != rule {
 			t.Errorf("Check(%q) blocked by %q; want %q", sql, gotRule, rule)
 		}
@@ -60,7 +61,7 @@ func TestIndexConcurrentlyRule(t *testing.T) {
 		"reindex table orders":                              true,
 		"reindex table concurrently orders":                 false,
 	} {
-		if got := c.Check(sql); (ruleOf(got) == "index_concurrently") != blocked {
+		if got := c.Check(sql, standard); (ruleOf(got) == "index_concurrently") != blocked {
 			t.Errorf("Check(%q) = %v; want blocked = %v", sql, got, blocked)
 		}
 	}
@@ -69,7 +70,7 @@ func TestIndexConcurrentlyRule(t *testing.T) {
 func TestRejectionCarriesOnlyFixedTextAndFingerprint(t *testing.T) {
 	c := mustParse(t, allRules).Checker("alice", discard)
 
-	got := c.Check("delete from orders -- it's O'Brien's")
+	got := c.Check("delete from orders -- it's O'Brien's", standard)
 
 	if got == nil {
 		t.Fatal("DELETE without WHERE was allowed")
@@ -91,7 +92,7 @@ func TestWarnModeLogsAndAllows(t *testing.T) {
 	var logs bytes.Buffer
 	c := mustParse(t, `{"rules": [{"check": "require_where", "mode": "warn"}]}`).Checker("alice", logger(&logs))
 
-	if got := c.Check("delete from orders where false; delete from orders"); got != nil {
+	if got := c.Check("delete from orders where false; delete from orders", standard); got != nil {
 		t.Errorf("warn mode rejected with %v; want allowed", got)
 	}
 	for _, want := range []string{`msg="would reject statement"`, "rule=require_where", "role=alice", "fingerprint=", "delete from orders where $1"} {
@@ -105,7 +106,7 @@ func TestEnforceModeLogs(t *testing.T) {
 	var logs bytes.Buffer
 	c := mustParse(t, allRules).Checker("alice", logger(&logs))
 
-	c.Check("delete from orders")
+	c.Check("delete from orders", standard)
 
 	if !strings.Contains(logs.String(), `msg="rejected statement"`) || !strings.Contains(logs.String(), "rule=require_where") {
 		t.Errorf("log %q; want the rejection", logs.String())
@@ -115,10 +116,10 @@ func TestEnforceModeLogs(t *testing.T) {
 func TestTenantInWarnModeIsNeverBlocked(t *testing.T) {
 	p := mustParse(t, `{"rules": [{"check": "require_where"}], "tenants": {"reporting": {"mode": "warn"}}}`)
 
-	if got := p.Checker("reporting", discard).Check("delete from orders"); got != nil {
+	if got := p.Checker("reporting", discard).Check("delete from orders", standard); got != nil {
 		t.Errorf("tenant in warn mode got %v; want allowed", got)
 	}
-	if got := p.Checker("alice", discard).Check("delete from orders"); got == nil {
+	if got := p.Checker("alice", discard).Check("delete from orders", standard); got == nil {
 		t.Error("other tenants were not blocked")
 	}
 }
@@ -133,7 +134,7 @@ func TestUncheckedStatements(t *testing.T) {
 		var logs bytes.Buffer
 		c := mustParse(t, config).Checker("alice", logger(&logs))
 
-		got := c.Check("selec 1")
+		got := c.Check("selec 1", standard)
 
 		if (got != nil) != wantReject {
 			t.Errorf("%s: unparsable statement got %v; want rejected = %v", config, got, wantReject)
@@ -156,6 +157,45 @@ func TestStatementTooLongToCheck(t *testing.T) {
 	}
 	if got := reject.CheckTooLong(1 << 30); got == nil || got.Code != "42501" {
 		t.Errorf("unchecked reject got %v; want 42501", got)
+	}
+}
+
+func TestStatementPostgresMayReadDifferently(t *testing.T) {
+	unknown := session.Settings{}
+	scsOff := session.Settings{StandardConformingStrings: "off", ClientEncoding: "UTF8"}
+	sjis := session.Settings{StandardConformingStrings: "on", ClientEncoding: "SJIS"}
+	sqlASCII := session.Settings{StandardConformingStrings: "on", ClientEncoding: "SQL_ASCII"}
+	for _, tc := range []struct {
+		set  session.Settings
+		sql  string
+		want bool // rejected as unchecked
+	}{
+		{standard, `select '\''; delete from orders; --'`, false},
+		{scsOff, `select '\''; delete from orders; --'`, true},
+		{standard, `select 'a\b'`, false},
+		{scsOff, `select 'a\b'`, true},
+		{scsOff, `select E'a\b', $$\$$`, false},
+		{scsOff, `select 1`, false},
+		{unknown, `select 'a\b'`, true},
+		{unknown, `select 'ok'`, false},
+		{sjis, `select 'ü'`, true},
+		{sjis, `select 'u'`, false},
+		{unknown, `select 'ü'`, true},
+		{standard, `select 'ü'`, false},
+		{sqlASCII, `select 'ü'`, false},
+	} {
+		var logs bytes.Buffer
+		c := mustParse(t, `{"rules": [{"check": "require_where"}]}`).Checker("alice", logger(&logs))
+
+		got := c.Check(tc.sql, tc.set)
+
+		// A quote hidden behind a backslash makes the first statement look like one SELECT; it is rejected unchecked, not by a rule.
+		if unchecked := got != nil && got.Message == "queryguard: statement could not be checked"; unchecked != tc.want {
+			t.Errorf("Check(%q, %+v) = %v; want unchecked = %v", tc.sql, tc.set, got, tc.want)
+		}
+		if tc.want && !strings.Contains(logs.String(), "could not check statement") {
+			t.Errorf("Check(%q, %+v) logged %q; want the reason", tc.sql, tc.set, logs.String())
+		}
 	}
 }
 
@@ -199,12 +239,15 @@ func TestLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Checker("alice", discard).Check("delete from orders") == nil {
+	if p.Checker("alice", discard).Check("delete from orders", standard) == nil {
 		t.Error("loaded policy allowed DELETE without WHERE")
 	}
 }
 
 var discard = slog.New(slog.DiscardHandler)
+
+// standard is how Postgres reads SQL by default, which is how the parser reads it.
+var standard = session.Settings{StandardConformingStrings: "on", ClientEncoding: "UTF8"}
 
 func logger(buf *bytes.Buffer) *slog.Logger { return slog.New(slog.NewTextHandler(buf, nil)) }
 

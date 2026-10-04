@@ -182,6 +182,24 @@ func TestDDLMatchesPostgres(t *testing.T) {
 	}
 }
 
+func TestBackslashInString(t *testing.T) {
+	for sql, want := range map[string]bool{
+		`select 'plain'`:                       false,
+		`select 'a\b'`:                         true,
+		`select '\''; delete from orders; --'`: true,
+		`select E'a\b', e'\''`:                 false,
+		`select $$a\b$$, $x$\$x$`:              false,
+		`select "a\b" from orders -- \`:        false,
+		`select 1 /* \' */`:                    false,
+		`select U&'d\0061t\+000061'`:           true,
+		`select '\`:                            true,
+	} {
+		if got := BackslashInString(sql); got != want {
+			t.Errorf("BackslashInString(%q) = %v; want %v", sql, got, want)
+		}
+	}
+}
+
 func TestAnalyzeRejectsInvalidSQL(t *testing.T) {
 	if _, err := Analyze("selec 1"); err == nil {
 		t.Error("Analyze(selec 1) succeeded; want a syntax error")

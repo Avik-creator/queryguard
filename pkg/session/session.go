@@ -24,14 +24,21 @@ const bufSize = 8 << 10
 
 // Checker decides whether a statement may run.
 type Checker interface {
-	// Check returns the error to send instead of running sql, or nil to run it.
-	Check(sql string) *pgproto3.ErrorResponse
+	// Check returns the error to send instead of running sql, or nil to run it; set says how Postgres will read sql.
+	Check(sql string, set Settings) *pgproto3.ErrorResponse
 	// CheckTooLong decides on a statement of size bytes, too long to read whole.
 	CheckTooLong(size int) *pgproto3.ErrorResponse
 }
 
-// Relay runs login, then relays messages both ways until either side closes; it closes both and returns the first error.
-func Relay(client, server net.Conn, check Checker, login func(client io.Writer, server io.Reader) error) error {
+// Settings are the server settings that change how Postgres reads statement text; an empty field is unknown.
+type Settings struct {
+	StandardConformingStrings string // "off" makes a backslash in '…' an escape
+	ClientEncoding            string // Postgres converts statements from it before parsing them
+}
+
+// Relay runs login, which passes each ParameterStatus to report, then relays messages both ways until either side
+// closes; it closes both and returns the first error.
+func Relay(client, server net.Conn, check Checker, login func(client io.Writer, server io.Reader, report func(name, value string)) error) error {
 	s := &session{
 		check:     check,
 		clientIn:  bufio.NewReaderSize(client, bufSize),
@@ -54,7 +61,11 @@ func Relay(client, server net.Conn, check Checker, login func(client io.Writer, 
 	var loops sync.WaitGroup
 	loops.Go(func() { stop(s.fromClient()) })
 	loops.Go(func() {
-		err := login(client, s.serverIn)
+		err := login(client, s.serverIn, func(name, value string) {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.report(name, value)
+		})
 		if err == nil {
 			s.loggedIn()
 		}
@@ -81,6 +92,7 @@ type session struct {
 	status    byte          // transaction status from the last ReadyForQuery; 0 until login ends
 	pending   []sent        // messages the server has yet to finish answering, oldest first
 	skipping  bool          // the server ignores everything up to the next Sync after an extended-protocol error
+	reported  Settings      // as last reported by the server
 
 	// Only fromClient uses these.
 	inBatch bool      // extended-protocol messages went to the server since the last Sync
@@ -154,7 +166,7 @@ func (s *session) checkStatement(typ byte, n int) error {
 	}
 	// A malformed message goes on unchanged, for Postgres to refuse.
 	if sql, ok := statementText(typ, body); ok {
-		if rej := s.check.Check(sql); rej != nil {
+		if rej := s.check.Check(sql, s.settings()); rej != nil {
 			return s.reject(typ, rej)
 		}
 	}
@@ -162,6 +174,27 @@ func (s *session) checkStatement(typ byte, n int) error {
 	writeHeader(s.serverOut, typ, n)
 	_, err := s.serverOut.Write(body)
 	return err
+}
+
+// settings returns the reported settings, or none while anything sent may still change them before sql is read.
+func (s *session) settings() Settings {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Postgres reports changes just before ReadyForQuery, which an unsynced batch has yet to get.
+	if len(s.pending) > 0 || s.inBatch {
+		return Settings{}
+	}
+	return s.reported
+}
+
+// report records a ParameterStatus; the caller holds mu.
+func (s *session) report(name, value string) {
+	switch name {
+	case "standard_conforming_strings":
+		s.reported.StandardConformingStrings = value
+	case "client_encoding":
+		s.reported.ClientEncoding = value
+	}
 }
 
 // forward streams one client message to the server.
@@ -283,6 +316,17 @@ func (s *session) relayAnswer(typ byte, n int) error {
 			return unexpected(err)
 		}
 		s.status = status[0]
+	}
+	// A longer ParameterStatus can't be one of the short settings report looks for.
+	if typ == 'S' && n <= bufSize {
+		body, err := s.serverIn.Peek(n)
+		if err != nil {
+			return unexpected(err)
+		}
+		if name, rest, ok := bytes.Cut(body, []byte{0}); ok {
+			value, _, _ := bytes.Cut(rest, []byte{0})
+			s.report(string(name), string(value))
+		}
 	}
 	if s.answered(typ) {
 		_, err := s.serverIn.Discard(n)

@@ -188,7 +188,8 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	})
 	defer stop()
 
-	err = session.Relay(client, server, check, func(client io.Writer, server io.Reader) error {
+	err = session.Relay(client, server, check, func(client io.Writer, server io.Reader, report func(name, value string)) error {
+		opts.Report = report
 		return wire.RelayStartup(client, server, opts)
 	})
 	forget()

@@ -179,6 +179,24 @@ func SearchPath(value string) []string {
 	return schemas
 }
 
+// BackslashInString reports whether sql has a backslash inside a '…' string, which Postgres reads as an escape when
+// standard_conforming_strings is off; Analyze reads it with the setting on. SQL that can't be scanned counts as having one.
+func BackslashInString(sql string) bool {
+	if !strings.Contains(sql, `\`) {
+		return false
+	}
+	scan, err := pg_query.Scan(sql)
+	if err != nil {
+		return true
+	}
+	return slices.ContainsFunc(scan.Tokens, func(t *pg_query.ScanToken) bool {
+		text := sql[t.Start:t.End]
+		// Plain strings start with a quote; E'…' and $$…$$ strings are also SCONST but read backslashes the same either way.
+		plain := t.Token == pg_query.Token_SCONST && strings.HasPrefix(text, "'") || t.Token == pg_query.Token_USCONST
+		return plain && strings.Contains(text, `\`)
+	})
+}
+
 // concurrently reports whether REINDEX options turn on CONCURRENTLY; an option without a value means on.
 func concurrently(params []*pg_query.Node) bool {
 	for _, p := range params {

@@ -161,6 +161,33 @@ func TestCountsOnlyLoggedInSessions(t *testing.T) {
 	expectOverCap(t, sendStartupAs(t, dial(t, addr), "alice"))
 }
 
+func TestChecksStatementsWithSettingsFromLogin(t *testing.T) {
+	// With standard_conforming_strings off, Postgres ends the string at \' and runs the DELETE.
+	const hidden = `select '\''; delete from orders; --'`
+	for scs, wantRejected := range map[string]bool{"on": false, "off": true} {
+		pg := serveFakePostgres(t, &fakePostgres{greeting: []encoder{
+			&pgproto3.AuthenticationOk{},
+			&pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"},
+			&pgproto3.ParameterStatus{Name: "standard_conforming_strings", Value: scs},
+			fakeServerKey,
+			&pgproto3.ReadyForQuery{TxStatus: 'I'},
+		}})
+		s := newServer(t, pg.addr)
+		s.Policy = mustPolicy(t, `{"rules": [{"check": "require_where"}]}`)
+		addr, _ := startProxy(t, s)
+		conn := startSession(t, addr)
+
+		if !wantRejected {
+			roundTrip(t, conn, hidden)
+			continue
+		}
+		send(t, conn, &pgproto3.Query{String: hidden})
+		if e, ok := receive(t, conn).(*pgproto3.ErrorResponse); !ok || e.Message != "queryguard: statement could not be checked" {
+			t.Fatalf("standard_conforming_strings %s: got %#v; want the statement rejected unchecked", scs, e)
+		}
+	}
+}
+
 func TestGivesClientItsOwnCancelKey(t *testing.T) {
 	addr, _ := startProxy(t, newServer(t, startFakePostgres(t).addr))
 
