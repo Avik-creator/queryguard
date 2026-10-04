@@ -204,6 +204,163 @@ func expectSettings(t *testing.T, seen <-chan Settings, want Settings) {
 	}
 }
 
+func TestExplainsQueryBeforeRunningIt(t *testing.T) {
+	h := start(t, fakeChecker{})
+
+	h.send(&pgproto3.Query{String: "select plan"})
+
+	h.serverGets(&pgproto3.Query{String: explainPrefix + "select plan"})
+	h.reply(&pgproto3.RowDescription{}, plan("small"), &pgproto3.CommandComplete{CommandTag: []byte("EXPLAIN")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.serverGets(&pgproto3.Query{String: "select plan"})
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+}
+
+func TestRejectsQueryByItsPlan(t *testing.T) {
+	h := start(t, fakeChecker{})
+
+	h.send(&pgproto3.Query{String: "select plan"})
+	h.serverGets(&pgproto3.Query{String: explainPrefix + "select plan"})
+	h.reply(plan("big"), &pgproto3.CommandComplete{CommandTag: []byte("EXPLAIN")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	h.clientGets(tooCostly, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.serverGetsNothingBefore(&pgproto3.Query{String: "select 'next'"})
+}
+
+func TestPassesOnPostgresErrorFromExplainingQuery(t *testing.T) {
+	h := start(t, fakeChecker{})
+
+	h.send(&pgproto3.Query{String: "select plan from nowhere"})
+	h.serverGets(&pgproto3.Query{String: explainPrefix + "select plan from nowhere"})
+	h.reply(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "42P01", Message: "relation \"nowhere\" does not exist", Position: int32(len(explainPrefix)) + 18},
+		&pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	// The query itself would fail the same way, so the client gets the error at the place in its own text.
+	h.clientGets(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "42P01", Message: "relation \"nowhere\" does not exist", Position: 18},
+		&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.serverGetsNothingBefore(&pgproto3.Query{String: "select 'next'"})
+}
+
+func TestExplainsBindWithItsValues(t *testing.T) {
+	h := start(t, fakeChecker{})
+	parse := &pgproto3.Parse{Name: "s1", Query: "select plan where id = $1", ParameterOIDs: []uint32{23}}
+	bind := &pgproto3.Bind{PreparedStatement: "s1", ParameterFormatCodes: []int16{1}, Parameters: [][]byte{{0, 0, 0, 7}}, ResultFormatCodes: []int16{1}}
+
+	h.send(parse, bind, &pgproto3.Execute{}, &pgproto3.Sync{})
+
+	h.serverGets(append([]encoder{parse}, explainBind(explainPrefix+parse.Query, []uint32{23}, []int16{1}, [][]byte{{0, 0, 0, 7}})...)...)
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.CloseComplete{}, &pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, plan("small"),
+		&pgproto3.CommandComplete{CommandTag: []byte("EXPLAIN")}, &pgproto3.CloseComplete{})
+	h.serverGets(bind, &pgproto3.Execute{}, &pgproto3.Sync{})
+	h.clientGets(&pgproto3.ParseComplete{})
+}
+
+func TestRejectsBindByItsPlanThroughPostgres(t *testing.T) {
+	h := start(t, fakeChecker{})
+	parse := &pgproto3.Parse{Name: "s1", Query: "select plan"}
+
+	h.send(parse, &pgproto3.Bind{PreparedStatement: "s1"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+
+	h.serverGets(append([]encoder{parse}, explainBind(explainPrefix+"select plan", nil, nil, nil)...)...)
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.CloseComplete{}, &pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, plan("big"),
+		&pgproto3.CommandComplete{CommandTag: []byte("EXPLAIN")}, &pgproto3.CloseComplete{})
+	// The EXPLAIN opened the batch's implicit transaction, so Postgres must end it with the error.
+	h.serverGets(&pgproto3.Parse{Query: wantCostDo}, &pgproto3.Bind{}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, postgresError, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.ParseComplete{}, postgresError, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+}
+
+func TestPassesOnPostgresErrorFromExplainingBind(t *testing.T) {
+	h := start(t, fakeChecker{})
+	parse := &pgproto3.Parse{Name: "s1", Query: "select plan where id = $1"}
+	bind := &pgproto3.Bind{PreparedStatement: "s1", Parameters: [][]byte{[]byte("x")}}
+
+	h.send(parse, bind, &pgproto3.Execute{}, &pgproto3.Sync{})
+
+	h.serverGets(append([]encoder{parse}, explainBind(explainPrefix+parse.Query, nil, nil, [][]byte{[]byte("x")})...)...)
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.CloseComplete{}, &pgproto3.ParseComplete{}, postgresError)
+	// Postgres now skips to Sync, as it would after the client's own Bind failed.
+	h.serverGets(&pgproto3.Sync{})
+	h.reply(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.ParseComplete{}, postgresError, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+}
+
+func TestExplainsGenericPlanForLargeValues(t *testing.T) {
+	explained := make(chan bool, 1)
+	h := start(t, fakeChecker{generic: explained})
+	parse := &pgproto3.Parse{Name: "s1", Query: "select plan where data = $1"}
+	bind := &pgproto3.Bind{PreparedStatement: "s1", Parameters: [][]byte{make([]byte, maxReplayed)}}
+
+	h.send(parse)
+	h.serverGets(parse)
+	// The proxy streams the Bind on while the test is still writing it.
+	buf, _ := bind.Encode(nil)
+	go h.client.Write(buf)
+
+	// GENERIC_PLAN ignores the values, but Postgres still wants one per parameter, so they are sent as NULLs.
+	h.serverGets(explainBind(genericPrefix+parse.Query, nil, nil, [][]byte{nil})...)
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.CloseComplete{}, &pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, plan("small"),
+		&pgproto3.CommandComplete{CommandTag: []byte("EXPLAIN")}, &pgproto3.CloseComplete{})
+	h.serverGets(bind)
+	if !<-explained {
+		t.Error("the cost check was not told the plan is generic")
+	}
+}
+
+func TestExplainsBindOnlyUnderTheSettingsItWasParsedWith(t *testing.T) {
+	h := start(t, fakeChecker{})
+	parse := &pgproto3.Parse{Name: "s1", Query: `select plan where note = 'a\b'`}
+	h.send(parse, &pgproto3.Sync{})
+	h.serverGets(parse, &pgproto3.Sync{})
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.ParseComplete{}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	h.send(&pgproto3.Bind{PreparedStatement: "s1"}, &pgproto3.Sync{})
+	h.serverGets(explainBind(explainPrefix+parse.Query, nil, nil, nil)...)
+	h.reply(&pgproto3.CloseComplete{}, &pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, plan("small"),
+		&pgproto3.CommandComplete{CommandTag: []byte("EXPLAIN")}, &pgproto3.CloseComplete{})
+	h.serverGets(&pgproto3.Bind{PreparedStatement: "s1"}, &pgproto3.Sync{})
+	h.reply(&pgproto3.BindComplete{}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.BindComplete{}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	changed := &pgproto3.ParameterStatus{Name: "standard_conforming_strings", Value: "off"}
+	h.send(&pgproto3.Query{String: "set standard_conforming_strings = off"})
+	h.serverGets(&pgproto3.Query{String: "set standard_conforming_strings = off"})
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("SET")}, changed, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.CommandComplete{CommandTag: []byte("SET")}, changed, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	// Postgres read the text when it was parsed; read again now, its backslash would be an escape.
+	h.send(&pgproto3.Bind{PreparedStatement: "s1"})
+	h.serverGets(&pgproto3.Bind{PreparedStatement: "s1"})
+}
+
+func TestForgetsClosedStatements(t *testing.T) {
+	h := start(t, fakeChecker{})
+	parse := &pgproto3.Parse{Name: "s1", Query: "select plan"}
+	h.send(parse, &pgproto3.Close{ObjectType: 'S', Name: "s1"}, &pgproto3.Sync{})
+	h.serverGets(parse, &pgproto3.Close{ObjectType: 'S', Name: "s1"}, &pgproto3.Sync{})
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.CloseComplete{}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.ParseComplete{}, &pgproto3.CloseComplete{}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	h.send(&pgproto3.Bind{PreparedStatement: "s1"})
+
+	h.serverGets(&pgproto3.Bind{PreparedStatement: "s1"})
+}
+
+func TestEndsWhilePostgresExplains(t *testing.T) {
+	h := start(t, fakeChecker{})
+	h.send(&pgproto3.Query{String: "select plan"})
+	h.serverGets(&pgproto3.Query{String: explainPrefix + "select plan"})
+
+	h.pg.Close()
+
+	select {
+	case <-h.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Relay still waits for the plan after Postgres went away")
+	}
+}
+
 func TestPassesEverythingWithoutChecker(t *testing.T) {
 	h := start(t, nil)
 
@@ -234,25 +391,60 @@ var rejected = &pgproto3.ErrorResponse{Severity: "ERROR", Code: "42501", Message
 // wantDo raises rejected inside Postgres; the hint's quote is doubled once per level of quoting.
 const wantDo = `DO 'BEGIN RAISE EXCEPTION USING ERRCODE = ''42501'', MESSAGE = ''queryguard: no'', HINT = ''it''''s bad''; END'`
 
+// tooCostly is what fakeChecker's cost check returns for a plan containing "big".
+var tooCostly = &pgproto3.ErrorResponse{Severity: "ERROR", Code: "54000", Message: "queryguard: too costly"}
+
+// wantCostDo raises tooCostly inside Postgres.
+const wantCostDo = `DO 'BEGIN RAISE EXCEPTION USING ERRCODE = ''54000'', MESSAGE = ''queryguard: too costly''; END'`
+
+// plan is a one-column row of EXPLAIN output.
+func plan(text string) *pgproto3.DataRow { return &pgproto3.DataRow{Values: [][]byte{[]byte(text)}} }
+
+// explainBind is what the proxy sends to explain a bound statement: its own statement and portal, closed before and after.
+func explainBind(sql string, types []uint32, formats []int16, values [][]byte) []encoder {
+	return []encoder{
+		&pgproto3.Close{ObjectType: 'S', Name: explainName},
+		&pgproto3.Parse{Name: explainName, Query: sql, ParameterOIDs: types},
+		&pgproto3.Bind{DestinationPortal: explainName, PreparedStatement: explainName, ParameterFormatCodes: formats, Parameters: values},
+		&pgproto3.Execute{Portal: explainName},
+		&pgproto3.Close{ObjectType: 'S', Name: explainName},
+		&pgproto3.Flush{},
+	}
+}
+
 // postgresError stands for whatever error Postgres sends.
 var postgresError = &pgproto3.ErrorResponse{Severity: "ERROR", Code: "42601", Message: "syntax error"}
 
 // loginSettings are the settings the harness's login reports.
 var loginSettings = Settings{StandardConformingStrings: "on", ClientEncoding: "UTF8"}
 
+// fakeChecker rejects statements with "bad", and costs those with "plan", rejecting plans with "big".
 type fakeChecker struct {
 	allowTooLong bool
 	seen         chan<- Settings // gets the settings of each checked statement, when set
+	generic      chan<- bool     // gets whether each plan explained was generic, when set
 }
 
-func (c fakeChecker) Check(sql string, set Settings) *pgproto3.ErrorResponse {
+func (c fakeChecker) Check(sql string, set Settings) (*pgproto3.ErrorResponse, CostCheck) {
 	if c.seen != nil {
 		c.seen <- set
 	}
-	if strings.Contains(sql, "bad") {
-		return rejected
+	switch {
+	case strings.Contains(sql, "bad"):
+		return rejected, nil
+	case !strings.Contains(sql, "plan"):
+		return nil, nil
 	}
-	return nil
+	return nil, func(e Explain) *pgproto3.ErrorResponse {
+		out, _ := e.Run()
+		if c.generic != nil {
+			c.generic <- e.Generic
+		}
+		if strings.Contains(out, "big") {
+			return tooCostly
+		}
+		return nil
+	}
 }
 
 func (c fakeChecker) CheckTooLong(int) *pgproto3.ErrorResponse {

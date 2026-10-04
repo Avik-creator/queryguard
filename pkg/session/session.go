@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -22,13 +23,40 @@ const maxCheckedLen = 16 << 20
 // bufSize matches Postgres's own 8 KB send buffer.
 const bufSize = 8 << 10
 
+// maxReplayed caps a Bind sent a second time to explain its statement; larger ones get a generic plan instead.
+const maxReplayed = 1 << 20
+
+// explainName names the proxy's own statement and portal for EXPLAIN.
+const explainName = "queryguard_explain"
+
+// EXPLAIN prefixes; positions in Postgres's errors count from the start of the prefixed text.
+const (
+	explainPrefix = "EXPLAIN (FORMAT JSON, VERBOSE) "
+	genericPrefix = "EXPLAIN (FORMAT JSON, VERBOSE, GENERIC_PLAN) "
+)
+
+// errPlanTooLarge says the plan was longer than the proxy reads.
+var errPlanTooLarge = errors.New("plan too large to read")
+
 // Checker decides whether a statement may run.
 type Checker interface {
-	// Check returns the error to send instead of running sql, or nil to run it; set says how Postgres will read sql.
-	Check(sql string, set Settings) *pgproto3.ErrorResponse
+	// Check returns the error to send instead of running sql, or nil, and the cost check to run just before it executes, or nil.
+	Check(sql string, set Settings) (*pgproto3.ErrorResponse, CostCheck)
 	// CheckTooLong decides on a statement of size bytes, too long to read whole.
 	CheckTooLong(size int) *pgproto3.ErrorResponse
 }
+
+// CostCheck returns the error to send instead of running a statement, judged on its plan, which explain gets when needed.
+type CostCheck func(explain Explain) *pgproto3.ErrorResponse
+
+// Explain gets the plan of the statement about to run.
+type Explain struct {
+	Generic bool                   // the plan for any parameter values, used when the bound values are too large to send twice
+	Run     func() (string, error) // EXPLAIN (FORMAT JSON, VERBOSE)'s output, or ErrNoPlan
+}
+
+// ErrNoPlan says Postgres gave no plan: it refused the statement, whose error the session passes on, or it is skipping to Sync.
+var ErrNoPlan = errors.New("postgres gave no plan")
 
 // Settings are the server settings that change how Postgres reads statement text; an empty field is unknown.
 type Settings struct {
@@ -40,12 +68,13 @@ type Settings struct {
 // closes; it closes both and returns the first error.
 func Relay(client, server net.Conn, check Checker, login func(client io.Writer, server io.Reader, report func(name, value string)) error) error {
 	s := &session{
-		check:     check,
-		clientIn:  bufio.NewReaderSize(client, bufSize),
-		clientOut: bufio.NewWriterSize(client, bufSize),
-		serverIn:  bufio.NewReaderSize(server, bufSize),
-		serverOut: bufio.NewWriterSize(server, bufSize),
-		ready:     make(chan struct{}),
+		check:      check,
+		clientIn:   bufio.NewReaderSize(client, bufSize),
+		clientOut:  bufio.NewWriterSize(client, bufSize),
+		serverIn:   bufio.NewReaderSize(server, bufSize),
+		serverOut:  bufio.NewWriterSize(server, bufSize),
+		ready:      make(chan struct{}),
+		serverGone: make(chan struct{}),
 	}
 	var (
 		once  sync.Once
@@ -61,6 +90,7 @@ func Relay(client, server net.Conn, check Checker, login func(client io.Writer, 
 	var loops sync.WaitGroup
 	loops.Go(func() { stop(s.fromClient()) })
 	loops.Go(func() {
+		defer close(s.serverGone)
 		err := login(client, s.serverIn, func(name, value string) {
 			s.mu.Lock()
 			defer s.mu.Unlock()
@@ -81,28 +111,57 @@ func Relay(client, server net.Conn, check Checker, login func(client io.Writer, 
 
 // session is the state shared by the two relay loops.
 type session struct {
-	check     Checker
-	ready     chan struct{} // closed once login has ended
-	clientIn  *bufio.Reader
-	serverIn  *bufio.Reader
-	serverOut *bufio.Writer // only fromClient writes to the server
+	check      Checker
+	ready      chan struct{} // closed once login has ended
+	serverGone chan struct{} // closed once nothing more is read from the server
+	clientIn   *bufio.Reader
+	serverIn   *bufio.Reader
+	serverOut  *bufio.Writer // only fromClient writes to the server
 
-	mu        sync.Mutex
-	clientOut *bufio.Writer // both loops write to the client, so only under mu
-	status    byte          // transaction status from the last ReadyForQuery; 0 until login ends
-	pending   []sent        // messages the server has yet to finish answering, oldest first
-	skipping  bool          // the server ignores everything up to the next Sync after an extended-protocol error
-	reported  Settings      // as last reported by the server
+	mu         sync.Mutex
+	clientOut  *bufio.Writer // both loops write to the client, so only under mu
+	status     byte          // transaction status from the last ReadyForQuery; 0 until login ends
+	pending    []sent        // messages the server has yet to finish answering, oldest first
+	skipping   bool          // the server ignores everything up to the next Sync after an extended-protocol error
+	reported   Settings      // as last reported by the server
+	explaining *explanation  // the proxy's EXPLAIN in flight, if any
 
 	// Only fromClient uses these.
-	inBatch bool      // extended-protocol messages went to the server since the last Sync
-	discard untilSync // what to do with client messages after a rejected Parse
+	inBatch    bool                 // extended-protocol messages went to the server since the last Sync
+	discard    untilSync            // what to do with client messages after a rejected Parse
+	statements map[string]statement // prepared statements with a cost check, by name
 }
 
-// sent is a client message the server will answer; the server's answers to a hidden one, except errors, don't reach the client.
+// sent is a message the server will answer.
 type sent struct {
-	typ    byte
-	hidden bool
+	typ byte
+	how answer
+}
+
+// answer says where the server's answers to a message go.
+type answer int
+
+const (
+	relayed  answer = iota // a client's message: to the client
+	hidden                 // the proxy's DO block: only its error, to the client
+	captured               // the proxy's EXPLAIN: to the statement waiting for its plan
+)
+
+// explanation collects the answers to the proxy's EXPLAIN.
+type explanation struct {
+	plan     strings.Builder         // the plan's rows
+	err      *pgproto3.ErrorResponse // why Postgres refused the statement, if it did
+	tooLarge bool
+	done     chan struct{} // closed once Postgres has answered or skipped every EXPLAIN message
+}
+
+// statement is a prepared statement whose cost is checked when it is bound.
+type statement struct {
+	sql   string
+	types []uint32 // parameter types from its Parse
+	cost  CostCheck
+	set   Settings // the settings Postgres read sql with, as far as the session knew them at its Parse
+	plain bool     // sql has no backslash or non-ASCII byte, so every setting reads it the same
 }
 
 // untilSync says how fromClient handles client messages up to the next Sync.
@@ -140,6 +199,10 @@ func (s *session) fromClient() error {
 			// The client gets ReadyForQuery before loggedIn runs; waiting keeps a quick first query from seeing status 0.
 			<-s.ready
 			err = s.checkStatement(typ, n)
+		case typ == 'B' && len(s.statements) > 0:
+			err = s.checkBind(n)
+		case typ == 'C' && len(s.statements) > 0:
+			err = s.closeStatement(n)
 		default:
 			err = s.forward(typ, n)
 		}
@@ -152,6 +215,13 @@ func (s *session) fromClient() error {
 // checkStatement reads a Query or Parse message whole and forwards or rejects it.
 func (s *session) checkStatement(typ byte, n int) error {
 	if n > maxCheckedLen {
+		if typ == 'P' {
+			// The statement replaces any of the same name, unchecked.
+			if head, err := s.clientIn.Peek(bufSize); err == nil {
+				name, _, _ := bytes.Cut(head, []byte{0})
+				delete(s.statements, string(name))
+			}
+		}
 		if rej := s.check.CheckTooLong(n); rej != nil {
 			if _, err := s.clientIn.Discard(n); err != nil {
 				return unexpected(err)
@@ -166,11 +236,20 @@ func (s *session) checkStatement(typ byte, n int) error {
 	}
 	// A malformed message goes on unchanged, for Postgres to refuse.
 	if sql, ok := statementText(typ, body); ok {
-		if rej := s.check.Check(sql, s.settings()); rej != nil {
+		set := s.settings()
+		rej, cost := s.check.Check(sql, set)
+		switch {
+		case rej != nil:
 			return s.reject(typ, rej)
+		case typ == 'P':
+			s.prepare(body, cost, set)
+		case cost != nil:
+			if handled, err := s.checkQueryCost(sql, cost); handled || err != nil {
+				return err
+			}
 		}
 	}
-	s.track(typ, false)
+	s.track(typ, relayed)
 	writeHeader(s.serverOut, typ, n)
 	_, err := s.serverOut.Write(body)
 	return err
@@ -197,9 +276,227 @@ func (s *session) report(name, value string) {
 	}
 }
 
+// prepare remembers a Parse's statement, read under set, for the cost check when it is bound.
+func (s *session) prepare(body []byte, cost CostCheck, set Settings) {
+	var p pgproto3.Parse
+	if p.Decode(body) != nil {
+		return
+	}
+	if cost == nil {
+		delete(s.statements, p.Name)
+		return
+	}
+	if s.statements == nil {
+		s.statements = map[string]statement{}
+	}
+	plain := !strings.ContainsFunc(p.Query, func(r rune) bool { return r == '\\' || r >= utf8.RuneSelf })
+	s.statements[p.Name] = statement{sql: p.Query, types: p.ParameterOIDs, cost: cost, set: set, plain: plain}
+}
+
+// closeStatement forgets a closed statement before passing the Close on.
+func (s *session) closeStatement(n int) error {
+	if body, err := s.clientIn.Peek(min(n, bufSize)); err == nil && len(body) > 0 && body[0] == 'S' {
+		name, _, _ := bytes.Cut(body[1:], []byte{0})
+		delete(s.statements, string(name))
+	}
+	return s.forward('C', n)
+}
+
+// checkQueryCost runs a simple query's cost check before the query is sent; handled says the client has its answer.
+func (s *session) checkQueryCost(sql string, cost CostCheck) (handled bool, err error) {
+	if s.failedTransaction() {
+		return false, nil
+	}
+	var refused *pgproto3.ErrorResponse
+	rej := cost(Explain{Run: func() (string, error) {
+		var out string
+		out, refused, err = s.explain(len(explainPrefix), &pgproto3.Query{String: explainPrefix + sql})
+		return out, err
+	}})
+	switch {
+	case lost(err):
+		return true, err
+	case refused != nil:
+		// The query would have failed the same way; Postgres's ReadyForQuery went with the EXPLAIN, so the proxy sends one.
+		return true, s.toClient(refused, &pgproto3.ReadyForQuery{TxStatus: s.statusNow()})
+	case rej != nil:
+		return true, s.reject('Q', rej)
+	}
+	return false, nil
+}
+
+// checkBind runs the cost check of the statement a Bind uses, explaining it with the Bind's values, or generically when they are large.
+func (s *session) checkBind(n int) error {
+	head, err := s.clientIn.Peek(min(n, bufSize))
+	if err != nil {
+		return unexpected(err)
+	}
+	_, rest, ok := bytes.Cut(head, []byte{0})
+	name, rest, ok2 := bytes.Cut(rest, []byte{0})
+	st, found := s.statements[string(name)]
+	// EXPLAIN reads the text again, which only reads the same as at Parse under the same settings.
+	sameReading := st.plain || (st.set != Settings{} && s.settings() == st.set)
+	if !ok || !ok2 || !found || !sameReading || s.failedTransaction() {
+		return s.forward('B', n)
+	}
+
+	var body []byte
+	prefix, bind := explainPrefix, &pgproto3.Bind{DestinationPortal: explainName, PreparedStatement: explainName}
+	if n <= maxReplayed {
+		body = make([]byte, n)
+		if _, err := io.ReadFull(s.clientIn, body); err != nil {
+			return unexpected(err)
+		}
+		var b pgproto3.Bind
+		if b.Decode(body) != nil {
+			// A malformed message goes on unchanged, for Postgres to refuse.
+			return s.send('B', body)
+		}
+		bind.ParameterFormatCodes, bind.Parameters = b.ParameterFormatCodes, b.Parameters
+	} else {
+		count, ok := paramCount(rest)
+		if !ok {
+			return s.forward('B', n)
+		}
+		// GENERIC_PLAN ignores the values, but Postgres still wants one for each parameter.
+		prefix, bind.Parameters = genericPrefix, make([][]byte, count)
+	}
+
+	var refused *pgproto3.ErrorResponse
+	rej := st.cost(Explain{Generic: prefix == genericPrefix, Run: func() (string, error) {
+		var out string
+		out, refused, err = s.explain(len(prefix),
+			&pgproto3.Close{ObjectType: 'S', Name: explainName},
+			&pgproto3.Parse{Name: explainName, Query: prefix + st.sql, ParameterOIDs: st.types},
+			bind,
+			&pgproto3.Execute{Portal: explainName},
+			// Closing the statement closes its portal too.
+			&pgproto3.Close{ObjectType: 'S', Name: explainName},
+			&pgproto3.Flush{})
+		return out, err
+	}})
+	if lost(err) {
+		return err
+	}
+	if refused != nil || rej != nil {
+		if body == nil {
+			if _, err := s.clientIn.Discard(n); err != nil {
+				return unexpected(err)
+			}
+		}
+		if rej != nil {
+			return s.reject('B', rej)
+		}
+		// Postgres now skips to Sync, as it would after the client's own Bind failed.
+		s.discard = forwardSync
+		return s.toClient(refused)
+	}
+	if body == nil {
+		return s.forward('B', n)
+	}
+	return s.send('B', body)
+}
+
+// paramCount reads a Bind's parameter count from b, the body after its two names, when b holds it.
+func paramCount(b []byte) (int, bool) {
+	if len(b) < 2 {
+		return 0, false
+	}
+	formats := 2 + 2*int(binary.BigEndian.Uint16(b))
+	if len(b) < formats+2 {
+		return 0, false
+	}
+	return int(binary.BigEndian.Uint16(b[formats:])), true
+}
+
+// explain sends the proxy's EXPLAIN and waits for every answer; with no plan it returns ErrNoPlan, and Postgres's error if it refused.
+func (s *session) explain(shift int, msgs ...pgproto3.FrontendMessage) (string, *pgproto3.ErrorResponse, error) {
+	var buf []byte
+	var types []byte
+	for _, m := range msgs {
+		start := len(buf)
+		var err error
+		if buf, err = m.Encode(buf); err != nil {
+			return "", nil, err
+		}
+		types = append(types, buf[start])
+	}
+	e := &explanation{done: make(chan struct{})}
+	s.mu.Lock()
+	if s.skipping {
+		s.mu.Unlock()
+		return "", nil, ErrNoPlan
+	}
+	s.explaining = e
+	for _, t := range types {
+		if t != 'H' {
+			s.pending = append(s.pending, sent{typ: t, how: captured})
+		}
+	}
+	s.mu.Unlock()
+	s.inBatch = s.inBatch || slices.ContainsFunc(types, func(t byte) bool { return t != 'Q' && t != 'H' })
+	if _, err := s.serverOut.Write(buf); err != nil {
+		return "", nil, err
+	}
+	if err := s.serverOut.Flush(); err != nil {
+		return "", nil, err
+	}
+
+	select {
+	case <-e.done:
+	case <-s.serverGone:
+		return "", nil, net.ErrClosed
+	}
+	switch {
+	case e.err != nil:
+		// The error points into the prefixed text; shift moves it back to the client's own.
+		if e.err.Position > int32(shift) {
+			e.err.Position -= int32(shift)
+		}
+		return "", e.err, ErrNoPlan
+	case e.tooLarge:
+		return "", nil, errPlanTooLarge
+	case e.plan.Len() == 0:
+		return "", nil, ErrNoPlan
+	}
+	return e.plan.String(), nil, nil
+}
+
+// lost reports whether err from explain means the session is over, rather than that there is no plan.
+func lost(err error) bool {
+	return err != nil && !errors.Is(err, ErrNoPlan) && !errors.Is(err, errPlanTooLarge)
+}
+
+// toClient writes msgs to the client and flushes them.
+func (s *session) toClient(msgs ...pgproto3.Message) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := writeMessages(s.clientOut, msgs...); err != nil {
+		return err
+	}
+	return s.clientOut.Flush()
+}
+
+func (s *session) statusNow() byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.status
+}
+
+// failedTransaction reports whether the client's transaction has failed, so every statement fails before it is planned.
+func (s *session) failedTransaction() bool { return s.statusNow() == 'E' }
+
+// send passes a message already read whole to the server.
+func (s *session) send(typ byte, body []byte) error {
+	s.track(typ, relayed)
+	writeHeader(s.serverOut, typ, len(body))
+	_, err := s.serverOut.Write(body)
+	return err
+}
+
 // forward streams one client message to the server.
 func (s *session) forward(typ byte, n int) error {
-	s.track(typ, false)
+	s.track(typ, relayed)
 	writeHeader(s.serverOut, typ, n)
 	return copyBody(s.serverOut, s.clientIn, n)
 }
@@ -228,12 +525,14 @@ func (s *session) reject(typ byte, rej *pgproto3.ErrorResponse) error {
 	// The error must come after Postgres's answers to what is in flight and must fail its transaction, so Postgres raises it.
 	do := doBlock(rej)
 	if typ == 'Q' {
-		s.track('Q', false)
+		s.track('Q', relayed)
 		return writeMessages(s.serverOut, &pgproto3.Query{String: do})
 	}
 	s.discard = forwardSync
+	// The DO block takes the place of the unnamed statement.
+	delete(s.statements, "")
 	for _, t := range []byte{'P', 'B', 'E'} {
-		s.track(t, true)
+		s.track(t, hidden)
 	}
 	return writeMessages(s.serverOut, &pgproto3.Parse{Query: do}, &pgproto3.Bind{}, &pgproto3.Execute{})
 }
@@ -263,8 +562,8 @@ func (s *session) dropUntilSync(typ byte, n int) error {
 	return unexpected(err)
 }
 
-// track records a client message on its way to the server.
-func (s *session) track(typ byte, hidden bool) {
+// track records a message on its way to the server.
+func (s *session) track(typ byte, how answer) {
 	switch typ {
 	case 'S':
 		s.inBatch = false
@@ -282,7 +581,7 @@ func (s *session) track(typ byte, hidden bool) {
 	} else if s.skipping {
 		return
 	}
-	s.pending = append(s.pending, sent{typ: typ, hidden: hidden})
+	s.pending = append(s.pending, sent{typ: typ, how: how})
 }
 
 // fromServer relays server messages to the client, dropping answers to the proxy's own hidden messages.
@@ -306,10 +605,11 @@ func (s *session) fromServer() error {
 	}
 }
 
-// relayAnswer passes one server message to the client, holding mu so a rejection can't land between it and its effect on pending.
+// relayAnswer passes one server message on, holding mu so a rejection can't land between it and its effect on pending.
 func (s *session) relayAnswer(typ byte, n int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer s.endExplaining()
 	if typ == 'Z' && n > 0 {
 		status, err := s.serverIn.Peek(1)
 		if err != nil {
@@ -328,7 +628,10 @@ func (s *session) relayAnswer(typ byte, n int) error {
 			s.report(string(name), string(value))
 		}
 	}
-	if s.answered(typ) {
+	switch how := s.answered(typ); {
+	case how == captured:
+		return s.capture(typ, n)
+	case how == hidden && typ != 'E':
 		_, err := s.serverIn.Discard(n)
 		return unexpected(err)
 	}
@@ -336,16 +639,51 @@ func (s *session) relayAnswer(typ byte, n int) error {
 	return copyBody(s.clientOut, s.serverIn, n)
 }
 
-// answered matches a server message to the oldest pending client message and reports whether to hide it.
-func (s *session) answered(typ byte) (hide bool) {
+// capture keeps the plan and any error from the answers to the proxy's EXPLAIN; the caller holds mu.
+func (s *session) capture(typ byte, n int) error {
+	e := s.explaining
+	if e == nil || (typ != 'D' && typ != 'E') || n > maxCheckedLen {
+		if e != nil && typ == 'D' {
+			e.tooLarge = true
+		}
+		_, err := s.serverIn.Discard(n)
+		return unexpected(err)
+	}
+	body := make([]byte, n)
+	if _, err := io.ReadFull(s.serverIn, body); err != nil {
+		return unexpected(err)
+	}
+	if typ == 'E' {
+		var refused pgproto3.ErrorResponse
+		if refused.Decode(body) == nil && e.err == nil {
+			e.err = &refused
+		}
+		return nil
+	}
+	var row pgproto3.DataRow
+	if row.Decode(body) == nil && len(row.Values) > 0 {
+		e.plan.Write(row.Values[0])
+	}
+	return nil
+}
+
+// endExplaining wakes the statement waiting for its plan once no EXPLAIN message awaits an answer; the caller holds mu.
+func (s *session) endExplaining() {
+	if s.explaining != nil && !slices.ContainsFunc(s.pending, func(p sent) bool { return p.how == captured }) {
+		close(s.explaining.done)
+		s.explaining = nil
+	}
+}
+
+// answered matches a server message to the oldest pending message and returns where it goes.
+func (s *session) answered(typ byte) answer {
 	// Notices, parameter changes and notifications can arrive at any time.
 	if len(s.pending) == 0 || typ == 'N' || typ == 'S' || typ == 'A' {
-		return false
+		return relayed
 	}
 	head := s.pending[0]
-	hide = head.hidden && typ != 'E'
 	if !finishes(head.typ, typ) {
-		return hide
+		return head.how
 	}
 	s.pending = s.pending[1:]
 	if typ == 'E' && head.typ != 'Q' && head.typ != 'F' && head.typ != 'S' {
@@ -357,7 +695,7 @@ func (s *session) answered(typ byte) (hide bool) {
 			s.skipping = true
 		}
 	}
-	return hide
+	return head.how
 }
 
 // finishes reports whether a server message of type reply is the last answer to a client message of type msg.

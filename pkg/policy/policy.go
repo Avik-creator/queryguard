@@ -170,8 +170,13 @@ type Checker struct {
 	log            *slog.Logger
 }
 
-// Check returns the error to send instead of running sql, or nil to run it; every match is logged.
-func (c *Checker) Check(sql string, set session.Settings) *pgproto3.ErrorResponse {
+// Check returns the error to send instead of running sql, or nil to run it, and no cost check yet; every match is logged.
+func (c *Checker) Check(sql string, set session.Settings) (*pgproto3.ErrorResponse, session.CostCheck) {
+	return c.check(sql, set), nil
+}
+
+// check returns the error to send instead of running sql, or nil to run it.
+func (c *Checker) check(sql string, set session.Settings) *pgproto3.ErrorResponse {
 	if len(c.rules) == 0 {
 		return nil
 	}
