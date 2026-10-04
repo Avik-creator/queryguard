@@ -61,6 +61,10 @@ func Analyze(sql string) (Query, error) {
 			q.DDL = q.DDL || n.IntoClause != nil
 		case *pg_query.UpdateStmt:
 			q.ChangesEveryRow = q.ChangesEveryRow || n.WhereClause == nil
+			// Updating the pg_settings view calls set_config for each row, with names and values known only when it runs.
+			if r := n.GetRelation(); r.GetRelname() == "pg_settings" && (r.GetSchemaname() == "" || r.GetSchemaname() == "pg_catalog") {
+				q.UnknownSearchPath = true
+			}
 		case *pg_query.DeleteStmt:
 			q.ChangesEveryRow = q.ChangesEveryRow || n.WhereClause == nil
 		case *pg_query.TruncateStmt:
@@ -114,7 +118,7 @@ func Analyze(sql string) (Query, error) {
 				}
 			}
 		case *pg_query.VariableSetStmt:
-			if n.Name == "search_path" {
+			if strings.EqualFold(n.Name, searchPath) {
 				for _, arg := range n.Args {
 					// "$user" stands for the role's own schema, which Postgres skips when it doesn't exist.
 					if s := arg.GetAConst().GetSval().GetSval(); !strings.HasPrefix(s, "$") {
@@ -136,18 +140,31 @@ func schemaOf(names []*pg_query.Node) string {
 	return names[len(names)-2].GetString_().GetSval()
 }
 
-// searchPathSet reports whether call is set_config('search_path', …) and returns the schemas it sets, or nil when the value is not a constant.
+// searchPath is the setting schema_allowlist watches; Postgres matches setting names ignoring case.
+const searchPath = "search_path"
+
+// searchPathSet reports whether call may be set_config('search_path', …) and returns the schemas it sets, or nil when the name or value is not a constant.
 func searchPathSet(call *pg_query.FuncCall) (schemas []string, ok bool) {
 	name := call.Funcname[len(call.Funcname)-1].GetString_().GetSval()
-	if name != "set_config" || len(call.Args) < 2 || call.Args[0].GetAConst().GetSval().GetSval() != "search_path" {
+	if name != "set_config" || len(call.Args) < 2 {
 		return nil, false
 	}
-	value := call.Args[1].GetAConst().GetSval()
-	if value == nil {
+	setting, value := call.Args[0].GetAConst().GetSval(), call.Args[1].GetAConst().GetSval()
+	switch {
+	case setting == nil:
+		return nil, true
+	case !strings.EqualFold(setting.Sval, searchPath):
+		return nil, false
+	case value == nil:
 		return nil, true
 	}
-	schemas = []string{}
-	for part := range strings.SplitSeq(value.Sval, ",") {
+	return SearchPath(value.Sval), true
+}
+
+// SearchPath returns the schemas in a search_path value, folding unquoted names to lower case and skipping "$user".
+func SearchPath(value string) []string {
+	schemas := []string{}
+	for part := range strings.SplitSeq(value, ",") {
 		part = strings.TrimSpace(part)
 		// Postgres folds unquoted names to lower case and keeps quoted ones as written.
 		if unquoted, quoted := strings.CutPrefix(part, `"`); quoted {
@@ -159,7 +176,7 @@ func searchPathSet(call *pg_query.FuncCall) (schemas []string, ok bool) {
 			schemas = append(schemas, part)
 		}
 	}
-	return schemas, true
+	return schemas
 }
 
 // concurrently reports whether REINDEX options turn on CONCURRENTLY; an option without a value means on.

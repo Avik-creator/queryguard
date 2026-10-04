@@ -60,6 +60,14 @@ func TestAnalyze(t *testing.T) {
 		{"truncate billing.orders", Query{ChangesEveryRow: true, Schemas: []string{"billing"}}},
 		{`select set_config('search_path', 'billing, "$user"', false)`, Query{Schemas: []string{"billing"}}},
 		{"select pg_catalog.set_config('search_path', current_setting('app.path'), false)", Query{Schemas: []string{"pg_catalog"}, UnknownSearchPath: true}},
+		// Postgres looks setting names up ignoring case.
+		{`set "SEARCH_PATH" = billing`, Query{Schemas: []string{"billing"}}},
+		{"select set_config('SEARCH_PATH', 'billing', false)", Query{Schemas: []string{"billing"}}},
+		{"select set_config(lower('SEARCH_PATH'), 'billing', false)", Query{UnknownSearchPath: true}},
+		{"select set_config('application_name', 'billing', false)", Query{}},
+		// Updating pg_settings calls set_config for each row.
+		{"update pg_settings set setting = 'billing' where name = 'search_path'", Query{UnknownSearchPath: true}},
+		{"update pg_catalog.pg_settings set setting = 'billing' where name = 'search_path'", Query{Schemas: []string{"pg_catalog"}, UnknownSearchPath: true}},
 	} {
 		got, err := Analyze(tc.sql)
 		if err != nil {
