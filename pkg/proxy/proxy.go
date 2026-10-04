@@ -145,7 +145,14 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 		release       = func() {}
 	)
 	if s.Policy != nil {
-		check = s.Policy.Checker(role, log.With("client", client.RemoteAddr()))
+		c := s.Policy.Checker(role, log.With("client", client.RemoteAddr()))
+		if rej := c.CheckStartup(wire.StartupSettings(startup.Parameters)); rej != nil {
+			if buf, err := rej.Encode(nil); err == nil {
+				client.Write(buf)
+			}
+			return
+		}
+		check = c
 		total, tenant := s.Policy.ConnectionLimits(role)
 		// Like Postgres, count a session only once it has logged in, so a client without the password can't use up a role's cap.
 		authenticated = func() *wire.Error {

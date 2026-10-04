@@ -6,6 +6,7 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"iter"
 	"log/slog"
 	"os"
 	"slices"
@@ -181,26 +182,51 @@ func (c *Checker) Check(sql string, set session.Settings) *pgproto3.ErrorRespons
 	if err != nil {
 		return c.unchecked("The parser cannot read it.", "err", err)
 	}
-	var blocked, fingerprint, normalized string
-	for _, r := range c.rules {
-		if !checks[r.Check].violatedBy(q, r) {
-			continue
-		}
-		if fingerprint == "" {
-			fingerprint, normalized = sqlparse.Fingerprint(sql), sqlparse.Normalize(sql)
-		}
-		enforce := r.Mode != Warn && !c.warnOnly
-		msg := "would reject statement"
-		if enforce {
-			msg = "rejected statement"
-			blocked = cmp.Or(blocked, r.Check)
-		}
-		c.log.Warn(msg, "rule", r.Check, "fingerprint", fingerprint, "query", normalized)
-	}
+	var fingerprint string
+	blocked := c.judge(q, "statement", func() []any {
+		fingerprint = sqlparse.Fingerprint(sql)
+		return []any{"fingerprint", fingerprint, "query", sqlparse.Normalize(sql)}
+	})
 	if blocked == "" {
 		return nil
 	}
 	return rejection("queryguard: rule "+blocked+" blocks this statement", "Statement fingerprint "+fingerprint+".", checks[blocked].hint)
+}
+
+// CheckStartup checks the settings a client asks for at login, which no statement shows; it returns a FATAL error to refuse the login.
+func (c *Checker) CheckStartup(settings iter.Seq2[string, string]) *pgproto3.ErrorResponse {
+	for name, value := range settings {
+		if name != "search_path" {
+			continue
+		}
+		blocked := c.judge(sqlparse.Query{Schemas: sqlparse.SearchPath(value)}, "login", func() []any { return []any{"search_path", value} })
+		if blocked != "" {
+			e := rejection("queryguard: rule "+blocked+" blocks this search_path", "", checks[blocked].hint)
+			e.Severity, e.SeverityUnlocalized = "FATAL", "FATAL"
+			return e
+		}
+	}
+	return nil
+}
+
+// judge runs the rules on q, logging each match of a statement or login with what describe returns, and returns the first rule that blocks it.
+func (c *Checker) judge(q sqlparse.Query, what string, describe func() []any) (blocked string) {
+	var attrs []any
+	for _, r := range c.rules {
+		if !checks[r.Check].violatedBy(q, r) {
+			continue
+		}
+		if attrs == nil {
+			attrs = describe()
+		}
+		msg := "would reject " + what
+		if r.Mode != Warn && !c.warnOnly {
+			msg = "rejected " + what
+			blocked = cmp.Or(blocked, r.Check)
+		}
+		c.log.Warn(msg, append([]any{"rule", r.Check}, attrs...)...)
+	}
+	return blocked
 }
 
 // CheckTooLong decides on a statement too long to read, as for one the parser can't read.

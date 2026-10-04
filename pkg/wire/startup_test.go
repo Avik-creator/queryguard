@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"testing"
 	"time"
 
@@ -242,6 +243,34 @@ func TestNegotiateReturnsCancelRequestOverTLS(t *testing.T) {
 	}
 	if got := mustBe[*pgproto3.CancelRequest](t, r.msg); got.ProcessID != 42 {
 		t.Errorf("got process %d; want 42", got.ProcessID)
+	}
+}
+
+func TestStartupSettings(t *testing.T) {
+	for _, tc := range []struct {
+		params map[string]string
+		want   []string
+	}{
+		{map[string]string{"user": "alice", "database": "shop", "replication": "true", "_pq_.x": "y"}, nil},
+		{map[string]string{"application_name": "app", "SEARCH_PATH": "billing"}, []string{"application_name=app", "search_path=billing"}},
+		{map[string]string{"options": "-c search_path=billing"}, []string{"search_path=billing"}},
+		{map[string]string{"options": "-csearch_path=billing --work_mem=64MB"}, []string{"search_path=billing", "work_mem=64MB"}},
+		// Postgres turns dashes in -c names into underscores and matches names ignoring case.
+		{map[string]string{"options": "-c Search-Path=billing"}, []string{"search_path=billing"}},
+		{map[string]string{"options": `-c search_path=public,\ billing`}, []string{"search_path=public, billing"}},
+		// -E takes no value, so c is the next switch in the cluster; -B takes the next word as its value.
+		{map[string]string{"options": "-Ec search_path=billing -B 100 -c x=1"}, []string{"search_path=billing", "x=1"}},
+		{map[string]string{"options": "  -c\tsearch_path=billing  "}, []string{"search_path=billing"}},
+		{map[string]string{"options": "-c novalue stray"}, nil},
+	} {
+		var got []string
+		for name, value := range StartupSettings(tc.params) {
+			got = append(got, name+"="+value)
+		}
+		slices.Sort(got)
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("StartupSettings(%q) = %q; want %q", tc.params, got, tc.want)
+		}
 	}
 }
 

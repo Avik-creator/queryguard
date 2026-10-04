@@ -161,6 +161,22 @@ func TestCountsOnlyLoggedInSessions(t *testing.T) {
 	expectOverCap(t, sendStartupAs(t, dial(t, addr), "alice"))
 }
 
+func TestRefusesLoginWithSearchPathOutsideAllowlist(t *testing.T) {
+	pg := startFakePostgres(t)
+	s := newServer(t, pg.addr)
+	s.Policy = mustPolicy(t, `{"rules": [{"check": "schema_allowlist", "schemas": ["public"]}]}`)
+	addr, _ := startProxy(t, s)
+
+	conn := dial(t, addr)
+	send(t, conn, &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30, Parameters: map[string]string{"user": "alice", "options": "-c search_path=billing"}})
+
+	expectFatal(t, conn, "42501")
+	if len(pg.received) > 0 {
+		t.Error("the refused login reached Postgres")
+	}
+	startSession(t, addr)
+}
+
 func TestChecksStatementsWithSettingsFromLogin(t *testing.T) {
 	// With standard_conforming_strings off, Postgres ends the string at \' and runs the DELETE.
 	const hidden = `select '\''; delete from orders; --'`

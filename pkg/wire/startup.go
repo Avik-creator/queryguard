@@ -7,7 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"net"
+	"slices"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -193,4 +196,77 @@ func SendFatal(w io.Writer, code, msg string) error {
 	}
 	_, err = w.Write(buf)
 	return err
+}
+
+// notSettings are the startup parameters Postgres handles itself instead of as settings.
+var notSettings = []string{"user", "database", "options", "replication"}
+
+// switchesWithValue are the postgres switches that take a value, from process_postgres_switches in postgres.c.
+const switchesWithValue = "BCcDdfhkNprStvW-"
+
+// StartupSettings yields the settings a startup message asks for, from options (-c name=value and --name=value)
+// and then the other parameters, with names lower-cased and dashes made underscores as Postgres matches them.
+func StartupSettings(params map[string]string) iter.Seq2[string, string] {
+	return func(yield func(string, string) bool) {
+		args := splitOptions(params["options"])
+		for i := 0; i < len(args); i++ {
+			// Postgres refuses a word that is not a switch, so whatever follows it is never applied.
+			if len(args[i]) < 2 || args[i][0] != '-' {
+				return
+			}
+			for j := 1; j < len(args[i]); j++ {
+				sw := args[i][j]
+				if !strings.ContainsRune(switchesWithValue, rune(sw)) {
+					continue
+				}
+				value := args[i][j+1:]
+				if value == "" && i+1 < len(args) {
+					i++
+					value = args[i]
+				}
+				if name, v, ok := strings.Cut(value, "="); ok && (sw == 'c' || sw == '-') {
+					if !yield(strings.ToLower(strings.ReplaceAll(name, "-", "_")), v) {
+						return
+					}
+				}
+				break
+			}
+		}
+		for name, value := range params {
+			if !slices.Contains(notSettings, name) && !strings.HasPrefix(name, "_pq_.") && !yield(strings.ToLower(name), value) {
+				return
+			}
+		}
+	}
+}
+
+// splitOptions splits options into words at unescaped white space, as pg_split_opts in postinit.c does.
+func splitOptions(options string) []string {
+	var words []string
+	var word strings.Builder
+	inWord, escaped := false, false
+	for i := range len(options) {
+		c := options[i]
+		switch {
+		case escaped:
+			escaped = false
+			word.WriteByte(c)
+		case strings.IndexByte(" \t\n\v\f\r", c) >= 0:
+			if inWord {
+				words = append(words, word.String())
+				word.Reset()
+			}
+			inWord = false
+			continue
+		case c == '\\':
+			escaped = true
+		default:
+			word.WriteByte(c)
+		}
+		inWord = true
+	}
+	if inWord {
+		words = append(words, word.String())
+	}
+	return words
 }

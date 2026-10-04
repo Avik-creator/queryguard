@@ -3,6 +3,7 @@ package policy
 import (
 	"bytes"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -196,6 +197,31 @@ func TestStatementPostgresMayReadDifferently(t *testing.T) {
 		if tc.want && !strings.Contains(logs.String(), "could not check statement") {
 			t.Errorf("Check(%q, %+v) logged %q; want the reason", tc.sql, tc.set, logs.String())
 		}
+	}
+}
+
+func TestStartupSearchPath(t *testing.T) {
+	c := mustParse(t, allRules).Checker("alice", discard)
+	for _, tc := range []struct {
+		settings map[string]string
+		want     string // the rule that refuses the login
+	}{
+		{map[string]string{"search_path": "public, pg_catalog"}, ""},
+		{map[string]string{"application_name": "billing"}, ""},
+		{map[string]string{"search_path": "billing"}, "schema_allowlist"},
+		{map[string]string{"search_path": `public, "Billing"`}, "schema_allowlist"},
+	} {
+		got := c.CheckStartup(maps.All(tc.settings))
+		if ruleOf(got) != tc.want {
+			t.Errorf("CheckStartup(%v) = %v; want blocked by %q", tc.settings, got, tc.want)
+		}
+		if got != nil && (got.Severity != "FATAL" || got.Code != "42501") {
+			t.Errorf("CheckStartup(%v) = %s %s; want FATAL 42501", tc.settings, got.Severity, got.Code)
+		}
+	}
+	warn := mustParse(t, `{"rules": [{"check": "schema_allowlist", "schemas": ["public"], "mode": "warn"}]}`).Checker("alice", discard)
+	if got := warn.CheckStartup(maps.All(map[string]string{"search_path": "billing"})); got != nil {
+		t.Errorf("warn mode refused the login with %v", got)
 	}
 }
 
