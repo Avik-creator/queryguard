@@ -123,12 +123,12 @@ func TestTenantInWarnModeIsNeverBlocked(t *testing.T) {
 	}
 }
 
-func TestParseErrors(t *testing.T) {
+func TestUncheckedStatements(t *testing.T) {
 	for config, wantReject := range map[string]bool{
-		`{"rules": [{"check": "require_where"}]}`:                           false,
-		`{"rules": [{"check": "require_where"}], "parse_errors": "allow"}`:  false,
-		`{"rules": [{"check": "require_where"}], "parse_errors": "reject"}`: true,
-		`{"parse_errors": "reject"}`:                                        false,
+		`{"rules": [{"check": "require_where"}]}`:                        true,
+		`{"rules": [{"check": "require_where"}], "unchecked": "allow"}`:  false,
+		`{"rules": [{"check": "require_where"}], "unchecked": "reject"}`: true,
+		`{"unchecked": "reject"}`:                                        false,
 	} {
 		var logs bytes.Buffer
 		c := mustParse(t, config).Checker("alice", logger(&logs))
@@ -148,14 +148,14 @@ func TestParseErrors(t *testing.T) {
 }
 
 func TestStatementTooLongToCheck(t *testing.T) {
-	allow := mustParse(t, `{"rules": [{"check": "require_where"}]}`).Checker("alice", discard)
-	reject := mustParse(t, `{"rules": [{"check": "require_where"}], "parse_errors": "reject"}`).Checker("alice", discard)
+	allow := mustParse(t, `{"rules": [{"check": "require_where"}], "unchecked": "allow"}`).Checker("alice", discard)
+	reject := mustParse(t, `{"rules": [{"check": "require_where"}]}`).Checker("alice", discard)
 
 	if got := allow.CheckTooLong(1 << 30); got != nil {
-		t.Errorf("parse_errors allow got %v; want allowed", got)
+		t.Errorf("unchecked allow got %v; want allowed", got)
 	}
 	if got := reject.CheckTooLong(1 << 30); got == nil || got.Code != "42501" {
-		t.Errorf("parse_errors reject got %v; want 42501", got)
+		t.Errorf("unchecked reject got %v; want 42501", got)
 	}
 }
 
@@ -177,7 +177,7 @@ func TestParseRejectsBadConfig(t *testing.T) {
 		`{"rules": [{"check": "require_where"}, {"check": "require_where"}]}`: "twice",
 		`{"rules": [{"check": "schema_allowlist"}]}`:                          "schemas",
 		`{"rules": [{"check": "require_where", "schemas": ["public"]}]}`:      "schemas",
-		`{"parse_errors": "maybe"}`:                                           "maybe",
+		`{"unchecked": "maybe"}`:                                              "maybe",
 		`{"tenants": {"alice": {"mode": "loud"}}}`:                            "loud",
 		`{"max_connections": -1}`:                                             "max_connections",
 		`{"tenants": {"alice": {"max_connections": -1}}}`:                     "max_connections",

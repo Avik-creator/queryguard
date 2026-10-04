@@ -17,8 +17,8 @@ import (
 
 // Config is the JSON policy file.
 type Config struct {
-	// ParseErrors is "allow" (the default) to let through statements the parser can't read, or "reject" to block them.
-	ParseErrors          string            `json:"parse_errors"`
+	// Unchecked is "reject" (the default) to block statements QueryGuard can't check, or "allow" to let them run.
+	Unchecked            string            `json:"unchecked"`
 	MaxConnections       int               `json:"max_connections"`        // across all tenants; 0 means no cap
 	TenantMaxConnections int               `json:"tenant_max_connections"` // for each tenant without its own; 0 means no cap
 	Rules                []Rule            `json:"rules"`
@@ -114,8 +114,8 @@ func Parse(data []byte) (*Policy, error) {
 
 func (c *Config) validate() error {
 	var errs []error
-	if c.ParseErrors != "" && c.ParseErrors != "allow" && c.ParseErrors != "reject" {
-		errs = append(errs, fmt.Errorf("parse_errors %q: want allow or reject", c.ParseErrors))
+	if c.Unchecked != "" && c.Unchecked != "allow" && c.Unchecked != "reject" {
+		errs = append(errs, fmt.Errorf("unchecked %q: want allow or reject", c.Unchecked))
 	}
 	if c.MaxConnections < 0 || c.TenantMaxConnections < 0 {
 		errs = append(errs, errors.New("max_connections and tenant_max_connections must not be negative"))
@@ -154,7 +154,7 @@ func (p *Policy) ConnectionLimits(role string) (total, tenant int) {
 func (p *Policy) Checker(role string, log *slog.Logger) *Checker {
 	return &Checker{
 		rules:          p.cfg.Rules,
-		rejectUnparsed: p.cfg.ParseErrors == "reject",
+		allowUnchecked: p.cfg.Unchecked == "allow",
 		warnOnly:       p.cfg.Tenants[role].Mode == Warn,
 		log:            log.With("role", role),
 	}
@@ -163,7 +163,7 @@ func (p *Policy) Checker(role string, log *slog.Logger) *Checker {
 // Checker checks the statements of one session.
 type Checker struct {
 	rules          []Rule
-	rejectUnparsed bool
+	allowUnchecked bool
 	warnOnly       bool
 	log            *slog.Logger
 }
@@ -207,15 +207,15 @@ func (c *Checker) CheckTooLong(size int) *pgproto3.ErrorResponse {
 	return c.unchecked("size", size)
 }
 
-// unchecked logs a statement that could not be checked and rejects it when parse_errors is reject.
+// unchecked logs a statement that could not be checked and rejects it unless unchecked is allow.
 func (c *Checker) unchecked(attrs ...any) *pgproto3.ErrorResponse {
-	reject := c.rejectUnparsed && !c.warnOnly
+	reject := !c.allowUnchecked && !c.warnOnly
 	c.log.Warn("could not check statement", append(attrs, "rejected", reject)...)
 	if !reject {
 		return nil
 	}
 	return rejection("queryguard: statement could not be checked", "",
-		"QueryGuard rejects SQL its parser cannot read because parse_errors is reject.")
+		"QueryGuard rejects statements it cannot check unless unchecked is allow in its config.")
 }
 
 // rejection is an insufficient_privilege error, the code Postgres itself uses for a refused action.
