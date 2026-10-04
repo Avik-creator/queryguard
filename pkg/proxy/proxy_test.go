@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Avik-creator/queryguard/internal/testcert"
+	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/wire"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -91,12 +92,54 @@ func TestAsksPostgresForTighterKeepalive(t *testing.T) {
 	}
 }
 
-func TestRelaysBytesBothWays(t *testing.T) {
+func TestRelaysMessagesBothWays(t *testing.T) {
 	pg := startFakePostgres(t)
 	addr, _ := startProxy(t, newServer(t, pg.addr))
 	conn := startSession(t, addr)
 
 	roundTrip(t, conn, "hello")
+}
+
+func TestRejectsStatementsByPolicy(t *testing.T) {
+	s := newServer(t, startFakePostgres(t).addr)
+	s.Policy = mustPolicy(t, `{"rules": [{"check": "require_where"}]}`)
+	addr, _ := startProxy(t, s)
+	conn := startSession(t, addr)
+
+	send(t, conn, &pgproto3.Query{String: "delete from orders"})
+
+	if e, ok := receive(t, conn).(*pgproto3.ErrorResponse); !ok || e.Code != "42501" {
+		t.Fatalf("got %#v; want error 42501", e)
+	}
+	if _, ok := receive(t, conn).(*pgproto3.ReadyForQuery); !ok {
+		t.Fatal("no ReadyForQuery after the rejection")
+	}
+	roundTrip(t, conn, "select 1")
+}
+
+func TestCapsConnectionsPerTenant(t *testing.T) {
+	s := newServer(t, startFakePostgres(t).addr)
+	s.Policy = mustPolicy(t, `{"tenant_max_connections": 1, "tenants": {"bob": {"max_connections": 2}}}`)
+	addr, _ := startProxy(t, s)
+	first := startSession(t, addr)
+
+	expectFatal(t, sendStartupAs(t, dial(t, addr), "alice"), "53300")
+	// bob has a cap of their own.
+	loginAs(t, dial(t, addr), "bob")
+	loginAs(t, dial(t, addr), "bob")
+	expectFatal(t, sendStartupAs(t, dial(t, addr), "bob"), "53300")
+
+	first.Close()
+	waitForSessionSlot(t, addr)
+}
+
+func TestCapsConnectionsInTotal(t *testing.T) {
+	s := newServer(t, startFakePostgres(t).addr)
+	s.Policy = mustPolicy(t, `{"max_connections": 1}`)
+	addr, _ := startProxy(t, s)
+	startSession(t, addr)
+
+	expectFatal(t, sendStartupAs(t, dial(t, addr), "bob"), "53300")
 }
 
 func TestGivesClientItsOwnCancelKey(t *testing.T) {
@@ -501,6 +544,36 @@ func upstreamParams(t *testing.T, s *Server, pg *fakePostgres, extra map[string]
 	return mustReceive[*pgproto3.StartupMessage](t, pg.received).Parameters
 }
 
+func mustPolicy(t *testing.T, config string) *policy.Policy {
+	t.Helper()
+	p, err := policy.Parse([]byte(config))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// sendStartupAs sends a startup message for role and returns conn.
+func sendStartupAs(t *testing.T, conn net.Conn, role string) net.Conn {
+	t.Helper()
+	send(t, conn, &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30, Parameters: map[string]string{"user": role}})
+	return conn
+}
+
+// waitForSessionSlot retries logging in as alice until the proxy has counted a closed session out.
+func waitForSessionSlot(t *testing.T, addr string) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		conn := sendStartupAs(t, dial(t, addr), "alice")
+		if _, ok := receive(t, conn).(*pgproto3.AuthenticationOk); ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("closed session still counts against the cap after 2s")
+		}
+	}
+}
+
 // with returns a copy of m with key set to v; an empty v removes key.
 func with(m map[string]string, key, v string) map[string]string {
 	m = maps.Clone(m)
@@ -566,10 +639,23 @@ func startSession(t *testing.T, addr string) net.Conn {
 	return conn
 }
 
-// login sends a startup message on conn, reads up to ReadyForQuery and returns the cancel key data the client got.
+// login logs in as alice on conn, reads up to ReadyForQuery and returns the cancel key data the client got.
 func login(t *testing.T, conn net.Conn) *pgproto3.BackendKeyData {
 	t.Helper()
 	sendStartup(t, conn)
+	return finishLogin(t, conn)
+}
+
+// loginAs logs in as role on conn.
+func loginAs(t *testing.T, conn net.Conn, role string) {
+	t.Helper()
+	sendStartupAs(t, conn, role)
+	finishLogin(t, conn)
+}
+
+// finishLogin reads up to ReadyForQuery and returns the cancel key data the client got.
+func finishLogin(t *testing.T, conn net.Conn) *pgproto3.BackendKeyData {
+	t.Helper()
 	var key *pgproto3.BackendKeyData
 	for {
 		switch msg := receive(t, conn).(type) {
@@ -663,20 +749,21 @@ func mustReceive[T pgproto3.FrontendMessage](t *testing.T, ch <-chan pgproto3.Fr
 	}
 }
 
-// roundTrip sends msg through conn and checks the echo comes back.
+// roundTrip sends msg as a Query through conn and checks fakePostgres's echo comes back.
 func roundTrip(t *testing.T, conn net.Conn, msg string) {
 	t.Helper()
+	want, _ := (&pgproto3.Query{String: msg}).Encode(nil)
 	conn.SetDeadline(time.Now().Add(2 * time.Second))
 	defer conn.SetDeadline(time.Time{})
-	if _, err := conn.Write([]byte(msg)); err != nil {
+	if _, err := conn.Write(want); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	got := make([]byte, len(msg))
+	got := make([]byte, len(want))
 	if _, err := io.ReadFull(conn, got); err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if string(got) != msg {
-		t.Fatalf("got %q back; want %q", got, msg)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("got %q back; want %q", got, want)
 	}
 }
 

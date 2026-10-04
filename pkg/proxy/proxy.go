@@ -14,8 +14,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/Avik-creator/queryguard/pkg/policy"
+	"github.com/Avik-creator/queryguard/pkg/session"
 	"github.com/Avik-creator/queryguard/pkg/wire"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -44,8 +47,11 @@ type Server struct {
 	ClientCheckInterval time.Duration
 	// KeepAlive is set on client sockets and sent to Postgres for its side; a disabled config leaves both alone.
 	KeepAlive net.KeepAliveConfig
+	// Policy holds the statement rules and connection caps; nil checks nothing.
+	Policy *policy.Policy
 
-	keys cancelKeys
+	keys     cancelKeys
+	sessions sessionCount
 }
 
 // Serve accepts on ln until ctx is cancelled, then drains sessions for up to ShutdownTimeout.
@@ -130,8 +136,22 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 	}
 }
 
-// relay connects client to an upstream connection and copies bytes both ways until either side closes.
+// relay connects client to an upstream connection and relays messages both ways until either side closes.
 func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, startup *pgproto3.StartupMessage) {
+	role := startup.Parameters["user"]
+	var check session.Checker
+	if s.Policy != nil {
+		total, tenant := s.Policy.ConnectionLimits(role)
+		release, ok := s.sessions.add(role, total, tenant)
+		if !ok {
+			log.Warn("refused connection over the cap", "client", client.RemoteAddr(), "role", role)
+			wire.SendFatal(client, "53300", "queryguard: too many connections")
+			return
+		}
+		defer release()
+		check = s.Policy.Checker(role, log.With("client", client.RemoteAddr()))
+	}
+
 	s.addSettings(startup)
 	server, err := s.Upstream.Acquire(ctx, startup)
 	if err != nil {
@@ -141,7 +161,7 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	}
 	defer s.Upstream.Release(server)
 
-	// The startup copy sets forget; it is called once both copies are done.
+	// The login sets forget; it is called once the session is over.
 	forget := func() {}
 	opts := wire.StartupOptions{
 		ChannelBinding: sameCertificate(client, server, s.TLSConfig),
@@ -152,31 +172,26 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 			return issued
 		},
 	}
-	closeBoth := func() {
+	stop := context.AfterFunc(ctx, func() {
 		client.Close()
 		server.Close()
-	}
-	stop := context.AfterFunc(ctx, closeBoth)
+	})
 	defer stop()
 
-	// When one side stops, close both so the other copy ends too.
-	var copies sync.WaitGroup
-	copies.Go(func() {
-		io.Copy(server, client)
-		closeBoth()
+	err = session.Relay(client, server, check, func(client io.Writer, server io.Reader) error {
+		return wire.RelayStartup(client, server, opts)
 	})
-	copies.Go(func() {
-		err := wire.RelayStartup(client, server, opts)
-		if err == nil {
-			io.Copy(client, server)
-		} else if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-			// Either side hanging up mid-login is normal; psql does it before every password prompt.
-			log.Warn("relay startup", "client", client.RemoteAddr(), "err", err)
-		}
-		closeBoth()
-	})
-	copies.Wait()
 	forget()
+	if !hungUp(err) {
+		log.Warn("session ended", "client", client.RemoteAddr(), "err", err)
+	}
+}
+
+// hungUp reports whether err only says that one side closed the connection, which is how every session ends.
+func hungUp(err error) bool {
+	// psql hangs up mid-login before every password prompt.
+	return err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET)
 }
 
 // addSettings adds the proxy's Postgres settings to startup, keeping any the client set directly or in options.

@@ -74,6 +74,24 @@ func TestUpstreamTLSRejects(t *testing.T) {
 	}
 }
 
+func TestLoadPolicy(t *testing.T) {
+	if p, err := loadPolicy(""); p != nil || err != nil {
+		t.Errorf("no -config gave %v, %v; want nil, nil", p, err)
+	}
+
+	good := filepath.Join(t.TempDir(), "good.json")
+	writeFile(t, good, []byte(`{"rules": [{"check": "require_where"}]}`))
+	if p, err := loadPolicy(good); p == nil || err != nil {
+		t.Errorf("valid config gave %v, %v; want a policy", p, err)
+	}
+
+	bad := filepath.Join(t.TempDir(), "bad.json")
+	writeFile(t, bad, []byte(`{"rules": [{"check": "nope"}]}`))
+	if _, err := loadPolicy(bad); err == nil {
+		t.Error("invalid config gave no error")
+	}
+}
+
 func writeFile(t *testing.T, name string, data []byte) {
 	t.Helper()
 	if err := os.WriteFile(name, data, 0o600); err != nil {

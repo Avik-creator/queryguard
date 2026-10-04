@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/proxy"
 	"github.com/Avik-creator/queryguard/pkg/wire"
 )
@@ -32,6 +33,7 @@ type options struct {
 	upstreamCA      string
 	clientCheck     time.Duration
 	keepAlive       bool
+	config          string
 	shutdownTimeout time.Duration
 }
 
@@ -45,6 +47,7 @@ func main() {
 	flag.StringVar(&opts.upstreamCA, "upstream-ca", "", "PEM CA certificates for verify-full; default is the system roots")
 	flag.DurationVar(&opts.clientCheck, "client-check-interval", proxy.DefaultClientCheckInterval,
 		"how often Postgres checks that a client is still there during a query; 0 leaves Postgres's setting alone")
+	flag.StringVar(&opts.config, "config", "", "JSON policy file with rules and connection caps; none means no checks")
 	flag.BoolVar(&opts.keepAlive, "tcp-keepalive", true,
 		"find silently dead clients and servers in about 30s; false keeps the operating system's timing")
 	flag.DurationVar(&opts.shutdownTimeout, "shutdown-timeout", proxy.DefaultShutdownTimeout,
@@ -73,6 +76,10 @@ func run(opts options, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	pol, err := loadPolicy(opts.config)
+	if err != nil {
+		return err
+	}
 
 	// Ctrl-C or a SIGTERM from Docker or systemd starts a clean shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -83,7 +90,7 @@ func run(opts options, log *slog.Logger) error {
 		return err
 	}
 	log.Info("queryguard started", "version", version, "listen", ln.Addr(), "upstream", opts.upstream,
-		"tls", tlsConfig != nil, "upstream_sslmode", opts.upstreamSSL)
+		"tls", tlsConfig != nil, "upstream_sslmode", opts.upstreamSSL, "config", opts.config)
 
 	var keepAlive net.KeepAliveConfig
 	if opts.keepAlive {
@@ -94,6 +101,7 @@ func run(opts options, log *slog.Logger) error {
 		TLSConfig:           tlsConfig,
 		ClientCheckInterval: opts.clientCheck,
 		KeepAlive:           keepAlive,
+		Policy:              pol,
 		ShutdownTimeout:     opts.shutdownTimeout,
 		Logger:              log,
 	}
@@ -102,6 +110,14 @@ func run(opts options, log *slog.Logger) error {
 	}
 	log.Info("queryguard stopped cleanly")
 	return nil
+}
+
+// loadPolicy reads the policy file, or returns nil when there is none.
+func loadPolicy(path string) (*policy.Policy, error) {
+	if path == "" {
+		return nil, nil
+	}
+	return policy.Load(path)
 }
 
 // loadTLS returns the client TLS config, or nil when neither file is given.
