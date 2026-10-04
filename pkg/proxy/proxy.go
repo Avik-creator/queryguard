@@ -11,14 +11,17 @@ import (
 	"log/slog"
 	"maps"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
+	"github.com/Avik-creator/queryguard/pkg/sched"
 	"github.com/Avik-creator/queryguard/pkg/session"
 	"github.com/Avik-creator/queryguard/pkg/wire"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -32,6 +35,9 @@ const (
 
 // DefaultClientCheckInterval is the suggested ClientCheckInterval; zero there means off.
 const DefaultClientCheckInterval = 2 * time.Second
+
+// cancelTimeout bounds sending a CancelRequest for a session.
+const cancelTimeout = 5 * time.Second
 
 // planStatsInterval is how often the plan cache's hit rate and explain time are logged.
 const planStatsInterval = time.Minute
@@ -51,14 +57,19 @@ type Server struct {
 	ClientCheckInterval time.Duration
 	// KeepAlive is set on client sockets and sent to Postgres for its side; a disabled config leaves both alone.
 	KeepAlive net.KeepAliveConfig
-	// Policy holds the statement rules and connection caps; nil checks nothing.
+	// Policy is the policy the server starts with: rules, tenants, budgets and caps; nil checks nothing. SetPolicy replaces it.
 	Policy *policy.Policy
 	// Catalog gives the cost rules table sizes; nil leaves every size unknown.
 	Catalog *plan.Catalog
+	// Plans caches statement plans for every session's cost rules.
+	Plans plan.Cache
 
 	keys     cancelKeys
 	sessions sessionCount
-	plans    plan.Cache
+	policies policy.Holder
+
+	mu    sync.Mutex
+	sched *sched.Scheduler // made with the first policy and reconfigured by each one after
 }
 
 // Serve accepts on ln until ctx is cancelled, then drains sessions for up to ShutdownTimeout.
@@ -73,7 +84,10 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	sessionCtx, closeSessions := context.WithCancel(context.WithoutCancel(ctx))
 	defer closeSessions()
 
-	if s.Policy != nil {
+	if s.Policy != nil && s.policies.Load() == nil {
+		s.SetPolicy(s.Policy)
+	}
+	if s.ActivePolicy() != nil {
 		go s.logPlanStats(ctx, log, time.Tick(planStatsInterval))
 	}
 
@@ -155,21 +169,21 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 		authenticated func() *wire.Error
 		release       = func() {}
 	)
-	if s.Policy != nil {
-		c := s.Policy.Checker(role, log.With("client", client.RemoteAddr()))
+	if p := s.ActivePolicy(); p != nil {
+		c := s.policies.Checker(role, log.With("client", client.RemoteAddr()))
+		// Postgres connects a client that names no database to the one named after its role.
+		c.Env = policy.Env{Database: cmp.Or(startup.Parameters["database"], role), Client: clientAddr(client), Plans: &s.Plans, Scheduler: s.scheduler()}
+		if s.Catalog != nil {
+			c.Env.Tables = s.Catalog
+		}
 		if rej := c.CheckStartup(wire.StartupSettings(startup.Parameters)); rej != nil {
 			if buf, err := rej.Encode(nil); err == nil {
 				client.Write(buf)
 			}
 			return
 		}
-		// Postgres connects a client that names no database to the one named after its role.
-		c.Costs = policy.Costs{Database: cmp.Or(startup.Parameters["database"], role), Plans: &s.plans}
-		if s.Catalog != nil {
-			c.Costs.Tables = s.Catalog
-		}
 		check = c
-		total, tenant := s.Policy.ConnectionLimits(role)
+		total, tenant := p.ConnectionLimits(role)
 		// Like Postgres, count a session only once it has logged in, so a client without the password can't use up a role's cap.
 		authenticated = func() *wire.Error {
 			r, ok := s.sessions.add(role, total, tenant)
@@ -195,10 +209,12 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 
 	// The login sets forget; it is called once the session is over.
 	forget := func() {}
+	var serverKey atomic.Pointer[pgproto3.BackendKeyData]
 	opts := wire.StartupOptions{
 		ChannelBinding: sameCertificate(client, server, s.TLSConfig),
 		Authenticated:  authenticated,
 		IssueKey: func(key *pgproto3.BackendKeyData) *pgproto3.BackendKeyData {
+			serverKey.Store(key)
 			forget()
 			issued, f := s.keys.issue(key)
 			forget = f
@@ -211,10 +227,23 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	})
 	defer stop()
 
-	err = session.Relay(client, server, check, func(client io.Writer, server io.Reader, report func(name, value string)) error {
-		opts.Report = report
-		return wire.RelayStartup(client, server, opts)
-	})
+	// The session cancels a statement past its timeout or left behind by its client, with the server's own key.
+	cancel := func() {
+		key := serverKey.Load()
+		if key == nil {
+			return
+		}
+		cctx, done := context.WithTimeout(context.WithoutCancel(ctx), cancelTimeout)
+		defer done()
+		if err := s.Upstream.Cancel(cctx, &pgproto3.CancelRequest{ProcessID: key.ProcessID, SecretKey: key.SecretKey}); err != nil {
+			log.Warn("cancel statement", "client", client.RemoteAddr(), "err", err)
+		}
+	}
+	err = session.Relay(client, server, session.Options{Check: check, Cancel: cancel,
+		Login: func(client io.Writer, server io.Reader, report func(name, value string)) error {
+			opts.Report = report
+			return wire.RelayStartup(client, server, opts)
+		}})
 	forget()
 	// A login refused over the cap was logged when it was refused.
 	if _, refused := errors.AsType[*wire.Error](err); !refused && !hungUp(err) {
@@ -266,7 +295,7 @@ func (s *Server) logPlanStats(ctx context.Context, log *slog.Logger, tick <-chan
 			return
 		case <-tick:
 		}
-		now := s.plans.Stats()
+		now := s.Plans.Stats()
 		hits, misses := now.Hits-last.Hits, now.Misses-last.Misses
 		if hits+misses == 0 {
 			continue
@@ -281,4 +310,36 @@ func (s *Server) logPlanStats(ctx context.Context, log *slog.Logger, tick <-chan
 }
 
 // PlanStats returns what the plan cache has done since the server started.
-func (s *Server) PlanStats() plan.Stats { return s.plans.Stats() }
+func (s *Server) PlanStats() plan.Stats { return s.Plans.Stats() }
+
+// SetPolicy puts p in force for new and open sessions alike, keeping each tenant's budget and use.
+func (s *Server) SetPolicy(p *policy.Policy) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sched == nil {
+		s.sched = sched.New(p.SchedConfig())
+	} else {
+		s.sched.Configure(p.SchedConfig())
+	}
+	s.policies.Store(p)
+}
+
+// ActivePolicy returns the policy in force.
+func (s *Server) ActivePolicy() *policy.Policy {
+	if p := s.policies.Load(); p != nil {
+		return p
+	}
+	return s.Policy
+}
+
+func (s *Server) scheduler() *sched.Scheduler {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sched
+}
+
+// clientAddr returns the client's IP address, or the zero Addr when it has none.
+func clientAddr(conn net.Conn) netip.Addr {
+	ap, _ := netip.ParseAddrPort(conn.RemoteAddr().String())
+	return ap.Addr()
+}

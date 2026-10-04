@@ -10,6 +10,7 @@ import (
 
 	"github.com/Avik-creator/queryguard/internal/testcert"
 	"github.com/Avik-creator/queryguard/pkg/policy"
+	"github.com/Avik-creator/queryguard/pkg/proxy"
 )
 
 func TestUpstreamTLSDisable(t *testing.T) {
@@ -110,6 +111,31 @@ func TestNewCatalog(t *testing.T) {
 	}
 	if c, err := newCatalog("host=db user=qg_monitor", scans, nil); c == nil || err != nil || c.DSN != "host=db user=qg_monitor" {
 		t.Errorf("valid -catalog-dsn gave %+v, %v", c, err)
+	}
+}
+
+func TestReloadKeepsPolicyInForceOnBadConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "queryguard.json")
+	first, _ := policy.Parse([]byte(`{}`))
+	s := &proxy.Server{}
+	s.SetPolicy(first)
+
+	for config, wantErr := range map[string]string{
+		`{"rules": [{"check": "nope"}]}`:                      "nope",
+		`{"rules": [{"check": "max_scan_rows", "rows": 10}]}`: "-catalog-dsn",
+	} {
+		writeFile(t, path, []byte(config))
+		if err := reload(s, path, nil); err == nil || !strings.Contains(err.Error(), wantErr) {
+			t.Errorf("reload of %s = %v; want an error mentioning %q", config, err, wantErr)
+		}
+		if s.ActivePolicy() != first {
+			t.Errorf("a bad config replaced the policy in force: %s", config)
+		}
+	}
+
+	writeFile(t, path, []byte(`{"rules": [{"check": "require_where"}]}`))
+	if err := reload(s, path, nil); err != nil || s.ActivePolicy() == first {
+		t.Errorf("reload of a good config = %v, policy replaced = %v", err, s.ActivePolicy() != first)
 	}
 }
 

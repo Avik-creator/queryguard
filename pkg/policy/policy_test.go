@@ -2,14 +2,20 @@ package policy
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"log/slog"
 	"maps"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Avik-creator/queryguard/pkg/plan"
+	"github.com/Avik-creator/queryguard/pkg/sched"
 	"github.com/Avik-creator/queryguard/pkg/session"
 	"github.com/Avik-creator/queryguard/pkg/sqlparse"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -266,7 +272,7 @@ func TestCostRules(t *testing.T) {
 		c := costChecker(t, costRules, tables{"public.orders": 1e6, "public.tenants": 100, "public.events_1": 30000, "public.events_2": 30000}, discard)
 		_, cost := c.Check("select * from orders where note = 'x'", standard)
 
-		got := cost(explained(tc.out, nil))
+		got := costOf(cost, explained(tc.out, nil))
 
 		if ruleOf(got) != tc.want {
 			t.Errorf("%s: blocked by %q (%v); want %q", name, ruleOf(got), got, tc.want)
@@ -282,7 +288,7 @@ func TestCostRejectionCarriesNumbersNotNames(t *testing.T) {
 	c := costChecker(t, costRules, tables{"public.orders": 1e6}, logger(&logs))
 	_, cost := c.Check("select * from orders where note = 'x'", standard)
 
-	got := cost(explained(`[{"Plan": {"Node Type": "Seq Scan", "Schema": "public", "Relation Name": "orders", "Total Cost": 500}}]`, nil))
+	got := costOf(cost, explained(`[{"Plan": {"Node Type": "Seq Scan", "Schema": "public", "Relation Name": "orders", "Total Cost": 500}}]`, nil))
 
 	if got == nil || !strings.Contains(got.Detail, "1000000 rows") || !strings.Contains(got.Detail, "50000") {
 		t.Fatalf("got %v; want a detail with the table size and the limit", got)
@@ -300,13 +306,13 @@ func TestCostCheckUsesCachedPlans(t *testing.T) {
 	runs := 0
 	for _, sql := range []string{"select * from orders where id = 1", "select * from orders where id = 2"} {
 		_, cost := c.Check(sql, standard)
-		cost(session.Explain{Run: func() (string, error) {
+		costOf(cost, session.Explain{Run: func() (string, error) {
 			runs++
 			return `[{"Plan": {"Node Type": "Index Scan", "Total Cost": 8}}]`, nil
 		}})
 	}
 	_, cost := c.Check("select * from orders where id = 3", standard)
-	cost(session.Explain{Generic: true, Run: func() (string, error) {
+	costOf(cost, session.Explain{Generic: true, Run: func() (string, error) {
 		runs++
 		return `[{"Plan": {"Node Type": "Index Scan", "Total Cost": 8}}]`, nil
 	}})
@@ -315,7 +321,7 @@ func TestCostCheckUsesCachedPlans(t *testing.T) {
 	if runs != 2 {
 		t.Errorf("explained %d times; want 2", runs)
 	}
-	if s := c.Costs.Plans.Stats(); s.Hits != 1 || s.Misses != 2 {
+	if s := c.Env.Plans.Stats(); s.Hits != 1 || s.Misses != 2 {
 		t.Errorf("cache stats %+v; want 1 hit, 2 misses", s)
 	}
 }
@@ -323,12 +329,12 @@ func TestCostCheckUsesCachedPlans(t *testing.T) {
 func TestCostCheckWithoutPlan(t *testing.T) {
 	c := costChecker(t, costRules, nil, discard)
 	_, cost := c.Check("select * from orders", standard)
-	if got := cost(explained("", session.ErrNoPlan)); got != nil {
+	if got := costOf(cost, explained("", session.ErrNoPlan)); got != nil {
 		t.Errorf("statement Postgres refused got %v; want it left to the session", got)
 	}
 
 	_, cost = c.Check("select * from customers", standard)
-	if got := cost(explained("not json", nil)); got == nil || got.Message != "queryguard: statement could not be checked" {
+	if got := costOf(cost, explained("not json", nil)); got == nil || got.Message != "queryguard: statement could not be checked" {
 		t.Errorf("unreadable plan got %v; want rejected unchecked", got)
 	}
 }
@@ -338,7 +344,7 @@ func TestCostRulesInWarnMode(t *testing.T) {
 	c := costChecker(t, `{"rules": [{"check": "max_cost", "cost": 10, "mode": "warn"}]}`, nil, logger(&logs))
 	_, cost := c.Check("select * from orders", standard)
 
-	if got := cost(explained(`[{"Plan": {"Node Type": "Seq Scan", "Total Cost": 500}}]`, nil)); got != nil {
+	if got := costOf(cost, explained(`[{"Plan": {"Node Type": "Seq Scan", "Total Cost": 500}}]`, nil)); got != nil {
 		t.Errorf("warn mode rejected with %v", got)
 	}
 	if !strings.Contains(logs.String(), `msg="would reject statement"`) || !strings.Contains(logs.String(), "rule=max_cost") {
@@ -352,6 +358,182 @@ func TestNeedsCatalog(t *testing.T) {
 	}
 	if !mustParse(t, costRules).NeedsCatalog() {
 		t.Error("max_scan_rows doesn't need the catalog")
+	}
+}
+
+func TestTenantFromTag(t *testing.T) {
+	var logs bytes.Buffer
+	p := mustParse(t, `{"trusted_roles": ["app"], "rules": [{"check": "require_where", "match": {"tenants": ["acme"]}}]}`)
+	app, bob := p.Checker("app", discard), p.Checker("bob", logger(&logs))
+
+	for c, tc := range map[*Checker]map[string]bool{
+		app: {"delete from orders /*tenant='acme'*/": true, "delete from orders /*tenant='other'*/": false, "delete from orders": false},
+		// Only a trusted role names its tenant; anyone else's tag is a label.
+		bob: {"delete from orders /*tenant='acme'*/": false},
+	} {
+		for sql, want := range tc {
+			if got := rejected(c.Check(sql, standard)); (got != nil) != want {
+				t.Errorf("Check(%q) = %v; want blocked = %v", sql, got, want)
+			}
+		}
+	}
+	if !strings.Contains(logs.String(), "tenant tag from a role not trusted to name one") {
+		t.Errorf("log %q; want the ignored tag", logs.String())
+	}
+}
+
+func TestRuleMatch(t *testing.T) {
+	for _, tc := range []struct {
+		match  string
+		role   string
+		client string
+		app    string
+		sql    string
+		want   bool
+	}{
+		{`{"roles": ["alice"]}`, "alice", "10.1.2.3", "", "delete from orders", true},
+		{`{"roles": ["alice"]}`, "bob", "10.1.2.3", "", "delete from orders", false},
+		{`{"application_names": ["batch"]}`, "alice", "10.1.2.3", "batch", "delete from orders", true},
+		{`{"application_names": ["batch"]}`, "alice", "10.1.2.3", "web", "delete from orders", false},
+		{`{"clients": ["10.0.0.0/8", "192.168.1.7"]}`, "alice", "10.1.2.3", "", "delete from orders", true},
+		{`{"clients": ["10.0.0.0/8", "192.168.1.7"]}`, "alice", "192.168.1.7", "", "delete from orders", true},
+		{`{"clients": ["10.0.0.0/8"]}`, "alice", "172.16.0.1", "", "delete from orders", false},
+		{`{"tags": {"route": "/admin"}}`, "alice", "10.1.2.3", "", "delete from orders /*route='%2Fadmin'*/", true},
+		{`{"tags": {"route": "/admin"}}`, "alice", "10.1.2.3", "", "delete from orders /*route='%2Fshop'*/", false},
+		{`{"roles": ["alice"], "application_names": ["batch"]}`, "alice", "10.1.2.3", "web", "delete from orders", false},
+	} {
+		c := mustParse(t, `{"rules": [{"check": "require_where", "match": `+tc.match+`}]}`).Checker(tc.role, discard)
+		c.Env.Client = netip.MustParseAddr(tc.client)
+		set := standard
+		set.ApplicationName = tc.app
+
+		if got := rejected(c.Check(tc.sql, set)); (got != nil) != tc.want {
+			t.Errorf("match %s for %s from %s (%q): blocked = %v; want %v", tc.match, tc.role, tc.client, tc.app, got != nil, tc.want)
+		}
+	}
+}
+
+func TestGateSpendsBudget(t *testing.T) {
+	c := gateChecker(t, `{"tenants": {"alice": {"budget": {"rate": 1, "burst": 150, "when_over": "reject"}}}}`, "alice", discard)
+
+	var got []string
+	for range 3 {
+		a := pass(t, c, "select * from orders where id = 1", costing(100), false)
+		got = append(got, codeOf(a.Reject))
+	}
+
+	// 150 units pay for the first; the second runs too, owing 50; the third has nothing left to spend.
+	if !slices.Equal(got, []string{"", "", "53000"}) {
+		t.Errorf("rejections %q; want only the third, with 53000", got)
+	}
+}
+
+func TestGateChargesStatementsWithoutPlan(t *testing.T) {
+	c := gateChecker(t, `{"tenants": {"alice": {"budget": {"rate": 1, "burst": 15, "min_charge": 10, "when_over": "reject"}}}}`, "alice", discard)
+	never := session.Explain{Run: func() (string, error) {
+		t.Error("explained a statement EXPLAIN can't plan")
+		return "", session.ErrNoPlan
+	}}
+
+	var got []string
+	for range 3 {
+		got = append(got, codeOf(pass(t, c, "begin", never, false).Reject))
+	}
+
+	if !slices.Equal(got, []string{"", "", "53000"}) {
+		t.Errorf("rejections %q; want the third after two minimum charges", got)
+	}
+}
+
+func TestGateTakesOneSlotPerBatch(t *testing.T) {
+	c := gateChecker(t, `{"scheduler": {"max_active": 1, "queue_timeout": "10ms"}}`, "alice", discard)
+
+	first := pass(t, c, "select 1", costing(1), false)
+	// A later statement of the same batch rides on the slot the session holds.
+	later := pass(t, c, "select 2", costing(1), true)
+	other := pass(t, c, "select 3", costing(1), false)
+
+	if first.Release == nil || later.Release != nil || later.Reject != nil {
+		t.Fatalf("first %+v, later %+v; want a slot for the first only", first, later)
+	}
+	if codeOf(other.Reject) != "53000" {
+		t.Errorf("a second session's statement got %v; want 53000 once no slot comes free", other.Reject)
+	}
+	first.Release()
+	if again := pass(t, c, "select 4", costing(1), false); again.Release == nil {
+		t.Error("the freed slot was not given out again")
+	}
+}
+
+func TestGateTimeouts(t *testing.T) {
+	config := `{"tenant_defaults": {"statement_timeout": "30s", "idle_in_transaction_timeout": "1m"},
+		"tenants": {"batch": {"statement_timeout": "10m"}}}`
+	for role, want := range map[string][2]time.Duration{"alice": {30 * time.Second, time.Minute}, "batch": {10 * time.Minute, time.Minute}} {
+		a := pass(t, gateChecker(t, config, role, discard), "select 1", costing(1), false)
+		if got := [2]time.Duration{a.Timeout, a.IdleInTransaction}; got != want {
+			t.Errorf("%s: timeouts %v; want %v", role, got, want)
+		}
+	}
+}
+
+func TestWarnTenantIsNeverHeldBack(t *testing.T) {
+	var logs bytes.Buffer
+	c := gateChecker(t, `{"scheduler": {"max_active": 1, "queue_timeout": "10ms"},
+		"tenants": {"alice": {"mode": "warn", "budget": {"rate": 1, "burst": 1, "when_over": "reject"}}}}`, "alice", logger(&logs))
+
+	for range 3 {
+		if a := pass(t, c, "select * from orders where id = 1", costing(100), false); a.Reject != nil {
+			t.Fatalf("warn tenant got %v", a.Reject)
+		}
+	}
+	if !strings.Contains(logs.String(), `msg="would reject statement" role=alice rule=budget`) {
+		t.Errorf("log %q; want the would-be rejection", logs.String())
+	}
+}
+
+func TestNoGateWithoutSchedulingOrCostRules(t *testing.T) {
+	c := gateChecker(t, `{"rules": [{"check": "require_where"}]}`, "alice", discard)
+	if _, gate := c.Check("select 1", standard); gate != nil {
+		t.Error("a policy with neither budgets, slots, timeouts nor cost rules gave a gate")
+	}
+	c = gateChecker(t, `{"tenant_defaults": {"statement_timeout": "1s"}}`, "alice", discard)
+	for _, sql := range []string{"begin", "select 1; select 2", "copy orders from stdin"} {
+		if _, gate := c.Check(sql, standard); gate == nil {
+			t.Errorf("Check(%q) gave no gate; want every statement to pass one", sql)
+		}
+	}
+}
+
+func TestHolderAppliesReloadToExistingCheckers(t *testing.T) {
+	var h Holder
+	h.Store(mustParse(t, `{}`))
+	c := h.Checker("alice", discard)
+	if got := rejected(c.Check("delete from orders", standard)); got != nil {
+		t.Fatalf("got %v before the reload", got)
+	}
+
+	h.Store(mustParse(t, `{"rules": [{"check": "require_where"}]}`))
+
+	if got := rejected(c.Check("delete from orders", standard)); got == nil {
+		t.Error("an open session kept the old rules after the reload")
+	}
+}
+
+func TestSchedConfig(t *testing.T) {
+	p := mustParse(t, `{"scheduler": {"max_active": 8, "queue_timeout": "2s", "slow_lane": {"max_active": 1, "queue_timeout": "30s"}},
+		"tenant_defaults": {"budget": {"rate": 10}},
+		"tenants": {"acme": {"budget": {"rate": 100, "burst": 1000, "share": 2, "min_charge": 5, "when_over": "slow"}}, "bob": {"mode": "warn"}}}`)
+
+	got := p.SchedConfig()
+
+	want := sched.Config{
+		Fast:    sched.Lane{MaxActive: 8, QueueTimeout: 2 * time.Second},
+		Slow:    sched.Lane{MaxActive: 1, QueueTimeout: 30 * time.Second},
+		Budgets: map[string]sched.Budget{"acme": {Rate: 100, Burst: 1000, Share: 2, MinCharge: 5, WhenOver: sched.SlowLane}},
+		Default: sched.Budget{Rate: 10},
+	}
+	if got.Fast != want.Fast || got.Slow != want.Slow || got.Default != want.Default || !maps.Equal(got.Budgets, want.Budgets) {
+		t.Errorf("SchedConfig = %+v; want %+v", got, want)
 	}
 }
 
@@ -377,12 +559,20 @@ func TestParseRejectsBadConfig(t *testing.T) {
 		`{"tenants": {"alice": {"mode": "loud"}}}`:                            "loud",
 		`{"max_connections": -1}`:                                             "max_connections",
 		`{"tenants": {"alice": {"max_connections": -1}}}`:                     "max_connections",
-		`{"rule": []}`:                                             "rule",
-		`{"rules": [{"check": "max_cost"}]}`:                       "cost",
-		`{"rules": [{"check": "max_cost", "cost": -1}]}`:           "cost",
-		`{"rules": [{"check": "max_scan_rows"}]}`:                  "rows",
-		`{"rules": [{"check": "require_where", "cost": 5}]}`:       "cost",
-		`{"rules": [{"check": "max_cost", "cost": 5, "rows": 5}]}`: "rows",
+		`{"rule": []}`:                                                              "rule",
+		`{"rules": [{"check": "max_cost"}]}`:                                        "cost",
+		`{"rules": [{"check": "max_cost", "cost": -1}]}`:                            "cost",
+		`{"rules": [{"check": "max_scan_rows"}]}`:                                   "rows",
+		`{"rules": [{"check": "require_where", "cost": 5}]}`:                        "cost",
+		`{"rules": [{"check": "max_cost", "cost": 5, "rows": 5}]}`:                  "rows",
+		`{"tenants": {"a": {"budget": {"rate": -1}}}}`:                              "rate",
+		`{"tenants": {"a": {"budget": {"rate": 10, "when_over": "later"}}}}`:        "later",
+		`{"tenants": {"a": {"budget": {"burst": 10}}}}`:                             "burst",
+		`{"tenant_defaults": {"statement_timeout": "soon"}}`:                        "soon",
+		`{"tenant_defaults": {"statement_timeout": "-1s"}}`:                         "statement_timeout",
+		`{"tenant_defaults": {"mode": "warn"}}`:                                     "tenant_defaults",
+		`{"scheduler": {"max_active": -1}}`:                                         "max_active",
+		`{"rules": [{"check": "deny_ddl", "match": {"clients": ["10.0.0.0/33"]}}]}`: "10.0.0.0/33",
 	} {
 		if _, err := Parse([]byte(config)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("Parse(%s) = %v; want an error mentioning %q", config, err, want)
@@ -408,13 +598,49 @@ func TestLoad(t *testing.T) {
 var discard = slog.New(slog.DiscardHandler)
 
 // rejected returns Check's error, dropping its cost check.
-func rejected(e *pgproto3.ErrorResponse, _ session.CostCheck) *pgproto3.ErrorResponse { return e }
+func rejected(e *pgproto3.ErrorResponse, _ session.Gate) *pgproto3.ErrorResponse { return e }
+
+// gateChecker checks role's statements under config with a scheduler of its own.
+func gateChecker(t *testing.T, config, role string, log *slog.Logger) *Checker {
+	t.Helper()
+	p := mustParse(t, config)
+	c := p.Checker(role, log)
+	c.Env = Env{Database: "shop", Plans: &plan.Cache{RefreshOneIn: -1}, Scheduler: sched.New(p.SchedConfig())}
+	return c
+}
+
+// pass checks sql and passes its gate with explain, failing the test when there is no gate.
+func pass(t *testing.T, c *Checker, sql string, explain session.Explain, running bool) session.Admission {
+	t.Helper()
+	rej, gate := c.Check(sql, standard)
+	if rej != nil || gate == nil {
+		t.Fatalf("Check(%q) = %v and gate %v; want a gate", sql, rej, gate != nil)
+	}
+	return gate(t.Context(), explain, running)
+}
+
+// costing explains any statement as an index scan of the given cost.
+func costing(cost float64) session.Explain {
+	return explained(fmt.Sprintf(`[{"Plan": {"Node Type": "Index Scan", "Total Cost": %g}}]`, cost), nil)
+}
+
+func codeOf(e *pgproto3.ErrorResponse) string {
+	if e == nil {
+		return ""
+	}
+	return e.Code
+}
+
+// costOf passes g as the first statement of a batch and returns its rejection, or nil.
+func costOf(g session.Gate, e session.Explain) *pgproto3.ErrorResponse {
+	return g(context.Background(), e, false).Reject
+}
 
 // costChecker checks alice's statements in database shop with a fresh plan cache and the given table sizes.
 func costChecker(t *testing.T, config string, sizes tables, log *slog.Logger) *Checker {
 	t.Helper()
 	c := mustParse(t, config).Checker("alice", log)
-	c.Costs = Costs{Database: "shop", Plans: &plan.Cache{}, Tables: sizes}
+	c.Env = Env{Database: "shop", Plans: &plan.Cache{RefreshOneIn: -1}, Tables: sizes}
 	return c
 }
 

@@ -210,7 +210,7 @@ func TestChecksStatementsWithSettingsFromLogin(t *testing.T) {
 func TestLogsPlanCacheStats(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var logs bytes.Buffer
-		s := &Server{}
+		s := &Server{Plans: plan.Cache{RefreshOneIn: -1}}
 		tick := make(chan time.Time)
 		ctx, cancel := context.WithCancel(t.Context())
 		done := make(chan struct{})
@@ -220,10 +220,10 @@ func TestLogsPlanCacheStats(t *testing.T) {
 		}()
 		explain := func() (plan.Plan, error) { time.Sleep(2 * time.Millisecond); return plan.Plan{}, nil }
 
-		s.plans.Get("a", explain)
-		s.plans.Get("a", explain)
-		s.plans.Get("a", explain)
-		s.plans.Get("b", explain)
+		s.Plans.Get("a", explain)
+		s.Plans.Get("a", explain)
+		s.Plans.Get("a", explain)
+		s.Plans.Get("b", explain)
 		tick <- time.Now()
 		// Nothing new since the last tick, so nothing is logged.
 		tick <- time.Now()
@@ -239,6 +239,67 @@ func TestLogsPlanCacheStats(t *testing.T) {
 			t.Errorf("PlanStats = %+v; want 2 hits and 2 misses", got)
 		}
 	})
+}
+
+func TestReloadReachesOpenSessions(t *testing.T) {
+	s := newServer(t, startFakePostgres(t).addr)
+	s.Policy = mustPolicy(t, `{}`)
+	addr, _ := startProxy(t, s)
+	// The session opens under the first policy, which blocks nothing.
+	conn := startSession(t, addr)
+
+	s.SetPolicy(mustPolicy(t, `{"rules": [{"check": "require_where"}]}`))
+
+	send(t, conn, &pgproto3.Query{String: "delete from orders"})
+	if typ := receiveType(t, conn); typ != 'E' {
+		t.Fatalf("got message %q after the reload; want the rejection", typ)
+	}
+	if s.ActivePolicy() == s.Policy {
+		t.Error("ActivePolicy is still the first policy")
+	}
+}
+
+func TestRulesMatchClientAddress(t *testing.T) {
+	for clients, want := range map[string]bool{`["127.0.0.1"]`: true, `["10.0.0.0/8"]`: false} {
+		s := newServer(t, startFakePostgres(t).addr)
+		s.Policy = mustPolicy(t, `{"rules": [{"check": "require_where", "match": {"clients": `+clients+`}}]}`)
+		addr, _ := startProxy(t, s)
+		conn := startSession(t, addr)
+
+		send(t, conn, &pgproto3.Query{String: "delete from orders"})
+
+		// fakePostgres echoes what reaches it, so an allowed statement comes back as a Query.
+		if blocked := receiveType(t, conn) == 'E'; blocked != want {
+			t.Errorf("clients %s: blocked = %v; want %v", clients, blocked, want)
+		}
+	}
+}
+
+func TestCancelsStatementWhenClientLeaves(t *testing.T) {
+	pg := startFakePostgres(t)
+	addr, _ := startProxy(t, newServer(t, pg.addr))
+	conn := startSession(t, addr)
+	mustReceive[*pgproto3.StartupMessage](t, pg.received)
+	// fakePostgres echoes the Query instead of answering it, so the statement never ends.
+	send(t, conn, &pgproto3.Query{String: "select pg_sleep(60)"})
+	receiveType(t, conn)
+
+	conn.Close()
+
+	expectServerKey(t, mustReceive[*pgproto3.CancelRequest](t, pg.received))
+}
+
+func TestCancelsStatementPastTenantTimeout(t *testing.T) {
+	pg := startFakePostgres(t)
+	s := newServer(t, pg.addr)
+	s.Policy = mustPolicy(t, `{"tenant_defaults": {"statement_timeout": "100ms"}}`)
+	addr, _ := startProxy(t, s)
+	conn := startSession(t, addr)
+	mustReceive[*pgproto3.StartupMessage](t, pg.received)
+
+	send(t, conn, &pgproto3.Query{String: "select pg_sleep(60)"})
+
+	expectServerKey(t, mustReceive[*pgproto3.CancelRequest](t, pg.received))
 }
 
 func TestGivesClientItsOwnCancelKey(t *testing.T) {
@@ -827,6 +888,21 @@ func receive(t *testing.T, conn net.Conn) pgproto3.BackendMessage {
 		t.Fatal(err)
 	}
 	return msg
+}
+
+// receiveType reads the next message on conn, whatever it is, and returns its type.
+func receiveType(t *testing.T, conn net.Conn) byte {
+	t.Helper()
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+	head := make([]byte, 5)
+	if _, err := io.ReadFull(conn, head); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if _, err := io.CopyN(io.Discard, conn, int64(binary.BigEndian.Uint32(head[1:]))-4); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	return head[0]
 }
 
 // expectOverCap fails the test unless conn logs in and is then refused as over a connection cap, as Postgres refuses.

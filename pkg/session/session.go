@@ -4,14 +4,18 @@ package session
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -40,14 +44,22 @@ var errPlanTooLarge = errors.New("plan too large to read")
 
 // Checker decides whether a statement may run.
 type Checker interface {
-	// Check returns the error to send instead of running sql, or nil, and the cost check to run just before it executes, or nil.
-	Check(sql string, set Settings) (*pgproto3.ErrorResponse, CostCheck)
+	// Check returns the error to send instead of running sql, or nil, and the gate to pass just before it executes, or nil.
+	Check(sql string, set Settings) (*pgproto3.ErrorResponse, Gate)
 	// CheckTooLong decides on a statement of size bytes, too long to read whole.
 	CheckTooLong(size int) *pgproto3.ErrorResponse
 }
 
-// CostCheck returns the error to send instead of running a statement, judged on its plan, which explain gets when needed.
-type CostCheck func(explain Explain) *pgproto3.ErrorResponse
+// Gate decides how a statement about to execute runs, waiting while ctx lasts; running says the session already holds a slot.
+type Gate func(ctx context.Context, explain Explain, running bool) Admission
+
+// Admission says whether and how a statement runs.
+type Admission struct {
+	Reject            *pgproto3.ErrorResponse // the error to send instead of running it
+	Release           func()                  // frees the slot it took, once the server is idle; nil when it took none
+	Timeout           time.Duration           // how long it may run before the proxy cancels it; 0 means no limit
+	IdleInTransaction time.Duration           // how long the session may then sit idle in a transaction; 0 means no limit
+}
 
 // Explain gets the plan of the statement about to run.
 type Explain struct {
@@ -58,17 +70,41 @@ type Explain struct {
 // ErrNoPlan says Postgres gave no plan: it refused the statement, whose error the session passes on, or it is skipping to Sync.
 var ErrNoPlan = errors.New("postgres gave no plan")
 
-// Settings are the server settings that change how Postgres reads statement text; an empty field is unknown.
+// Settings are the server settings the checker needs; an empty field is unknown.
 type Settings struct {
 	StandardConformingStrings string // "off" makes a backslash in '…' an escape
 	ClientEncoding            string // Postgres converts statements from it before parsing them
+	ApplicationName           string // known even while statements are in flight, since it doesn't change how text reads
 }
 
-// Relay runs login, which passes each ParameterStatus to report, then relays messages both ways until either side
-// closes; it closes both and returns the first error.
-func Relay(client, server net.Conn, check Checker, login func(client io.Writer, server io.Reader, report func(name, value string)) error) error {
+// reading returns only the settings that change how Postgres reads statement text.
+func (s Settings) reading() Settings {
+	return Settings{StandardConformingStrings: s.StandardConformingStrings, ClientEncoding: s.ClientEncoding}
+}
+
+// Options set up a session.
+type Options struct {
+	Check  Checker                                                                         // nil checks nothing
+	Login  func(client io.Writer, server io.Reader, report func(name, value string)) error // relays the login, passing each ParameterStatus to report
+	Cancel func()                                                                          // asks Postgres to cancel what the server connection runs; nil can't
+}
+
+// ErrIdleInTransaction ends a session left idle in a transaction past its limit.
+var ErrIdleInTransaction = errors.New("session idle in a transaction past its limit")
+
+// Waits for the client to hang up: after watchDelay, a waiting statement checks the client every watchPoll.
+const (
+	watchDelay = 50 * time.Millisecond
+	watchPoll  = 200 * time.Millisecond
+)
+
+// Relay runs the login, then relays messages both ways until either side closes; it closes both and returns the first error.
+func Relay(client, server net.Conn, opts Options) error {
+	login := opts.Login
 	s := &session{
-		check:      check,
+		check:      opts.Check,
+		cancel:     opts.Cancel,
+		client:     client,
 		clientIn:   bufio.NewReaderSize(client, bufSize),
 		clientOut:  bufio.NewWriterSize(client, bufSize),
 		serverIn:   bufio.NewReaderSize(server, bufSize),
@@ -80,15 +116,24 @@ func Relay(client, server net.Conn, check Checker, login func(client io.Writer, 
 		once  sync.Once
 		first error
 	)
-	stop := func(err error) {
+	s.stop = func(err error) {
 		once.Do(func() {
+			s.stopped.Store(true)
 			first = err
 			client.Close()
 			server.Close()
 		})
 	}
+	stop := s.stop
 	var loops sync.WaitGroup
-	loops.Go(func() { stop(s.fromClient()) })
+	loops.Go(func() {
+		err := s.fromClient()
+		// A client that leaves mid-statement leaves Postgres working for no one.
+		if !s.stopped.Load() && s.busy() && s.cancel != nil {
+			s.cancel()
+		}
+		stop(err)
+	})
 	loops.Go(func() {
 		defer close(s.serverGone)
 		err := login(client, s.serverIn, func(name, value string) {
@@ -106,12 +151,20 @@ func Relay(client, server net.Conn, check Checker, login func(client io.Writer, 
 		stop(err)
 	})
 	loops.Wait()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stopTimers()
+	s.freeSlot()
 	return first
 }
 
 // session is the state shared by the two relay loops.
 type session struct {
 	check      Checker
+	cancel     func()        // from Options
+	client     net.Conn      // read deadlines on it let a waiting statement notice a hang-up
+	stop       func(error)   // ends the session, closing both connections
+	stopped    atomic.Bool   // stop has run
 	ready      chan struct{} // closed once login has ended
 	serverGone chan struct{} // closed once nothing more is read from the server
 	clientIn   *bufio.Reader
@@ -125,6 +178,14 @@ type session struct {
 	skipping   bool          // the server ignores everything up to the next Sync after an extended-protocol error
 	reported   Settings      // as last reported by the server
 	explaining *explanation  // the proxy's EXPLAIN in flight, if any
+	slot       func()        // frees the slot the session holds, if any
+	admitting  bool          // a gate is running, so the server going idle keeps the slot the statement will need
+	timeout    time.Duration // how long the running statements may take
+	idleLimit  time.Duration // how long the session may sit idle in a transaction
+	stmtTimer  *time.Timer   // cancels the running statement at its timeout
+	idleTimer  *time.Timer   // ends the session idle in a transaction too long
+	idleGen    int           // bumped by each client message, so an idle timer firing late does nothing
+	timedOut   bool          // the proxy cancelled for a timeout, so Postgres's cancel error says so
 
 	// Only fromClient uses these.
 	inBatch    bool                 // extended-protocol messages went to the server since the last Sync
@@ -159,7 +220,7 @@ type explanation struct {
 type statement struct {
 	sql   string
 	types []uint32 // parameter types from its Parse
-	cost  CostCheck
+	gate  Gate
 	set   Settings // the settings Postgres read sql with, as far as the session knew them at its Parse
 	plain bool     // sql has no backslash or non-ASCII byte, so every setting reads it the same
 }
@@ -192,6 +253,7 @@ func (s *session) fromClient() error {
 		if err != nil {
 			return err
 		}
+		s.clientSent()
 		switch {
 		case s.discard != relayAll:
 			err = s.dropUntilSync(typ, n)
@@ -237,14 +299,14 @@ func (s *session) checkStatement(typ byte, n int) error {
 	// A malformed message goes on unchanged, for Postgres to refuse.
 	if sql, ok := statementText(typ, body); ok {
 		set := s.settings()
-		rej, cost := s.check.Check(sql, set)
+		rej, gate := s.check.Check(sql, set)
 		switch {
 		case rej != nil:
 			return s.reject(typ, rej)
 		case typ == 'P':
-			s.prepare(body, cost, set)
-		case cost != nil:
-			if handled, err := s.checkQueryCost(sql, cost); handled || err != nil {
+			s.prepare(body, gate, set)
+		case gate != nil:
+			if handled, err := s.checkQueryCost(sql, gate); handled || err != nil {
 				return err
 			}
 		}
@@ -261,7 +323,7 @@ func (s *session) settings() Settings {
 	defer s.mu.Unlock()
 	// Postgres reports changes just before ReadyForQuery, which an unsynced batch has yet to get.
 	if len(s.pending) > 0 || s.inBatch {
-		return Settings{}
+		return Settings{ApplicationName: s.reported.ApplicationName}
 	}
 	return s.reported
 }
@@ -273,16 +335,18 @@ func (s *session) report(name, value string) {
 		s.reported.StandardConformingStrings = value
 	case "client_encoding":
 		s.reported.ClientEncoding = value
+	case "application_name":
+		s.reported.ApplicationName = value
 	}
 }
 
 // prepare remembers a Parse's statement, read under set, for the cost check when it is bound.
-func (s *session) prepare(body []byte, cost CostCheck, set Settings) {
+func (s *session) prepare(body []byte, gate Gate, set Settings) {
 	var p pgproto3.Parse
 	if p.Decode(body) != nil {
 		return
 	}
-	if cost == nil {
+	if gate == nil {
 		delete(s.statements, p.Name)
 		return
 	}
@@ -290,7 +354,7 @@ func (s *session) prepare(body []byte, cost CostCheck, set Settings) {
 		s.statements = map[string]statement{}
 	}
 	plain := !strings.ContainsFunc(p.Query, func(r rune) bool { return r == '\\' || r >= utf8.RuneSelf })
-	s.statements[p.Name] = statement{sql: p.Query, types: p.ParameterOIDs, cost: cost, set: set, plain: plain}
+	s.statements[p.Name] = statement{sql: p.Query, types: p.ParameterOIDs, gate: gate, set: set.reading(), plain: plain}
 }
 
 // closeStatement forgets a closed statement before passing the Close on.
@@ -303,12 +367,12 @@ func (s *session) closeStatement(n int) error {
 }
 
 // checkQueryCost runs a simple query's cost check before the query is sent; handled says the client has its answer.
-func (s *session) checkQueryCost(sql string, cost CostCheck) (handled bool, err error) {
+func (s *session) checkQueryCost(sql string, gate Gate) (handled bool, err error) {
 	if s.failedTransaction() {
 		return false, nil
 	}
 	var refused *pgproto3.ErrorResponse
-	rej := cost(Explain{Run: func() (string, error) {
+	rej := s.admit(gate, Explain{Run: func() (string, error) {
 		var out string
 		out, refused, err = s.explain(len(explainPrefix), &pgproto3.Query{String: explainPrefix + sql})
 		return out, err
@@ -335,8 +399,17 @@ func (s *session) checkBind(n int) error {
 	name, rest, ok2 := bytes.Cut(rest, []byte{0})
 	st, found := s.statements[string(name)]
 	// EXPLAIN reads the text again, which only reads the same as at Parse under the same settings.
-	sameReading := st.plain || (st.set != Settings{} && s.settings() == st.set)
-	if !ok || !ok2 || !found || !sameReading || s.failedTransaction() {
+	if !ok || !ok2 || !found || s.failedTransaction() {
+		return s.forward('B', n)
+	}
+	if !st.plain && (st.set == Settings{} || s.settings().reading() != st.set) {
+		// The statement still takes its slot and budget, judged without a plan.
+		if rej := s.admit(st.gate, Explain{}); rej != nil {
+			if _, err := s.clientIn.Discard(n); err != nil {
+				return unexpected(err)
+			}
+			return s.reject('B', rej)
+		}
 		return s.forward('B', n)
 	}
 
@@ -363,7 +436,7 @@ func (s *session) checkBind(n int) error {
 	}
 
 	var refused *pgproto3.ErrorResponse
-	rej := st.cost(Explain{Generic: prefix == genericPrefix, Run: func() (string, error) {
+	rej := s.admit(st.gate, Explain{Generic: prefix == genericPrefix, Run: func() (string, error) {
 		var out string
 		out, refused, err = s.explain(len(prefix),
 			&pgproto3.Close{ObjectType: 'S', Name: explainName},
@@ -395,6 +468,163 @@ func (s *session) checkBind(n int) error {
 		return s.forward('B', n)
 	}
 	return s.send('B', body)
+}
+
+// admit passes gate for a statement about to be sent, keeps the slot and limits it gives, and returns the error to send instead.
+func (s *session) admit(gate Gate, e Explain) *pgproto3.ErrorResponse {
+	s.mu.Lock()
+	running := s.slot != nil
+	s.admitting = true
+	s.mu.Unlock()
+
+	ctx, done := s.waitContext()
+	a := gate(ctx, e, running)
+	done()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.admitting = false
+	if a.Release != nil {
+		s.slot = a.Release
+	}
+	if a.Reject != nil {
+		if len(s.pending) == 0 {
+			// Nothing runs, so a slot kept for this statement goes back.
+			s.freeSlot()
+		}
+		return a.Reject
+	}
+	s.timeout, s.idleLimit = a.Timeout, a.IdleInTransaction
+	if a.Timeout > 0 {
+		if s.stmtTimer == nil {
+			s.stmtTimer = time.AfterFunc(a.Timeout, s.statementTimedOut)
+		} else {
+			s.stmtTimer.Reset(a.Timeout)
+		}
+	}
+	return nil
+}
+
+// waitContext returns a context ended by a client hang-up or a lost server, and the func to call before reading the client again.
+func (s *session) waitContext() (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	watched := make(chan struct{})
+	go func() {
+		defer close(watched)
+		// Most gates return at once, and only a statement that waits needs its client watched.
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.serverGone:
+			cancel()
+			return
+		case <-time.After(watchDelay):
+		}
+		for ctx.Err() == nil {
+			// Peeking reads what the client sends into the buffer without taking it, and sees a hang-up as an error.
+			if s.clientIn.Buffered() == 0 {
+				s.client.SetReadDeadline(time.Now().Add(watchPoll))
+				if _, err := s.clientIn.Peek(1); err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+					cancel()
+					return
+				}
+			}
+			select {
+			case <-s.serverGone:
+				cancel()
+				return
+			case <-ctx.Done():
+				return
+			case <-time.After(watchPoll / 4):
+			}
+		}
+	}()
+	return ctx, func() {
+		cancel()
+		// A deadline in the past wakes a Peek in progress.
+		s.client.SetReadDeadline(time.Now())
+		<-watched
+		s.client.SetReadDeadline(time.Time{})
+	}
+}
+
+// statementTimedOut cancels the statement running past its timeout.
+func (s *session) statementTimedOut() {
+	s.mu.Lock()
+	busy := len(s.pending) > 0
+	s.timedOut = s.timedOut || busy
+	s.mu.Unlock()
+	if busy && s.cancel != nil {
+		s.cancel()
+	}
+}
+
+// clientSent stops the idle-in-transaction timer, since the client has sent something.
+func (s *session) clientSent() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.idleGen++
+	if s.idleTimer != nil {
+		s.idleTimer.Stop()
+		s.idleTimer = nil
+	}
+}
+
+// becameIdle frees the slot, stops the statement timer and starts the idle-in-transaction one; the caller holds mu.
+func (s *session) becameIdle() {
+	if s.stmtTimer != nil {
+		s.stmtTimer.Stop()
+	}
+	s.timedOut = false
+	// The proxy's own EXPLAIN ends while the statement it is for is being admitted, which needs the slot.
+	if s.admitting {
+		return
+	}
+	s.freeSlot()
+	if (s.status == 'T' || s.status == 'E') && s.idleLimit > 0 {
+		gen := s.idleGen
+		s.idleTimer = time.AfterFunc(s.idleLimit, func() { s.idleTimedOut(gen) })
+	}
+}
+
+// idleTimedOut ends the session as idle_in_transaction_session_timeout does, unless the client sent something since.
+func (s *session) idleTimedOut(gen int) {
+	s.mu.Lock()
+	if gen != s.idleGen || len(s.pending) > 0 || (s.status != 'T' && s.status != 'E') {
+		s.mu.Unlock()
+		return
+	}
+	// Closing the server connection makes Postgres roll the transaction back.
+	if writeMessages(s.clientOut, &pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "25P03",
+		Message: "queryguard: terminating connection due to idle-in-transaction timeout"}) == nil {
+		s.clientOut.Flush()
+	}
+	s.mu.Unlock()
+	s.stop(ErrIdleInTransaction)
+}
+
+// freeSlot frees the slot the session holds, if any; the caller holds mu.
+func (s *session) freeSlot() {
+	if s.slot != nil {
+		s.slot()
+		s.slot = nil
+	}
+}
+
+// stopTimers stops the session's timers; the caller holds mu.
+func (s *session) stopTimers() {
+	for _, t := range []*time.Timer{s.stmtTimer, s.idleTimer} {
+		if t != nil {
+			t.Stop()
+		}
+	}
+}
+
+// busy reports whether Postgres is working on something the client sent.
+func (s *session) busy() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.pending) > 0
 }
 
 // paramCount reads a Bind's parameter count from b, the body after its two names, when b holds it.
@@ -609,6 +839,11 @@ func (s *session) fromServer() error {
 func (s *session) relayAnswer(typ byte, n int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer func() {
+		if typ == 'Z' && len(s.pending) == 0 {
+			s.becameIdle()
+		}
+	}()
 	defer s.endExplaining()
 	if typ == 'Z' && n > 0 {
 		status, err := s.serverIn.Peek(1)
@@ -634,9 +869,28 @@ func (s *session) relayAnswer(typ byte, n int) error {
 	case how == hidden && typ != 'E':
 		_, err := s.serverIn.Discard(n)
 		return unexpected(err)
+	case typ == 'E' && s.timedOut && n <= maxCheckedLen:
+		return s.relayTimeout(n)
 	}
 	writeHeader(s.clientOut, typ, n)
 	return copyBody(s.clientOut, s.serverIn, n)
+}
+
+// relayTimeout passes on an error after a timeout's cancel, saying so if it is the cancel's error; the caller holds mu.
+func (s *session) relayTimeout(n int) error {
+	body := make([]byte, n)
+	if _, err := io.ReadFull(s.serverIn, body); err != nil {
+		return unexpected(err)
+	}
+	var e pgproto3.ErrorResponse
+	if e.Decode(body) != nil || e.Code != "57014" {
+		writeHeader(s.clientOut, 'E', n)
+		_, err := s.clientOut.Write(body)
+		return err
+	}
+	s.timedOut = false
+	e.Message = "queryguard: canceling statement due to statement timeout"
+	return writeMessages(s.clientOut, &e)
 }
 
 // capture keeps the plan and any error from the answers to the proxy's EXPLAIN; the caller holds mu.
@@ -686,6 +940,10 @@ func (s *session) answered(typ byte) answer {
 		return head.how
 	}
 	s.pending = s.pending[1:]
+	// Each statement of a pipeline gets the whole timeout from when the one before it ends.
+	if (head.typ == 'Q' || head.typ == 'E') && s.stmtTimer != nil && len(s.pending) > 0 {
+		s.stmtTimer.Reset(s.timeout)
+	}
 	if typ == 'E' && head.typ != 'Q' && head.typ != 'F' && head.typ != 'S' {
 		// After an extended-protocol error Postgres ignores everything up to the next Sync.
 		if i := slices.IndexFunc(s.pending, func(p sent) bool { return p.typ == 'S' }); i >= 0 {

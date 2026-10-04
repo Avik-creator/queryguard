@@ -115,6 +115,9 @@ func run(opts options, log *slog.Logger) error {
 		ShutdownTimeout:     opts.shutdownTimeout,
 		Logger:              log,
 	}
+	if opts.config != "" {
+		go reloadOnHangup(ctx, s, opts.config, catalog, log)
+	}
 	if err := s.Serve(ctx, ln); err != nil {
 		return err
 	}
@@ -189,5 +192,37 @@ func upstreamTLS(mode, caFile, addr string) (*tls.Config, error) {
 		return cfg, nil
 	default:
 		return nil, fmt.Errorf("unknown -upstream-sslmode %q: want disable, require or verify-full", mode)
+	}
+}
+
+// reload reads the policy file again and puts it in force for every session, keeping the one in force when it fails.
+func reload(s *proxy.Server, path string, catalog *plan.Catalog) error {
+	p, err := policy.Load(path)
+	if err != nil {
+		return err
+	}
+	if p.NeedsCatalog() && catalog == nil {
+		return errors.New("rule max_scan_rows needs table sizes: restart with -catalog-dsn")
+	}
+	s.SetPolicy(p)
+	return nil
+}
+
+// reloadOnHangup reloads the policy file at each SIGHUP until ctx ends.
+func reloadOnHangup(ctx context.Context, s *proxy.Server, path string, catalog *plan.Catalog, log *slog.Logger) {
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-hup:
+		}
+		if err := reload(s, path, catalog); err != nil {
+			log.Error("config not reloaded; the one in force stays", "config", path, "err", err)
+			continue
+		}
+		log.Info("config reloaded", "config", path)
 	}
 }

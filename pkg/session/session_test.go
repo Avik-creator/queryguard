@@ -1,10 +1,12 @@
 package session
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -361,6 +363,175 @@ func TestEndsWhilePostgresExplains(t *testing.T) {
 	}
 }
 
+func TestHoldsSlotUntilPostgresIsIdle(t *testing.T) {
+	a := newAdmitter()
+	h := start(t, fakeChecker{admit: a})
+
+	h.send(&pgproto3.Query{String: "select slot"})
+	h.serverGets(&pgproto3.Query{String: "select slot"})
+	expect(t, a.running, false)
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
+	expectNone(t, a.released, "slot freed before ReadyForQuery")
+
+	h.reply(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	expect(t, a.released, struct{}{})
+}
+
+func TestPipelineTakesOneSlot(t *testing.T) {
+	a := newAdmitter()
+	h := start(t, fakeChecker{admit: a})
+	p1, p2 := &pgproto3.Parse{Name: "a", Query: "select slot 1"}, &pgproto3.Parse{Name: "b", Query: "select slot 2"}
+
+	h.send(p1, p2, &pgproto3.Bind{PreparedStatement: "a"}, &pgproto3.Execute{}, &pgproto3.Bind{PreparedStatement: "b"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+
+	h.serverGets(p1, p2, &pgproto3.Bind{PreparedStatement: "a"}, &pgproto3.Execute{}, &pgproto3.Bind{PreparedStatement: "b"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	expect(t, a.running, false)
+	expect(t, a.running, true)
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, &pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")},
+		&pgproto3.BindComplete{}, &pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	expect(t, a.released, struct{}{})
+	expectNone(t, a.released, "a second slot was freed")
+}
+
+func TestCancelsStatementPastItsTimeout(t *testing.T) {
+	a := newAdmitter()
+	a.timeout = 50 * time.Millisecond
+	h := start(t, fakeChecker{admit: a})
+
+	h.send(&pgproto3.Query{String: "select slot, pg_sleep(60)"})
+	h.serverGets(&pgproto3.Query{String: "select slot, pg_sleep(60)"})
+
+	expect(t, h.cancels, struct{}{})
+	h.reply(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "57014", Message: "canceling statement due to user request"},
+		&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	// The cancel came from QueryGuard's timeout, not from the client, so the error says so.
+	h.clientGets(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "57014", Message: "queryguard: canceling statement due to statement timeout"},
+		&pgproto3.ReadyForQuery{TxStatus: 'I'})
+}
+
+func TestNoCancelForStatementWithinItsTimeout(t *testing.T) {
+	a := newAdmitter()
+	a.timeout = 200 * time.Millisecond
+	h := start(t, fakeChecker{admit: a})
+
+	h.send(&pgproto3.Query{String: "select slot"})
+	h.serverGets(&pgproto3.Query{String: "select slot"})
+	h.reply(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	time.Sleep(300 * time.Millisecond)
+	expectNone(t, h.cancels, "cancelled an idle session")
+}
+
+func TestEndsSessionIdleInTransaction(t *testing.T) {
+	a := newAdmitter()
+	a.idle = 50 * time.Millisecond
+	h := start(t, fakeChecker{admit: a})
+
+	h.send(&pgproto3.Query{String: "begin slot"})
+	h.serverGets(&pgproto3.Query{String: "begin slot"})
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("BEGIN")}, &pgproto3.ReadyForQuery{TxStatus: 'T'})
+
+	// Postgres ends such a session with the same error for idle_in_transaction_session_timeout.
+	h.clientGets(&pgproto3.CommandComplete{CommandTag: []byte("BEGIN")}, &pgproto3.ReadyForQuery{TxStatus: 'T'},
+		&pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "25P03",
+			Message: "queryguard: terminating connection due to idle-in-transaction timeout"})
+	select {
+	case <-h.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Relay did not end the session")
+	}
+}
+
+func TestKeepsSessionIdleOutsideTransaction(t *testing.T) {
+	a := newAdmitter()
+	a.idle = 50 * time.Millisecond
+	h := start(t, fakeChecker{admit: a})
+
+	h.send(&pgproto3.Query{String: "select slot"})
+	h.serverGets(&pgproto3.Query{String: "select slot"})
+	h.reply(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	time.Sleep(150 * time.Millisecond)
+	h.serverGetsNothingBefore(&pgproto3.Query{String: "select 'still here'"})
+}
+
+func TestCancelsWhenClientLeavesMidStatement(t *testing.T) {
+	h := start(t, fakeChecker{})
+	h.send(&pgproto3.Query{String: "select pg_sleep(60)"})
+	h.serverGets(&pgproto3.Query{String: "select pg_sleep(60)"})
+
+	h.client.Close()
+
+	expect(t, h.cancels, struct{}{})
+}
+
+func TestNoCancelWhenIdleClientLeaves(t *testing.T) {
+	h := start(t, fakeChecker{})
+	h.send(&pgproto3.Query{String: "select 1"})
+	h.serverGets(&pgproto3.Query{String: "select 1"})
+	h.reply(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	h.client.Close()
+	<-h.done
+
+	expectNone(t, h.cancels, "cancelled after an idle client left")
+}
+
+func TestDropsWaitingStatementWhenClientLeaves(t *testing.T) {
+	a := newAdmitter()
+	h := start(t, fakeChecker{admit: a})
+	h.send(&pgproto3.Query{String: "select wait"})
+	time.Sleep(100 * time.Millisecond)
+
+	h.client.Close()
+
+	if err := <-a.waited; !errors.Is(err, context.Canceled) {
+		t.Errorf("the wait ended with %v; want it cancelled", err)
+	}
+	h.pg.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := h.pg.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Errorf("Postgres got %v; want the session closed with nothing sent", err)
+	}
+}
+
+func TestBindPassesGateEvenWhenItCannotBeExplained(t *testing.T) {
+	a := newAdmitter()
+	h := start(t, fakeChecker{admit: a})
+	parse := &pgproto3.Parse{Name: "s1", Query: `select slot where note = 'a\b'`}
+	h.send(parse, &pgproto3.Bind{PreparedStatement: "s1"}, &pgproto3.Sync{})
+
+	// The settings are unknown at Bind, with the Parse in flight, so there is no EXPLAIN, but the slot is taken.
+	h.serverGets(parse, &pgproto3.Bind{PreparedStatement: "s1"}, &pgproto3.Sync{})
+	expect(t, a.running, false)
+}
+
+// expect waits up to 2s for a value on ch and compares it with want.
+func expect[T comparable](t *testing.T, ch <-chan T, want T) {
+	t.Helper()
+	select {
+	case got := <-ch:
+		if got != want {
+			t.Fatalf("got %v; want %v", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("nothing arrived; want %v", want)
+	}
+}
+
+// expectNone fails the test if ch gets a value within 100ms.
+func expectNone[T any](t *testing.T, ch <-chan T, what string) {
+	t.Helper()
+	select {
+	case v := <-ch:
+		t.Fatalf("%s: %v", what, v)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestPassesEverythingWithoutChecker(t *testing.T) {
 	h := start(t, nil)
 
@@ -418,32 +589,63 @@ var postgresError = &pgproto3.ErrorResponse{Severity: "ERROR", Code: "42601", Me
 // loginSettings are the settings the harness's login reports.
 var loginSettings = Settings{StandardConformingStrings: "on", ClientEncoding: "UTF8"}
 
-// fakeChecker rejects statements with "bad", and costs those with "plan", rejecting plans with "big".
+// fakeChecker rejects "bad", costs "plan" (rejecting "big" plans), admits "slot" as admit says, and holds "wait" until its wait ends.
 type fakeChecker struct {
 	allowTooLong bool
 	seen         chan<- Settings // gets the settings of each checked statement, when set
 	generic      chan<- bool     // gets whether each plan explained was generic, when set
+	admit        *admitter       // admits "slot" statements, when set
 }
 
-func (c fakeChecker) Check(sql string, set Settings) (*pgproto3.ErrorResponse, CostCheck) {
+// admitter admits statements with a slot and limits, recording each gate's running and each release.
+type admitter struct {
+	timeout, idle time.Duration
+	running       chan bool     // gets running from each gate
+	released      chan struct{} // gets a value when a slot is freed
+	waited        chan error    // gets why each "wait" statement's wait ended
+}
+
+func newAdmitter() *admitter {
+	return &admitter{running: make(chan bool, 10), released: make(chan struct{}, 10), waited: make(chan error, 10)}
+}
+
+func (c fakeChecker) Check(sql string, set Settings) (*pgproto3.ErrorResponse, Gate) {
 	if c.seen != nil {
 		c.seen <- set
 	}
 	switch {
 	case strings.Contains(sql, "bad"):
 		return rejected, nil
+	case strings.Contains(sql, "wait"):
+		return nil, func(ctx context.Context, _ Explain, _ bool) Admission {
+			<-ctx.Done()
+			c.admit.waited <- ctx.Err()
+			return Admission{Reject: tooCostly}
+		}
+	case strings.Contains(sql, "slot"):
+		return nil, func(_ context.Context, _ Explain, running bool) Admission {
+			c.admit.running <- running
+			a := Admission{Timeout: c.admit.timeout, IdleInTransaction: c.admit.idle}
+			if !running {
+				a.Release = sync.OnceFunc(func() { c.admit.released <- struct{}{} })
+			}
+			return a
+		}
 	case !strings.Contains(sql, "plan"):
 		return nil, nil
 	}
-	return nil, func(e Explain) *pgproto3.ErrorResponse {
+	return nil, func(_ context.Context, e Explain, _ bool) Admission {
+		if e.Run == nil {
+			return Admission{}
+		}
 		out, _ := e.Run()
 		if c.generic != nil {
 			c.generic <- e.Generic
 		}
 		if strings.Contains(out, "big") {
-			return tooCostly
+			return Admission{Reject: tooCostly}
 		}
-		return nil
+		return Admission{}
 	}
 }
 
@@ -456,24 +658,30 @@ func (c fakeChecker) CheckTooLong(int) *pgproto3.ErrorResponse {
 
 // harness runs Relay between a test client and a test Postgres.
 type harness struct {
-	t      *testing.T
-	client net.Conn      // the test's end, acting as the client
-	pg     net.Conn      // the test's end, acting as Postgres
-	done   chan struct{} // closed when Relay returns
+	t       *testing.T
+	client  net.Conn      // the test's end, acting as the client
+	pg      net.Conn      // the test's end, acting as Postgres
+	done    chan struct{} // closed when Relay returns
+	cancels chan struct{} // gets a value each time the session asks Postgres to cancel
+	err     error         // what Relay returned, once done is closed
 }
 
 func start(t *testing.T, check Checker) *harness {
 	t.Helper()
 	client, proxyClient := tcpPair(t)
 	pg, proxyServer := tcpPair(t)
-	h := &harness{t: t, client: client, pg: pg, done: make(chan struct{})}
+	h := &harness{t: t, client: client, pg: pg, done: make(chan struct{}), cancels: make(chan struct{}, 10)}
 	go func() {
 		defer close(h.done)
-		Relay(proxyClient, proxyServer, check, func(_ io.Writer, _ io.Reader, report func(name, value string)) error {
-			report("standard_conforming_strings", loginSettings.StandardConformingStrings)
-			report("client_encoding", loginSettings.ClientEncoding)
-			report("TimeZone", "UTC")
-			return nil
+		h.err = Relay(proxyClient, proxyServer, Options{
+			Check: check,
+			Login: func(_ io.Writer, _ io.Reader, report func(name, value string)) error {
+				report("standard_conforming_strings", loginSettings.StandardConformingStrings)
+				report("client_encoding", loginSettings.ClientEncoding)
+				report("TimeZone", "UTC")
+				return nil
+			},
+			Cancel: func() { h.cancels <- struct{}{} },
 		})
 	}()
 	t.Cleanup(func() {
