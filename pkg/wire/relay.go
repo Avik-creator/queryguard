@@ -13,12 +13,13 @@ import (
 
 // Server message types and authentication codes RelayStartup acts on.
 const (
-	authRequestType    = 'R'
-	backendKeyDataType = 'K'
-	readyForQueryType  = 'Z'
-	errorResponseType  = 'E'
-	authOK             = 0
-	authSASL           = 10
+	authRequestType     = 'R'
+	backendKeyDataType  = 'K'
+	parameterStatusType = 'S'
+	readyForQueryType   = 'Z'
+	errorResponseType   = 'E'
+	authOK              = 0
+	authSASL            = 10
 )
 
 // maxKeyDataLen is the longest BackendKeyData body: a process ID and a 256-byte secret, the protocol 3.2 limit.
@@ -28,6 +29,7 @@ const maxKeyDataLen = 4 + 256
 type StartupOptions struct {
 	ChannelBinding bool                                                           // keep -PLUS SASL mechanisms
 	IssueKey       func(server *pgproto3.BackendKeyData) *pgproto3.BackendKeyData // the key data the client gets instead; nil keeps the server's
+	Report         func(name, value string)                                       // gets each ParameterStatus; nil ignores them
 	// Authenticated runs once AuthenticationOk has reached the client; an *Error it returns goes to the client as FATAL and ends the login.
 	Authenticated func() *Error
 }
@@ -50,6 +52,8 @@ func RelayStartup(client io.Writer, server io.Reader, opts StartupOptions) error
 			err = relayAuth(client, server, head, size, opts)
 		case typ == backendKeyDataType && opts.IssueKey != nil:
 			err = relayKey(client, server, size, opts.IssueKey)
+		case typ == parameterStatusType && opts.Report != nil:
+			err = relayParameter(client, server, head, size, opts.Report)
 		default:
 			err = forward(client, server, head[:], size)
 		}
@@ -115,6 +119,24 @@ func relayKey(client io.Writer, server io.Reader, size int64, issueKey func(*pgp
 		return fmt.Errorf("invalid BackendKeyData: %w", err)
 	}
 	return writeMessage(client, issueKey(&key))
+}
+
+// relayParameter forwards a ParameterStatus of size bytes after passing it to report.
+func relayParameter(client io.Writer, server io.Reader, head [5]byte, size int64, report func(name, value string)) error {
+	if size > maxPacketLen {
+		return fmt.Errorf("ParameterStatus of %d bytes is too long", size)
+	}
+	body := make([]byte, size)
+	if _, err := io.ReadFull(server, body); err != nil {
+		return unexpected(err)
+	}
+	var msg pgproto3.ParameterStatus
+	if err := msg.Decode(body); err != nil {
+		return fmt.Errorf("invalid ParameterStatus: %w", err)
+	}
+	report(msg.Name, msg.Value)
+	_, err := client.Write(append(head[:], body...))
+	return err
 }
 
 // writeMessage encodes msg and writes it to w.

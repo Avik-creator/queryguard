@@ -100,6 +100,31 @@ func TestRelayStartupForwardsOtherMessagesUnchanged(t *testing.T) {
 	}
 }
 
+func TestRelayStartupReportsParameters(t *testing.T) {
+	want := concat(
+		encode(t, &pgproto3.AuthenticationOk{}),
+		encode(t, &pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"}),
+		encode(t, &pgproto3.ParameterStatus{Name: "standard_conforming_strings", Value: "on"}),
+		encode(t, &pgproto3.ReadyForQuery{TxStatus: 'I'}),
+	)
+	var client bytes.Buffer
+	var got []string
+
+	err := RelayStartup(&client, bytes.NewReader(want), StartupOptions{Report: func(name, value string) {
+		got = append(got, name+"="+value)
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.Equal(got, []string{"client_encoding=UTF8", "standard_conforming_strings=on"}) {
+		t.Errorf("reported %q", got)
+	}
+	if !bytes.Equal(client.Bytes(), want) {
+		t.Errorf("client got %q; want %q", client.Bytes(), want)
+	}
+}
+
 func TestRelayStartupRefusesAfterAuthentication(t *testing.T) {
 	for _, binding := range []bool{false, true} {
 		ok := encode(t, &pgproto3.AuthenticationOk{})
@@ -156,9 +181,12 @@ func TestRelayStartupRejects(t *testing.T) {
 		"SASL list unterminated": concat([]byte("R"), u32(4+4+5), u32(10), []byte("SCRAM")),
 		"key too short":          concat([]byte("K"), u32(4+7), u32(4242), []byte{1, 2, 3}),
 		"key too long":           concat([]byte("K"), u32(4+4+257), u32(4242), make([]byte, 257)),
+		"parameter unterminated": concat([]byte("S"), u32(4+3), []byte("abc")),
+		"parameter too long":     concat([]byte("S"), u32(4+maxPacketLen+1)),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := RelayStartup(io.Discard, bytes.NewReader(in), StartupOptions{IssueKey: issue}); err == nil {
+			opts := StartupOptions{IssueKey: issue, Report: func(string, string) {}}
+			if err := RelayStartup(io.Discard, bytes.NewReader(in), opts); err == nil {
 				t.Fatal("RelayStartup returned nil; want an error")
 			}
 		})
@@ -179,6 +207,7 @@ func FuzzRelayStartup(f *testing.F) {
 	f.Add(concat(
 		encodeF(f, &pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"}}),
 		encodeF(f, &pgproto3.AuthenticationOk{}),
+		encodeF(f, &pgproto3.ParameterStatus{Name: "client_encoding", Value: "UTF8"}),
 		encodeF(f, &pgproto3.BackendKeyData{ProcessID: 4242, SecretKey: bytes.Repeat([]byte{7}, 32)}),
 		encodeF(f, &pgproto3.ReadyForQuery{TxStatus: 'I'}),
 	))
@@ -189,6 +218,6 @@ func FuzzRelayStartup(f *testing.F) {
 			}
 			return k
 		}
-		RelayStartup(io.Discard, bytes.NewReader(in), StartupOptions{IssueKey: issue})
+		RelayStartup(io.Discard, bytes.NewReader(in), StartupOptions{IssueKey: issue, Report: func(string, string) {}})
 	})
 }
