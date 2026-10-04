@@ -19,6 +19,7 @@ type Query struct {
 	BlockingIndexChange bool     // CREATE INDEX, DROP INDEX or REINDEX without CONCURRENTLY, which blocks writes
 	Schemas             []string // schemas named explicitly, sorted, without duplicates
 	UnknownSearchPath   bool     // set_config('search_path', …) with a value known only when it runs
+	Explainable         bool     // a single statement EXPLAIN can plan: SELECT, INSERT, UPDATE, DELETE, MERGE, DECLARE or CREATE TABLE AS
 }
 
 // notDDL lists the statement types Postgres's GetCommandLogLevel does not log as DDL; every other *Stmt is DDL.
@@ -45,6 +46,13 @@ func Analyze(sql string) (Query, error) {
 		return Query{}, err
 	}
 	var q Query
+	if len(tree.Stmts) == 1 {
+		switch tree.Stmts[0].GetStmt().GetNode().(type) {
+		case *pg_query.Node_SelectStmt, *pg_query.Node_InsertStmt, *pg_query.Node_UpdateStmt, *pg_query.Node_DeleteStmt,
+			*pg_query.Node_MergeStmt, *pg_query.Node_DeclareCursorStmt, *pg_query.Node_CreateTableAsStmt:
+			q.Explainable = true
+		}
+	}
 	schemas := map[string]bool{}
 	add := func(schema string) {
 		if schema != "" {
