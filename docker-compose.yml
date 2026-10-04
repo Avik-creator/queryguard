@@ -7,6 +7,9 @@ x-postgres: &postgres
     POSTGRES_DB: queryguard
     POSTGRES_USER: postgres
     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-queryguard}
+    # Test data size, read by testdata/initdb/load.sh.
+    QG_CUSTOMERS: ${QG_CUSTOMERS:-1000000}
+    QG_ORDERS: ${QG_ORDERS:-10000000}
   command:
     - -c
     - shared_preload_libraries=pg_stat_statements
@@ -19,23 +22,34 @@ x-postgres: &postgres
     # Check over TCP, not the Unix socket: during first-time setup Postgres
     # runs a temporary server on the socket only, which would pass too early.
     test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d queryguard"]
-    interval: 2s
+    # Loading the test data takes a few minutes on first start. Failed checks
+    # don't count during start_period, and the first passing check ends it.
+    interval: 5s
     timeout: 3s
-    retries: 30
-    start_period: 30s
+    retries: 5
+    start_period: 10m
+    start_interval: 2s
 
+# Each service lists all its volumes: "<<:" replaces a list rather than
+# adding to it, so mounts can't be shared through the block above.
 services:
   pg16:
     <<: *postgres
     image: postgres:16
     ports: ["127.0.0.1:5416:5432"]
-    volumes: ["pg16:/var/lib/postgresql/data"]
+    volumes:
+      - ./testdata/initdb:/docker-entrypoint-initdb.d:ro
+      - ./testdata/schema.sql:/queryguard/schema.sql:ro
+      - pg16:/var/lib/postgresql/data
 
   pg17:
     <<: *postgres
     image: postgres:17
     ports: ["127.0.0.1:5417:5432"]
-    volumes: ["pg17:/var/lib/postgresql/data"]
+    volumes:
+      - ./testdata/initdb:/docker-entrypoint-initdb.d:ro
+      - ./testdata/schema.sql:/queryguard/schema.sql:ro
+      - pg17:/var/lib/postgresql/data
 
   pg18:
     <<: *postgres
@@ -43,7 +57,10 @@ services:
     ports: ["127.0.0.1:5418:5432"]
     # From 18 the image keeps data under /var/lib/postgresql/18/docker, so the
     # volume mounts one level higher than for 16 and 17.
-    volumes: ["pg18:/var/lib/postgresql"]
+    volumes:
+      - ./testdata/initdb:/docker-entrypoint-initdb.d:ro
+      - ./testdata/schema.sql:/queryguard/schema.sql:ro
+      - pg18:/var/lib/postgresql
 
 volumes:
   pg16:
