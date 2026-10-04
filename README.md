@@ -5,8 +5,8 @@ speaks the Postgres wire protocol. It estimates what each query will cost before
 it runs and gives every tenant a budget, so one tenant's expensive queries can't
 starve everyone else.
 
-> **Status:** early development. The proxy does not work yet; this repository
-> currently holds the project setup (milestone M0).
+> **Status:** early development (milestone M1). QueryGuard relays sessions,
+> cancel requests and TLS, but does not estimate or limit anything yet.
 
 ## Planned features
 
@@ -31,6 +31,33 @@ starve everyone else.
 go build -o bin/queryguard ./cmd/queryguard
 ./bin/queryguard -version
 ```
+
+## TLS
+
+Clients can use TLS through an `SSLRequest` or, from PostgreSQL 17 clients,
+`sslnegotiation=direct`:
+
+```sh
+make certs   # self-signed certificate for local testing
+./bin/queryguard -tls-cert certs/server.crt -tls-key certs/server.key
+```
+
+TLS to PostgreSQL is set with `-upstream-sslmode` (`disable`, `require` or
+`verify-full`, with the same meanings as in libpq) and `-upstream-ca` for a
+private CA.
+
+### SCRAM channel binding
+
+Channel binding (`SCRAM-SHA-256-PLUS`) ties the password check to the server's
+TLS certificate. The client sees QueryGuard's certificate while PostgreSQL
+checks its own, so with TLS on both sides:
+
+| QueryGuard's certificate | Clients with `channel_binding=prefer` (the libpq default) |
+| --- | --- |
+| The same certificate and key as PostgreSQL | Work, with channel binding end to end |
+| A different certificate | Fail with "SCRAM channel binding negotiation error"; set `channel_binding=disable` |
+
+Clients connecting to QueryGuard without TLS always work.
 
 ## License
 

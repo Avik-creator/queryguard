@@ -2,6 +2,7 @@
 package proxy
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"crypto/tls"
@@ -113,6 +114,7 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	}
 	defer s.Upstream.Release(server)
 
+	channelBinding := sameCertificate(client, server, s.TLSConfig)
 	closeBoth := func() {
 		client.Close()
 		server.Close()
@@ -127,7 +129,7 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 		closeBoth()
 	})
 	copies.Go(func() {
-		err := wire.RelayAuth(client, server)
+		err := wire.RelayAuth(client, server, channelBinding)
 		if err == nil {
 			io.Copy(client, server)
 		} else if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
@@ -137,4 +139,16 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 		closeBoth()
 	})
 	copies.Wait()
+}
+
+// sameCertificate reports whether both sides use TLS and the server presented the proxy's own certificate, so channel binding works end to end.
+func sameCertificate(client, server net.Conn, cfg *tls.Config) bool {
+	_, clientTLS := client.(*tls.Conn)
+	serverTLS, ok := server.(*tls.Conn)
+	if !clientTLS || !ok || cfg == nil || len(cfg.Certificates) == 0 {
+		return false
+	}
+	// The handshake proved the server holds the key for the certificate it sent, so a copied certificate can't pass.
+	peer := serverTLS.ConnectionState().PeerCertificates
+	return len(peer) > 0 && bytes.Equal(peer[0].Raw, cfg.Certificates[0].Certificate[0])
 }

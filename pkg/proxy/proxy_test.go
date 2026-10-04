@@ -86,18 +86,34 @@ func TestForwardsCancelRequestOverTLS(t *testing.T) {
 	}
 }
 
-func TestHidesChannelBindingFromClient(t *testing.T) {
-	pg := serveFakePostgres(t, &fakePostgres{greeting: []encoder{
-		&pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"}},
-	}})
-	addr, _ := startProxy(t, newServer(t, pg.addr))
-	conn := dial(t, addr)
+func TestPassesChannelBindingWhenProxyHasPostgresCertificate(t *testing.T) {
+	cert, _ := testcert.Pair(t)
 
-	sendStartup(t, conn)
+	got := offeredMechanisms(t, cert, cert, true)
 
-	sasl, ok := receive(t, conn).(*pgproto3.AuthenticationSASL)
-	if !ok || !slices.Equal(sasl.AuthMechanisms, []string{"SCRAM-SHA-256"}) {
-		t.Fatalf("client got %#v; want SASL with only SCRAM-SHA-256", sasl)
+	if !slices.Equal(got, []string{"SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"}) {
+		t.Errorf("client was offered %q; want SCRAM-SHA-256-PLUS kept", got)
+	}
+}
+
+func TestHidesChannelBindingWhenCertificatesDiffer(t *testing.T) {
+	proxyCert, _ := testcert.Pair(t)
+	pgCert, _ := testcert.Pair(t)
+
+	got := offeredMechanisms(t, proxyCert, pgCert, true)
+
+	if !slices.Equal(got, []string{"SCRAM-SHA-256"}) {
+		t.Errorf("client was offered %q; want only SCRAM-SHA-256", got)
+	}
+}
+
+func TestHidesChannelBindingFromPlaintextClient(t *testing.T) {
+	cert, _ := testcert.Pair(t)
+
+	got := offeredMechanisms(t, cert, cert, false)
+
+	if !slices.Equal(got, []string{"SCRAM-SHA-256"}) {
+		t.Errorf("client was offered %q; want only SCRAM-SHA-256", got)
 	}
 }
 
@@ -338,6 +354,31 @@ func serveFakePostgres(t *testing.T, pg *fakePostgres) *fakePostgres {
 		}
 	}()
 	return pg
+}
+
+// offeredMechanisms logs in through a proxy presenting proxyCert to a Postgres presenting pgCert that offers both SCRAM methods.
+func offeredMechanisms(t *testing.T, proxyCert, pgCert tls.Certificate, clientTLS bool) []string {
+	t.Helper()
+	pg := serveFakePostgres(t, &fakePostgres{tls: wire.ServerTLSConfig(pgCert), greeting: []encoder{
+		&pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"}},
+	}})
+	s := newServer(t, pg.addr)
+	s.TLSConfig = wire.ServerTLSConfig(proxyCert)
+	// Certificate checks are tested elsewhere; here only the mechanism list matters.
+	s.Upstream = Dialer{Addr: pg.addr, TLSConfig: &tls.Config{InsecureSkipVerify: true}}
+	addr, _ := startProxy(t, s)
+
+	conn := dial(t, addr)
+	if clientTLS {
+		conn = tls.Client(conn, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"postgresql"}})
+	}
+	sendStartup(t, conn)
+
+	sasl, ok := receive(t, conn).(*pgproto3.AuthenticationSASL)
+	if !ok {
+		t.Fatalf("client got %#v; want AuthenticationSASL", sasl)
+	}
+	return sasl.AuthMechanisms
 }
 
 // startProxy runs s.Serve on a free port and returns its address and a stop function.

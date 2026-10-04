@@ -19,8 +19,8 @@ const (
 	authSASL          = 10
 )
 
-// RelayAuth copies server messages to client until authentication succeeds or fails, hiding channel binding mechanisms.
-func RelayAuth(client io.Writer, server io.Reader) error {
+// RelayAuth copies server messages to client until authentication succeeds or fails, hiding channel binding mechanisms unless channelBinding.
+func RelayAuth(client io.Writer, server io.Reader, channelBinding bool) error {
 	for {
 		// Message type, length, and for 'R' messages the authentication code.
 		var head [9]byte
@@ -48,10 +48,11 @@ func RelayAuth(client io.Writer, server io.Reader) error {
 		if _, err := io.ReadFull(server, head[5:]); err != nil {
 			return unexpected(err)
 		}
-		switch binary.BigEndian.Uint32(head[5:]) {
-		case authOK:
+		code := binary.BigEndian.Uint32(head[5:])
+		switch {
+		case code == authOK:
 			return forward(client, server, head[:], size-4)
-		case authSASL:
+		case code == authSASL && !channelBinding:
 			if err := relaySASL(client, server, head[5:], size); err != nil {
 				return err
 			}

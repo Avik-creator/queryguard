@@ -17,7 +17,7 @@ func TestRelayAuthRemovesChannelBindingMechanisms(t *testing.T) {
 	))
 	var client bytes.Buffer
 
-	if err := RelayAuth(&client, server); err != nil {
+	if err := RelayAuth(&client, server, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -31,6 +31,22 @@ func TestRelayAuthRemovesChannelBindingMechanisms(t *testing.T) {
 	}
 }
 
+func TestRelayAuthKeepsChannelBindingWhenAllowed(t *testing.T) {
+	want := concat(
+		encode(t, &pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"}}),
+		encode(t, &pgproto3.AuthenticationOk{}),
+	)
+	var client bytes.Buffer
+
+	if err := RelayAuth(&client, bytes.NewReader(want), true); err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(client.Bytes(), want) {
+		t.Fatalf("client got %q; want %q", client.Bytes(), want)
+	}
+}
+
 func TestRelayAuthForwardsOtherMessagesUnchanged(t *testing.T) {
 	want := concat(
 		encode(t, &pgproto3.NegotiateProtocolVersion{NewestMinorProtocol: 0, UnrecognizedOptions: []string{"_pq_.x"}}),
@@ -41,7 +57,7 @@ func TestRelayAuthForwardsOtherMessagesUnchanged(t *testing.T) {
 	)
 	var client bytes.Buffer
 
-	if err := RelayAuth(&client, bytes.NewReader(want)); err != nil {
+	if err := RelayAuth(&client, bytes.NewReader(want), false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -58,7 +74,7 @@ func TestRelayAuthStopsAfterAuthentication(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			server := bytes.NewReader(concat(encode(t, end), []byte("after")))
 
-			if err := RelayAuth(io.Discard, server); err != nil {
+			if err := RelayAuth(io.Discard, server, false); err != nil {
 				t.Fatal(err)
 			}
 
@@ -77,7 +93,7 @@ func TestRelayAuthRejects(t *testing.T) {
 		"SASL list unterminated": concat([]byte("R"), u32(4+4+5), u32(10), []byte("SCRAM")),
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := RelayAuth(io.Discard, bytes.NewReader(in)); err == nil {
+			if err := RelayAuth(io.Discard, bytes.NewReader(in), false); err == nil {
 				t.Fatal("RelayAuth returned nil; want an error")
 			}
 		})
@@ -87,7 +103,7 @@ func TestRelayAuthRejects(t *testing.T) {
 func TestRelayAuthReportsEOFInsideMessage(t *testing.T) {
 	ok := encode(t, &pgproto3.AuthenticationOk{})
 
-	err := RelayAuth(io.Discard, bytes.NewReader(ok[:len(ok)-1]))
+	err := RelayAuth(io.Discard, bytes.NewReader(ok[:len(ok)-1]), false)
 
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("got %v; want io.ErrUnexpectedEOF", err)
