@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/session"
 	"github.com/Avik-creator/queryguard/pkg/sqlparse"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -225,6 +226,135 @@ func TestStartupSearchPath(t *testing.T) {
 	}
 }
 
+const costRules = `{"rules": [{"check": "max_cost", "cost": 1000}, {"check": "max_scan_rows", "rows": 50000}]}`
+
+func TestCostCheckOnlyForStatementsEXPLAINCanPlan(t *testing.T) {
+	c := costChecker(t, costRules, nil, discard)
+	for sql, want := range map[string]bool{
+		"select * from orders":            true,
+		"update orders set total = 0":     true,
+		"begin":                           false,
+		"select 1; select * from orders":  false,
+		"create index on orders (status)": false,
+	} {
+		if _, cost := c.Check(sql, standard); (cost != nil) != want {
+			t.Errorf("Check(%q) gave a cost check = %v; want %v", sql, cost != nil, want)
+		}
+	}
+	if _, cost := mustParse(t, allRules).Checker("alice", discard).Check("select * from orders", standard); cost != nil {
+		t.Error("a policy without cost rules asked for a plan")
+	}
+}
+
+func TestCostRules(t *testing.T) {
+	big := `[{"Plan": {"Node Type": "Seq Scan", "Schema": "public", "Relation Name": "orders", "Total Cost": 900}}]`
+	for name, tc := range map[string]struct {
+		out  string
+		want string // the rule that blocks it
+	}{
+		"cheap":                    {`[{"Plan": {"Node Type": "Index Scan", "Total Cost": 8.4}}]`, ""},
+		"over the cost":            {`[{"Plan": {"Node Type": "Index Scan", "Total Cost": 1000.5}}]`, "max_cost"},
+		"full read of a big table": {big, "max_scan_rows"},
+		"full read of a small one": {`[{"Plan": {"Node Type": "Seq Scan", "Schema": "public", "Relation Name": "tenants", "Total Cost": 3}}]`, ""},
+		"table never analyzed":     {`[{"Plan": {"Node Type": "Seq Scan", "Schema": "public", "Relation Name": "fresh", "Total Cost": 3}}]`, ""},
+		// Partitions of 30000 rows each are small, but a plan reading two of them in full reads 60000 rows.
+		"full read across partitions": {`[{"Plan": {"Node Type": "Append", "Total Cost": 900, "Plans": [
+			{"Node Type": "Seq Scan", "Schema": "public", "Relation Name": "events_1", "Total Cost": 450},
+			{"Node Type": "Seq Scan", "Schema": "public", "Relation Name": "events_2", "Total Cost": 450}]}}]`, "max_scan_rows"},
+		"both, cost listed first": {strings.Replace(big, "900", "2000", 1), "max_cost"},
+	} {
+		c := costChecker(t, costRules, tables{"public.orders": 1e6, "public.tenants": 100, "public.events_1": 30000, "public.events_2": 30000}, discard)
+		_, cost := c.Check("select * from orders where note = 'x'", standard)
+
+		got := cost(explained(tc.out, nil))
+
+		if ruleOf(got) != tc.want {
+			t.Errorf("%s: blocked by %q (%v); want %q", name, ruleOf(got), got, tc.want)
+		}
+		if got != nil && got.Code != "54000" {
+			t.Errorf("%s: code %s; want 54000 program_limit_exceeded", name, got.Code)
+		}
+	}
+}
+
+func TestCostRejectionCarriesNumbersNotNames(t *testing.T) {
+	var logs bytes.Buffer
+	c := costChecker(t, costRules, tables{"public.orders": 1e6}, logger(&logs))
+	_, cost := c.Check("select * from orders where note = 'x'", standard)
+
+	got := cost(explained(`[{"Plan": {"Node Type": "Seq Scan", "Schema": "public", "Relation Name": "orders", "Total Cost": 500}}]`, nil))
+
+	if got == nil || !strings.Contains(got.Detail, "1000000 rows") || !strings.Contains(got.Detail, "50000") {
+		t.Fatalf("got %v; want a detail with the table size and the limit", got)
+	}
+	if strings.Contains(got.Detail, "orders") || strings.ContainsAny(got.Detail+got.Message+got.Hint, `'\$`) {
+		t.Errorf("rejection %q carries a name or quoting characters", got.Detail)
+	}
+	if !strings.Contains(logs.String(), "seq_scans=[public.orders]") || !strings.Contains(logs.String(), "cost=500") {
+		t.Errorf("log %q; want the table and the cost", logs.String())
+	}
+}
+
+func TestCostCheckUsesCachedPlans(t *testing.T) {
+	c := costChecker(t, costRules, nil, discard)
+	runs := 0
+	for _, sql := range []string{"select * from orders where id = 1", "select * from orders where id = 2"} {
+		_, cost := c.Check(sql, standard)
+		cost(session.Explain{Run: func() (string, error) {
+			runs++
+			return `[{"Plan": {"Node Type": "Index Scan", "Total Cost": 8}}]`, nil
+		}})
+	}
+	_, cost := c.Check("select * from orders where id = 3", standard)
+	cost(session.Explain{Generic: true, Run: func() (string, error) {
+		runs++
+		return `[{"Plan": {"Node Type": "Index Scan", "Total Cost": 8}}]`, nil
+	}})
+
+	// The same statement with other constants hits the cache; a generic plan is a different plan.
+	if runs != 2 {
+		t.Errorf("explained %d times; want 2", runs)
+	}
+	if s := c.Costs.Plans.Stats(); s.Hits != 1 || s.Misses != 2 {
+		t.Errorf("cache stats %+v; want 1 hit, 2 misses", s)
+	}
+}
+
+func TestCostCheckWithoutPlan(t *testing.T) {
+	c := costChecker(t, costRules, nil, discard)
+	_, cost := c.Check("select * from orders", standard)
+	if got := cost(explained("", session.ErrNoPlan)); got != nil {
+		t.Errorf("statement Postgres refused got %v; want it left to the session", got)
+	}
+
+	_, cost = c.Check("select * from customers", standard)
+	if got := cost(explained("not json", nil)); got == nil || got.Message != "queryguard: statement could not be checked" {
+		t.Errorf("unreadable plan got %v; want rejected unchecked", got)
+	}
+}
+
+func TestCostRulesInWarnMode(t *testing.T) {
+	var logs bytes.Buffer
+	c := costChecker(t, `{"rules": [{"check": "max_cost", "cost": 10, "mode": "warn"}]}`, nil, logger(&logs))
+	_, cost := c.Check("select * from orders", standard)
+
+	if got := cost(explained(`[{"Plan": {"Node Type": "Seq Scan", "Total Cost": 500}}]`, nil)); got != nil {
+		t.Errorf("warn mode rejected with %v", got)
+	}
+	if !strings.Contains(logs.String(), `msg="would reject statement"`) || !strings.Contains(logs.String(), "rule=max_cost") {
+		t.Errorf("log %q; want the would-be rejection", logs.String())
+	}
+}
+
+func TestNeedsCatalog(t *testing.T) {
+	if mustParse(t, `{"rules": [{"check": "max_cost", "cost": 10}]}`).NeedsCatalog() {
+		t.Error("max_cost alone needs the catalog")
+	}
+	if !mustParse(t, costRules).NeedsCatalog() {
+		t.Error("max_scan_rows doesn't need the catalog")
+	}
+}
+
 func TestConnectionLimits(t *testing.T) {
 	p := mustParse(t, `{"max_connections": 100, "tenant_max_connections": 10, "tenants": {"batch": {"max_connections": 2}}}`)
 
@@ -247,7 +377,12 @@ func TestParseRejectsBadConfig(t *testing.T) {
 		`{"tenants": {"alice": {"mode": "loud"}}}`:                            "loud",
 		`{"max_connections": -1}`:                                             "max_connections",
 		`{"tenants": {"alice": {"max_connections": -1}}}`:                     "max_connections",
-		`{"rule": []}`: "rule",
+		`{"rule": []}`:                                             "rule",
+		`{"rules": [{"check": "max_cost"}]}`:                       "cost",
+		`{"rules": [{"check": "max_cost", "cost": -1}]}`:           "cost",
+		`{"rules": [{"check": "max_scan_rows"}]}`:                  "rows",
+		`{"rules": [{"check": "require_where", "cost": 5}]}`:       "cost",
+		`{"rules": [{"check": "max_cost", "cost": 5, "rows": 5}]}`: "rows",
 	} {
 		if _, err := Parse([]byte(config)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("Parse(%s) = %v; want an error mentioning %q", config, err, want)
@@ -274,6 +409,27 @@ var discard = slog.New(slog.DiscardHandler)
 
 // rejected returns Check's error, dropping its cost check.
 func rejected(e *pgproto3.ErrorResponse, _ session.CostCheck) *pgproto3.ErrorResponse { return e }
+
+// costChecker checks alice's statements in database shop with a fresh plan cache and the given table sizes.
+func costChecker(t *testing.T, config string, sizes tables, log *slog.Logger) *Checker {
+	t.Helper()
+	c := mustParse(t, config).Checker("alice", log)
+	c.Costs = Costs{Database: "shop", Plans: &plan.Cache{}, Tables: sizes}
+	return c
+}
+
+// explained is an Explain whose Run returns out and err.
+func explained(out string, err error) session.Explain {
+	return session.Explain{Run: func() (string, error) { return out, err }}
+}
+
+// tables are table sizes keyed by schema.name.
+type tables map[string]float64
+
+func (ts tables) Rows(_ string, t plan.Table) (float64, bool) {
+	n, ok := ts[t.String()]
+	return n, ok
+}
 
 // standard is how Postgres reads SQL by default, which is how the parser reads it.
 var standard = session.Settings{StandardConformingStrings: "on", ClientEncoding: "UTF8"}
