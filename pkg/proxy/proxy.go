@@ -127,7 +127,13 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 		closeBoth()
 	})
 	copies.Go(func() {
-		io.Copy(client, server)
+		err := wire.RelayAuth(client, server)
+		if err == nil {
+			io.Copy(client, server)
+		} else if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			// Either side hanging up mid-login is normal; psql does it before every password prompt.
+			log.Warn("relay authentication", "client", client.RemoteAddr(), "err", err)
+		}
 		closeBoth()
 	})
 	copies.Wait()

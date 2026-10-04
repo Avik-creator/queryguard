@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -59,11 +61,7 @@ func TestRelaysOverDirectTLS(t *testing.T) {
 	addr, _ := startProxy(t, s)
 
 	clientTLS.NextProtos = []string{"postgresql"}
-	conn := tls.Client(dial(t, addr), clientTLS)
-	send(t, conn, &pgproto3.StartupMessage{
-		ProtocolVersion: pgproto3.ProtocolVersion30,
-		Parameters:      map[string]string{"user": "alice"},
-	})
+	conn := login(t, tls.Client(dial(t, addr), clientTLS))
 
 	roundTrip(t, conn, "hello over TLS")
 }
@@ -88,6 +86,93 @@ func TestForwardsCancelRequestOverTLS(t *testing.T) {
 	}
 }
 
+func TestHidesChannelBindingFromClient(t *testing.T) {
+	pg := serveFakePostgres(t, &fakePostgres{greeting: []encoder{
+		&pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"}},
+	}})
+	addr, _ := startProxy(t, newServer(t, pg.addr))
+	conn := dial(t, addr)
+
+	sendStartup(t, conn)
+
+	sasl, ok := receive(t, conn).(*pgproto3.AuthenticationSASL)
+	if !ok || !slices.Equal(sasl.AuthMechanisms, []string{"SCRAM-SHA-256"}) {
+		t.Fatalf("client got %#v; want SASL with only SCRAM-SHA-256", sasl)
+	}
+}
+
+func TestStaysQuietWhenClientLeavesDuringLogin(t *testing.T) {
+	pg := serveFakePostgres(t, &fakePostgres{greeting: []encoder{
+		&pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256"}},
+	}})
+	var logs bytes.Buffer
+	s := newServer(t, pg.addr)
+	s.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	addr, stop := startProxy(t, s)
+	conn := dial(t, addr)
+	sendStartup(t, conn)
+	receive(t, conn)
+
+	conn.Close()
+	stop()
+
+	if logs.Len() > 0 {
+		t.Errorf("proxy logged %q; want nothing", logs.String())
+	}
+}
+
+func TestConnectsToUpstreamOverTLS(t *testing.T) {
+	cert, clientTLS := testcert.Pair(t)
+	pg := serveFakePostgres(t, &fakePostgres{tls: wire.ServerTLSConfig(cert)})
+	s := newServer(t, pg.addr)
+	s.Upstream = Dialer{Addr: pg.addr, TLSConfig: clientTLS}
+	addr, _ := startProxy(t, s)
+
+	conn := startSession(t, addr)
+
+	roundTrip(t, conn, "hello")
+}
+
+func TestForwardsCancelRequestToUpstreamOverTLS(t *testing.T) {
+	cert, clientTLS := testcert.Pair(t)
+	pg := serveFakePostgres(t, &fakePostgres{tls: wire.ServerTLSConfig(cert)})
+	s := newServer(t, pg.addr)
+	s.Upstream = Dialer{Addr: pg.addr, TLSConfig: clientTLS}
+	addr, _ := startProxy(t, s)
+
+	send(t, dial(t, addr), &pgproto3.CancelRequest{ProcessID: 42, SecretKey: []byte{1, 2, 3, 4}})
+
+	if got := mustReceive[*pgproto3.CancelRequest](t, pg.received); got.ProcessID != 42 {
+		t.Errorf("upstream got process %d; want 42", got.ProcessID)
+	}
+}
+
+func TestFailsWhenUpstreamRefusesTLS(t *testing.T) {
+	_, clientTLS := testcert.Pair(t)
+	pg := startFakePostgres(t)
+	s := newServer(t, pg.addr)
+	s.Upstream = Dialer{Addr: pg.addr, TLSConfig: clientTLS}
+	addr, _ := startProxy(t, s)
+	conn := dial(t, addr)
+
+	sendStartup(t, conn)
+
+	expectFatal(t, conn, "08006")
+}
+
+func TestFailsWhenUpstreamCertificateIsUntrusted(t *testing.T) {
+	cert, _ := testcert.Pair(t)
+	pg := serveFakePostgres(t, &fakePostgres{tls: wire.ServerTLSConfig(cert)})
+	s := newServer(t, pg.addr)
+	s.Upstream = Dialer{Addr: pg.addr, TLSConfig: &tls.Config{ServerName: "localhost"}}
+	addr, _ := startProxy(t, s)
+	conn := dial(t, addr)
+
+	sendStartup(t, conn)
+
+	expectFatal(t, conn, "08006")
+}
+
 func TestSendsFatalErrorWhenUpstreamUnreachable(t *testing.T) {
 	// A port that was just released has nothing listening on it.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -98,17 +183,10 @@ func TestSendsFatalErrorWhenUpstreamUnreachable(t *testing.T) {
 	ln.Close()
 
 	addr, _ := startProxy(t, newServer(t, upstream))
-	conn := startSession(t, addr)
+	conn := dial(t, addr)
+	sendStartup(t, conn)
 
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	msg, err := pgproto3.NewFrontend(conn, nil).Receive()
-	if err != nil {
-		t.Fatalf("want an ErrorResponse: %v", err)
-	}
-	if e, ok := msg.(*pgproto3.ErrorResponse); !ok || e.Severity != "FATAL" || e.Code != "08006" {
-		t.Fatalf("got %#v; want FATAL 08006", msg)
-	}
-	expectClosed(t, conn)
+	expectFatal(t, conn, "08006")
 }
 
 func TestClosesClientWhenUpstreamCloses(t *testing.T) {
@@ -128,7 +206,8 @@ func TestClosesClientWhenUpstreamCloses(t *testing.T) {
 	}()
 
 	addr, _ := startProxy(t, newServer(t, ln.Addr().String()))
-	conn := startSession(t, addr)
+	conn := dial(t, addr)
+	sendStartup(t, conn)
 
 	expectClosed(t, conn)
 }
@@ -208,36 +287,53 @@ func newServer(t *testing.T, upstream string) *Server {
 	}
 }
 
-// fakePostgres records each client's startup packet, then echoes bytes back.
+// fakePostgres records each client's startup packet, sends its greeting, then echoes bytes back.
 type fakePostgres struct {
 	addr     string
 	received chan pgproto3.FrontendMessage
+	tls      *tls.Config // when set, plaintext connections are dropped
+	greeting []encoder   // sent after a startup message; AuthenticationOk when empty
 }
 
-func startFakePostgres(t *testing.T) *fakePostgres {
+func startFakePostgres(t *testing.T) *fakePostgres { return serveFakePostgres(t, &fakePostgres{}) }
+
+func serveFakePostgres(t *testing.T, pg *fakePostgres) *fakePostgres {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
-	pg := &fakePostgres{addr: ln.Addr().String(), received: make(chan pgproto3.FrontendMessage, 10)}
+	pg.addr = ln.Addr().String()
+	pg.received = make(chan pgproto3.FrontendMessage, 10)
+	greeting := pg.greeting
+	if len(greeting) == 0 {
+		greeting = []encoder{&pgproto3.AuthenticationOk{}}
+	}
 	go func() {
 		for {
-			conn, err := ln.Accept()
+			raw, err := ln.Accept()
 			if err != nil {
 				return
 			}
 			go func() {
-				defer conn.Close()
-				_, msg, err := wire.Negotiate(conn, nil)
+				defer raw.Close()
+				conn, msg, err := wire.Negotiate(raw, pg.tls)
 				if err != nil {
 					return
 				}
-				pg.received <- msg
-				if _, ok := msg.(*pgproto3.StartupMessage); ok {
-					io.Copy(conn, conn)
+				if _, ok := conn.(*tls.Conn); pg.tls != nil && !ok {
+					return
 				}
+				pg.received <- msg
+				if _, ok := msg.(*pgproto3.StartupMessage); !ok {
+					return
+				}
+				for _, m := range greeting {
+					buf, _ := m.Encode(nil)
+					conn.Write(buf)
+				}
+				io.Copy(conn, conn)
 			}()
 		}
 	}()
@@ -279,18 +375,34 @@ func dial(t *testing.T, addr string) net.Conn {
 	return conn
 }
 
-// startSession connects to the proxy and sends a startup message for alice.
+// startSession connects to the proxy and logs in.
 func startSession(t *testing.T, addr string) net.Conn {
 	t.Helper()
-	conn := dial(t, addr)
+	return login(t, dial(t, addr))
+}
+
+// login sends a startup message on conn and waits for AuthenticationOk.
+func login(t *testing.T, conn net.Conn) net.Conn {
+	t.Helper()
+	sendStartup(t, conn)
+	if msg, ok := receive(t, conn).(*pgproto3.AuthenticationOk); !ok {
+		t.Fatalf("got %#v; want AuthenticationOk", msg)
+	}
+	return conn
+}
+
+// sendStartup sends a startup message for alice and the shop database.
+func sendStartup(t *testing.T, conn net.Conn) {
+	t.Helper()
 	send(t, conn, &pgproto3.StartupMessage{
 		ProtocolVersion: pgproto3.ProtocolVersion30,
 		Parameters:      map[string]string{"user": "alice", "database": "shop"},
 	})
-	return conn
 }
 
-func send(t *testing.T, conn net.Conn, msg interface{ Encode([]byte) ([]byte, error) }) {
+type encoder interface{ Encode([]byte) ([]byte, error) }
+
+func send(t *testing.T, conn net.Conn, msg encoder) {
 	t.Helper()
 	buf, err := msg.Encode(nil)
 	if err != nil {
@@ -299,6 +411,36 @@ func send(t *testing.T, conn net.Conn, msg interface{ Encode([]byte) ([]byte, er
 	if _, err := conn.Write(buf); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// receive reads exactly one server message from conn within 2s.
+func receive(t *testing.T, conn net.Conn) pgproto3.BackendMessage {
+	t.Helper()
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+	head := make([]byte, 5)
+	if _, err := io.ReadFull(conn, head); err != nil {
+		t.Fatalf("read message: %v", err)
+	}
+	body := make([]byte, binary.BigEndian.Uint32(head[1:])-4)
+	if _, err := io.ReadFull(conn, body); err != nil {
+		t.Fatalf("read message: %v", err)
+	}
+	msg, err := pgproto3.NewFrontend(bytes.NewReader(append(head, body...)), io.Discard).Receive()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return msg
+}
+
+// expectFatal fails the test unless conn gets a FATAL error with code and is then closed.
+func expectFatal(t *testing.T, conn net.Conn, code string) {
+	t.Helper()
+	msg := receive(t, conn)
+	if e, ok := msg.(*pgproto3.ErrorResponse); !ok || e.Severity != "FATAL" || e.Code != code {
+		t.Fatalf("got %#v; want FATAL %s", msg, code)
+	}
+	expectClosed(t, conn)
 }
 
 // mustReceive waits up to 2s for the next message on ch and checks its type.

@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,6 +28,8 @@ type options struct {
 	upstream        string
 	tlsCert         string
 	tlsKey          string
+	upstreamSSL     string
+	upstreamCA      string
 	shutdownTimeout time.Duration
 }
 
@@ -36,6 +39,8 @@ func main() {
 	flag.StringVar(&opts.upstream, "upstream", "127.0.0.1:5418", "host:port of the Postgres server")
 	flag.StringVar(&opts.tlsCert, "tls-cert", "", "PEM certificate for client TLS; needs -tls-key")
 	flag.StringVar(&opts.tlsKey, "tls-key", "", "PEM private key for client TLS; needs -tls-cert")
+	flag.StringVar(&opts.upstreamSSL, "upstream-sslmode", "disable", "TLS to Postgres: disable, require or verify-full")
+	flag.StringVar(&opts.upstreamCA, "upstream-ca", "", "PEM CA certificates for verify-full; default is the system roots")
 	flag.DurationVar(&opts.shutdownTimeout, "shutdown-timeout", proxy.DefaultShutdownTimeout,
 		"how long open sessions may continue after a shutdown signal")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -58,6 +63,10 @@ func run(opts options, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	upstreamTLSConfig, err := upstreamTLS(opts.upstreamSSL, opts.upstreamCA, opts.upstream)
+	if err != nil {
+		return err
+	}
 
 	// Ctrl-C or a SIGTERM from Docker or systemd starts a clean shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -67,10 +76,11 @@ func run(opts options, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	log.Info("queryguard started", "version", version, "listen", ln.Addr(), "upstream", opts.upstream, "tls", tlsConfig != nil)
+	log.Info("queryguard started", "version", version, "listen", ln.Addr(), "upstream", opts.upstream,
+		"tls", tlsConfig != nil, "upstream_sslmode", opts.upstreamSSL)
 
 	s := &proxy.Server{
-		Upstream:        proxy.Dialer{Addr: opts.upstream},
+		Upstream:        proxy.Dialer{Addr: opts.upstream, TLSConfig: upstreamTLSConfig},
 		TLSConfig:       tlsConfig,
 		ShutdownTimeout: opts.shutdownTimeout,
 		Logger:          log,
@@ -95,4 +105,37 @@ func loadTLS(certFile, keyFile string) (*tls.Config, error) {
 		return nil, fmt.Errorf("load TLS certificate: %w", err)
 	}
 	return wire.ServerTLSConfig(cert), nil
+}
+
+// upstreamTLS returns the TLS config for connecting to Postgres; sslmode names follow libpq.
+func upstreamTLS(mode, caFile, addr string) (*tls.Config, error) {
+	if caFile != "" && mode != "verify-full" {
+		return nil, errors.New("-upstream-ca needs -upstream-sslmode=verify-full")
+	}
+	switch mode {
+	case "disable":
+		return nil, nil
+	case "require":
+		// Like libpq: encrypt, but accept any certificate.
+		return &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}, nil
+	case "verify-full":
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		cfg := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: host}
+		if caFile != "" {
+			pem, err := os.ReadFile(caFile)
+			if err != nil {
+				return nil, err
+			}
+			cfg.RootCAs = x509.NewCertPool()
+			if !cfg.RootCAs.AppendCertsFromPEM(pem) {
+				return nil, fmt.Errorf("no certificates found in %s", caFile)
+			}
+		}
+		return cfg, nil
+	default:
+		return nil, fmt.Errorf("unknown -upstream-sslmode %q: want disable, require or verify-full", mode)
+	}
 }

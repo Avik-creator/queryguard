@@ -159,10 +159,7 @@ func readPacket(conn io.ReadWriter, header []byte) ([]byte, error) {
 	}
 	body := make([]byte, length-4)
 	if _, err := io.ReadFull(conn, body); err != nil {
-		if errors.Is(err, io.EOF) {
-			return nil, io.ErrUnexpectedEOF
-		}
-		return nil, err
+		return nil, unexpected(err)
 	}
 	return body, nil
 }
