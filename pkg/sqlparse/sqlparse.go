@@ -21,6 +21,8 @@ type Query struct {
 	Schemas             []string // schemas named explicitly, sorted, without duplicates
 	UnknownSearchPath   bool     // set_config('search_path', …) with a value known only when it runs
 	Explainable         bool     // a single statement EXPLAIN can plan: SELECT, INSERT, UPDATE, DELETE, MERGE, DECLARE or CREATE TABLE AS
+	Analyzes            bool     // VACUUM or ANALYZE, which refresh the planner's statistics
+	Cursor              bool     // DECLARE, whose query runs in the FETCHes that follow
 }
 
 // notDDL lists the statement types Postgres's GetCommandLogLevel does not log as DDL; every other *Stmt is DDL.
@@ -53,6 +55,7 @@ func Analyze(sql string) (Query, error) {
 			*pg_query.Node_MergeStmt, *pg_query.Node_DeclareCursorStmt, *pg_query.Node_CreateTableAsStmt:
 			q.Explainable = true
 		}
+		_, q.Cursor = tree.Stmts[0].GetStmt().GetNode().(*pg_query.Node_DeclareCursorStmt)
 	}
 	schemas := map[string]bool{}
 	add := func(schema string) {
@@ -99,6 +102,8 @@ func Analyze(sql string) (Query, error) {
 			}
 		case *pg_query.DoStmt:
 			q.Do = true
+		case *pg_query.VacuumStmt:
+			q.Analyzes = true
 		case *pg_query.RangeVar:
 			add(n.Schemaname)
 		case *pg_query.FuncCall:
