@@ -2,11 +2,15 @@ package wire
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"io"
+	"net"
 	"testing"
+	"time"
 
+	"github.com/Avik-creator/queryguard/internal/testcert"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
@@ -27,7 +31,7 @@ func TestNegotiateReturnsStartupMessage(t *testing.T) {
 	}
 }
 
-func TestNegotiateDeclinesSSL(t *testing.T) {
+func TestNegotiateDeclinesSSLWithoutTLSConfig(t *testing.T) {
 	in := concat(encode(t, &pgproto3.SSLRequest{}), encode(t, startup(pgproto3.ProtocolVersion30, "user", "alice")))
 
 	msg, out, err := negotiate(in)
@@ -89,7 +93,7 @@ func TestNegotiateDoesNotReadPastStartup(t *testing.T) {
 	in := concat(encode(t, startup(pgproto3.ProtocolVersion30, "user", "alice")), []byte("next"))
 	r := bytes.NewReader(in)
 
-	if _, err := Negotiate(rw(r, io.Discard)); err != nil {
+	if _, _, err := Negotiate(scriptConn{r: r, w: io.Discard}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if rest, _ := io.ReadAll(r); string(rest) != "next" {
@@ -128,15 +132,116 @@ func TestNegotiateRejects(t *testing.T) {
 			if _, ok := errors.AsType[*Error](err); !ok {
 				t.Fatalf("got error %v; want *wire.Error", err)
 			}
-			msg, rerr := pgproto3.NewFrontend(bytes.NewReader(bytes.TrimPrefix(out, []byte("N"))), nil).Receive()
-			if rerr != nil {
-				t.Fatalf("client got %q, not an ErrorResponse: %v", out, rerr)
-			}
-			got := mustBe[*pgproto3.ErrorResponse](t, msg)
-			if got.Severity != "FATAL" || got.Code != tt.wantCode {
-				t.Errorf("got %s %s %q; want FATAL %s", got.Severity, got.Code, got.Message, tt.wantCode)
-			}
+			expectFatal(t, bytes.NewReader(bytes.TrimPrefix(out, []byte("N"))), tt.wantCode)
 		})
+	}
+}
+
+func TestNegotiateUpgradesSSLRequestToTLS(t *testing.T) {
+	cert, clientTLS := testcert.Pair(t)
+	client, done := negotiateTCP(t, ServerTLSConfig(cert))
+
+	write(t, client, encode(t, &pgproto3.SSLRequest{}))
+	expectReply(t, client, 'S')
+	tc := tls.Client(client, clientTLS)
+	write(t, tc, encode(t, startup(pgproto3.ProtocolVersion30, "user", "alice")))
+
+	r := wait(t, done)
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if _, ok := r.conn.(*tls.Conn); !ok {
+		t.Errorf("got %T back; want *tls.Conn", r.conn)
+	}
+	mustBe[*pgproto3.StartupMessage](t, r.msg)
+}
+
+func TestNegotiateAcceptsDirectTLS(t *testing.T) {
+	cert, clientTLS := testcert.Pair(t)
+	client, done := negotiateTCP(t, ServerTLSConfig(cert))
+
+	clientTLS.NextProtos = []string{"postgresql"}
+	tc := tls.Client(client, clientTLS)
+	write(t, tc, encode(t, startup(pgproto3.ProtocolVersion30, "user", "alice")))
+
+	r := wait(t, done)
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if _, ok := r.conn.(*tls.Conn); !ok {
+		t.Errorf("got %T back; want *tls.Conn", r.conn)
+	}
+	mustBe[*pgproto3.StartupMessage](t, r.msg)
+}
+
+func TestNegotiateRejectsDirectTLSWithoutALPN(t *testing.T) {
+	cert, clientTLS := testcert.Pair(t)
+	client, done := negotiateTCP(t, ServerTLSConfig(cert))
+
+	tc := tls.Client(client, clientTLS)
+	write(t, tc, encode(t, startup(pgproto3.ProtocolVersion30, "user", "alice")))
+
+	r := wait(t, done)
+	if e, ok := errors.AsType[*Error](r.err); !ok || e.Code != "08P01" {
+		t.Fatalf("got %v; want *wire.Error 08P01", r.err)
+	}
+	tc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	expectFatal(t, tc, "08P01")
+}
+
+func TestNegotiateClosesDirectTLSWithoutTLSConfig(t *testing.T) {
+	_, clientTLS := testcert.Pair(t)
+	client, done := negotiateTCP(t, nil)
+
+	clientTLS.NextProtos = []string{"postgresql"}
+	go tls.Client(client, clientTLS).Handshake()
+
+	if r := wait(t, done); r.err == nil || r.msg != nil {
+		t.Fatalf("got message %v, error %v; want an error", r.msg, r.err)
+	}
+}
+
+func TestNegotiateRejectsPlaintextSentBeforeTLSHandshake(t *testing.T) {
+	cert, _ := testcert.Pair(t)
+	client, done := negotiateTCP(t, ServerTLSConfig(cert))
+
+	// An attacker in the middle could inject plaintext here; it must never be read as the startup message.
+	write(t, client, concat(encode(t, &pgproto3.SSLRequest{}), encode(t, startup(pgproto3.ProtocolVersion30, "user", "mallory"))))
+
+	if r := wait(t, done); r.err == nil || r.msg != nil {
+		t.Fatalf("got message %v, error %v; want the TLS handshake to fail", r.msg, r.err)
+	}
+}
+
+func TestNegotiateRejectsSSLRequestInsideTLS(t *testing.T) {
+	cert, clientTLS := testcert.Pair(t)
+	client, done := negotiateTCP(t, ServerTLSConfig(cert))
+
+	write(t, client, encode(t, &pgproto3.SSLRequest{}))
+	expectReply(t, client, 'S')
+	tc := tls.Client(client, clientTLS)
+	write(t, tc, encode(t, &pgproto3.SSLRequest{}))
+
+	if e, ok := errors.AsType[*Error](wait(t, done).err); !ok || e.Code != "08P01" {
+		t.Fatalf("got %v; want *wire.Error 08P01", e)
+	}
+}
+
+func TestNegotiateReturnsCancelRequestOverTLS(t *testing.T) {
+	cert, clientTLS := testcert.Pair(t)
+	client, done := negotiateTCP(t, ServerTLSConfig(cert))
+
+	write(t, client, encode(t, &pgproto3.SSLRequest{}))
+	expectReply(t, client, 'S')
+	tc := tls.Client(client, clientTLS)
+	write(t, tc, encode(t, &pgproto3.CancelRequest{ProcessID: 42, SecretKey: []byte{1, 2, 3, 4}}))
+
+	r := wait(t, done)
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if got := mustBe[*pgproto3.CancelRequest](t, r.msg); got.ProcessID != 42 {
+		t.Errorf("got process %d; want 42", got.ProcessID)
 	}
 }
 
@@ -153,18 +258,105 @@ func FuzzNegotiate(f *testing.F) {
 	})
 }
 
-// negotiate runs Negotiate on scripted client bytes and returns what it wrote back.
+// negotiate runs Negotiate without TLS on scripted client bytes and returns what it wrote back.
 func negotiate(in []byte) (pgproto3.FrontendMessage, []byte, error) {
 	var out bytes.Buffer
-	msg, err := Negotiate(rw(bytes.NewReader(in), &out))
+	_, msg, err := Negotiate(scriptConn{r: bytes.NewReader(in), w: &out}, nil)
 	return msg, out.Bytes(), err
 }
 
-func rw(r io.Reader, w io.Writer) io.ReadWriter {
-	return struct {
-		io.Reader
-		io.Writer
-	}{r, w}
+// scriptConn is a net.Conn that reads scripted client bytes and records replies; only Read and Write work.
+type scriptConn struct {
+	net.Conn
+	r io.Reader
+	w io.Writer
+}
+
+func (c scriptConn) Read(p []byte) (int, error)  { return c.r.Read(p) }
+func (c scriptConn) Write(p []byte) (int, error) { return c.w.Write(p) }
+
+type result struct {
+	conn net.Conn
+	msg  pgproto3.FrontendMessage
+	err  error
+}
+
+// negotiateTCP runs Negotiate on the server end of a loopback TCP connection and returns the client end.
+func negotiateTCP(t *testing.T, cfg *tls.Config) (net.Conn, <-chan result) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		client.Close()
+		server.Close()
+	})
+	server.SetDeadline(time.Now().Add(2 * time.Second))
+
+	done := make(chan result, 1)
+	go func() {
+		conn, msg, err := Negotiate(server, cfg)
+		if err != nil {
+			server.Close()
+		}
+		done <- result{conn, msg, err}
+	}()
+	return client, done
+}
+
+func wait(t *testing.T, done <-chan result) result {
+	t.Helper()
+	select {
+	case r := <-done:
+		return r
+	case <-time.After(3 * time.Second):
+		t.Fatal("Negotiate did not return within 3s")
+		return result{}
+	}
+}
+
+func write(t *testing.T, w io.Writer, b []byte) {
+	t.Helper()
+	if _, err := w.Write(b); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+}
+
+// expectReply reads one byte from conn and checks it is want.
+func expectReply(t *testing.T, conn net.Conn, want byte) {
+	t.Helper()
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var b [1]byte
+	if _, err := io.ReadFull(conn, b[:]); err != nil {
+		t.Fatalf("read reply: %v", err)
+	}
+	conn.SetReadDeadline(time.Time{})
+	if b[0] != want {
+		t.Fatalf("got reply %q; want %q", b[0], want)
+	}
+}
+
+// expectFatal reads an ErrorResponse from r and checks it is FATAL with the given SQLSTATE.
+func expectFatal(t *testing.T, r io.Reader, code string) {
+	t.Helper()
+	msg, err := pgproto3.NewFrontend(r, nil).Receive()
+	if err != nil {
+		t.Fatalf("want an ErrorResponse: %v", err)
+	}
+	got := mustBe[*pgproto3.ErrorResponse](t, msg)
+	if got.Severity != "FATAL" || got.Code != code {
+		t.Errorf("got %s %s %q; want FATAL %s", got.Severity, got.Code, got.Message, code)
+	}
 }
 
 // startup builds a StartupMessage from a version and name/value pairs.

@@ -13,3 +13,6 @@ coverage.html
 .idea/
 .vscode/
 .DS_Store
+
+# Local TLS certificates from make certs
+/certs/

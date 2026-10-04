@@ -2,10 +2,12 @@
 package wire
 
 import (
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -23,6 +25,12 @@ const (
 	maxPacketLen = 10_000
 )
 
+// tlsHandshakeByte starts every TLS connection; a startup packet's first byte is always 0.
+const tlsHandshakeByte = 0x16
+
+// alpnProtocol is the ALPN name Postgres requires for direct TLS (PG17+).
+const alpnProtocol = "postgresql"
+
 // Error is a startup failure that has already been reported to the client.
 type Error struct {
 	Code    string // SQLSTATE
@@ -31,44 +39,91 @@ type Error struct {
 
 func (e *Error) Error() string { return fmt.Sprintf("%s (SQLSTATE %s)", e.Message, e.Code) }
 
-// Negotiate declines SSL and GSS encryption and returns the client's StartupMessage or CancelRequest.
-func Negotiate(conn io.ReadWriter) (pgproto3.FrontendMessage, error) {
+// ServerTLSConfig returns a config for accepting client TLS with cert, including the ALPN direct TLS needs.
+func ServerTLSConfig(cert tls.Certificate) *tls.Config {
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{alpnProtocol},
+	}
+}
+
+// Negotiate runs the startup handshake and returns the connection to use from now on and the client's StartupMessage or CancelRequest.
+func Negotiate(conn net.Conn, tlsConfig *tls.Config) (net.Conn, pgproto3.FrontendMessage, error) {
+	var first [1]byte
+	if _, err := io.ReadFull(conn, first[:]); err != nil {
+		return nil, nil, err
+	}
+	if first[0] == tlsHandshakeByte {
+		return directTLS(conn, first[0], tlsConfig)
+	}
+	return readStartup(conn, first[:], tlsConfig, false)
+}
+
+// directTLS completes a TLS handshake the client started without an SSLRequest.
+func directTLS(conn net.Conn, first byte, tlsConfig *tls.Config) (net.Conn, pgproto3.FrontendMessage, error) {
+	if tlsConfig == nil {
+		return nil, nil, errors.New("client started TLS but TLS is not configured")
+	}
+	tlsConn := tls.Server(&prefixConn{Conn: conn, prefix: []byte{first}}, tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, nil, err
+	}
+	if tlsConn.ConnectionState().NegotiatedProtocol != alpnProtocol {
+		return nil, nil, fail(tlsConn, "08P01", "received direct SSL connection request without ALPN protocol negotiation extension")
+	}
+	return readStartup(tlsConn, nil, tlsConfig, true)
+}
+
+// readStartup reads startup packets until a StartupMessage or CancelRequest; header holds bytes of the first packet already read.
+func readStartup(conn net.Conn, header []byte, tlsConfig *tls.Config, encrypted bool) (net.Conn, pgproto3.FrontendMessage, error) {
 	var sawSSL, sawGSS bool
 	for {
-		body, err := readPacket(conn)
+		body, err := readPacket(conn, header)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		header = nil
 		code := binary.BigEndian.Uint32(body)
 
 		switch {
-		case code == sslRequestCode && !sawSSL:
+		case code == sslRequestCode && !encrypted && !sawSSL && tlsConfig != nil:
+			if _, err := conn.Write([]byte{'S'}); err != nil {
+				return nil, nil, err
+			}
+			// Nothing past the SSLRequest has been read, so injected plaintext can't survive into the TLS session.
+			tlsConn := tls.Server(conn, tlsConfig)
+			if err := tlsConn.Handshake(); err != nil {
+				return nil, nil, err
+			}
+			conn, encrypted = tlsConn, true
+		case code == sslRequestCode && !encrypted && !sawSSL:
 			sawSSL = true
 			if _, err := conn.Write([]byte{'N'}); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-		case code == gssEncRequestCode && !sawGSS:
+		case code == gssEncRequestCode && !encrypted && !sawGSS:
 			sawGSS = true
 			if _, err := conn.Write([]byte{'N'}); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		case code == sslRequestCode || code == gssEncRequestCode:
-			return nil, fail(conn, "08P01", "duplicate encryption request")
+			return nil, nil, fail(conn, "08P01", "duplicate encryption request")
 		case code == cancelRequestCode:
 			var req pgproto3.CancelRequest
 			if err := req.Decode(body); err != nil {
-				return nil, fail(conn, "08P01", "invalid cancel request: "+err.Error())
+				return nil, nil, fail(conn, "08P01", "invalid cancel request: "+err.Error())
 			}
-			return &req, nil
+			return conn, &req, nil
 		case code>>16 == 3:
 			// Not returned directly: a nil *StartupMessage would make a non-nil interface.
 			msg, err := decodeStartup(conn, code, body)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			return msg, nil
+			return conn, msg, nil
 		default:
-			return nil, fail(conn, "0A000", fmt.Sprintf("unsupported frontend protocol %d.%d: queryguard supports 3.x", code>>16, code&0xffff))
+			return nil, nil, fail(conn, "0A000", fmt.Sprintf("unsupported frontend protocol %d.%d: queryguard supports 3.x", code>>16, code&0xffff))
 		}
 	}
 }
@@ -88,17 +143,21 @@ func decodeStartup(conn io.Writer, version uint32, body []byte) (*pgproto3.Start
 	return &msg, nil
 }
 
-// readPacket reads exactly one length-prefixed startup packet and returns it without the length word.
-func readPacket(conn io.ReadWriter) ([]byte, error) {
-	var header [4]byte
-	if _, err := io.ReadFull(conn, header[:]); err != nil {
+// readPacket reads exactly one startup packet, after the header bytes already read, and returns it without the length word.
+func readPacket(conn io.ReadWriter, header []byte) ([]byte, error) {
+	var buf [4]byte
+	n := copy(buf[:], header)
+	if _, err := io.ReadFull(conn, buf[n:]); err != nil {
+		if n > 0 && errors.Is(err, io.EOF) {
+			return nil, io.ErrUnexpectedEOF
+		}
 		return nil, err
 	}
-	n := int32(binary.BigEndian.Uint32(header[:]))
-	if n < minPacketLen || n > maxPacketLen {
+	length := int32(binary.BigEndian.Uint32(buf[:]))
+	if length < minPacketLen || length > maxPacketLen {
 		return nil, fail(conn, "08P01", "invalid length of startup packet")
 	}
-	body := make([]byte, n-4)
+	body := make([]byte, length-4)
 	if _, err := io.ReadFull(conn, body); err != nil {
 		if errors.Is(err, io.EOF) {
 			return nil, io.ErrUnexpectedEOF
@@ -106,6 +165,21 @@ func readPacket(conn io.ReadWriter) ([]byte, error) {
 		return nil, err
 	}
 	return body, nil
+}
+
+// prefixConn replays bytes already read from Conn before reading more.
+type prefixConn struct {
+	net.Conn
+	prefix []byte
+}
+
+func (c *prefixConn) Read(p []byte) (int, error) {
+	if len(c.prefix) > 0 {
+		n := copy(p, c.prefix)
+		c.prefix = c.prefix[n:]
+		return n, nil
+	}
+	return c.Conn.Read(p)
 }
 
 // fail sends a FATAL error to the client and returns it as an *Error.

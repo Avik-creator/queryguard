@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Avik-creator/queryguard/internal/testcert"
 	"github.com/Avik-creator/queryguard/pkg/wire"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -48,6 +50,42 @@ func TestForwardsCancelRequest(t *testing.T) {
 		t.Errorf("upstream got %+v; want process 42 and the same key", got)
 	}
 	expectClosed(t, conn)
+}
+
+func TestRelaysOverDirectTLS(t *testing.T) {
+	cert, clientTLS := testcert.Pair(t)
+	s := newServer(t, startFakePostgres(t).addr)
+	s.TLSConfig = wire.ServerTLSConfig(cert)
+	addr, _ := startProxy(t, s)
+
+	clientTLS.NextProtos = []string{"postgresql"}
+	conn := tls.Client(dial(t, addr), clientTLS)
+	send(t, conn, &pgproto3.StartupMessage{
+		ProtocolVersion: pgproto3.ProtocolVersion30,
+		Parameters:      map[string]string{"user": "alice"},
+	})
+
+	roundTrip(t, conn, "hello over TLS")
+}
+
+func TestForwardsCancelRequestOverTLS(t *testing.T) {
+	cert, clientTLS := testcert.Pair(t)
+	pg := startFakePostgres(t)
+	s := newServer(t, pg.addr)
+	s.TLSConfig = wire.ServerTLSConfig(cert)
+	addr, _ := startProxy(t, s)
+
+	raw := dial(t, addr)
+	send(t, raw, &pgproto3.SSLRequest{})
+	reply := make([]byte, 1)
+	if _, err := io.ReadFull(raw, reply); err != nil || reply[0] != 'S' {
+		t.Fatalf("got %q, %v; want 'S'", reply, err)
+	}
+	send(t, tls.Client(raw, clientTLS), &pgproto3.CancelRequest{ProcessID: 42, SecretKey: []byte{1, 2, 3, 4}})
+
+	if got := mustReceive[*pgproto3.CancelRequest](t, pg.received); got.ProcessID != 42 {
+		t.Errorf("upstream got process %d; want 42", got.ProcessID)
+	}
 }
 
 func TestSendsFatalErrorWhenUpstreamUnreachable(t *testing.T) {
@@ -192,7 +230,7 @@ func startFakePostgres(t *testing.T) *fakePostgres {
 			}
 			go func() {
 				defer conn.Close()
-				msg, err := wire.Negotiate(conn)
+				_, msg, err := wire.Negotiate(conn, nil)
 				if err != nil {
 					return
 				}

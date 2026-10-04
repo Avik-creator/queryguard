@@ -4,6 +4,7 @@ package proxy
 import (
 	"cmp"
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"log/slog"
@@ -24,6 +25,7 @@ const (
 // Server relays client connections to Upstream, one server connection per client.
 type Server struct {
 	Upstream        Upstream
+	TLSConfig       *tls.Config   // nil means clients are told TLS is unavailable
 	StartupTimeout  time.Duration // how long a new client has to send its startup message
 	ShutdownTimeout time.Duration // how long sessions may drain after Serve stops
 	Logger          *slog.Logger  // nil means slog.Default()
@@ -79,8 +81,9 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 	stop := context.AfterFunc(ctx, func() { client.Close() })
 	defer stop()
 
+	// The deadline covers the TLS handshake too, since the TLS connection reads through client.
 	client.SetDeadline(time.Now().Add(cmp.Or(s.StartupTimeout, DefaultStartupTimeout)))
-	msg, err := wire.Negotiate(client)
+	conn, msg, err := wire.Negotiate(client, s.TLSConfig)
 	if err != nil {
 		// A client that connects and leaves without a word, like a TCP health check, is not an error.
 		if !errors.Is(err, io.EOF) {
@@ -96,7 +99,7 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 			log.Warn("forward cancel request", "client", client.RemoteAddr(), "err", err)
 		}
 	case *pgproto3.StartupMessage:
-		s.relay(ctx, log, client, msg)
+		s.relay(ctx, log, conn, msg)
 	}
 }
 
