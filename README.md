@@ -5,17 +5,14 @@ speaks the Postgres wire protocol. It estimates what each query will cost before
 it runs and gives every tenant a budget, so one tenant's expensive queries can't
 starve everyone else.
 
-> **Status:** early development. Milestones M1 to M4 are done: QueryGuard
+> **Status:** early development. Milestones M1 to M5 are done: QueryGuard
 > relays sessions, cancel requests and TLS; blocks statements by rule or by
-> their planned cost; and gives each tenant a cost budget, a fair share of
-> the server and time limits. Costs are the planner's own estimates for now.
+> their planned cost; gives each tenant a cost budget, a fair share of the
+> server and time limits; and learns from how long statements take, to
+> correct their costs and to catch plans that suddenly get worse.
 
 ## Planned features
 
-- Costs corrected over time by comparing the planner's estimates with how
-  long queries actually took.
-- Plan flips, such as an index scan turning into a full read, detected and
-  sent to the slow lane.
 - The number of statements running at once adjusted to the server's
   latency and lock waits.
 - Prometheus metrics and a log of every decision.
@@ -192,7 +189,9 @@ its own yet.
 `max_scan_rows` reads table sizes (`pg_class.reltuples`) over QueryGuard's own
 connection to each database, refreshed every minute. Any role can read
 `pg_class`; pass the connection string with `-catalog-dsn`, and the password
-in `PGPASSWORD` or a `.pgpass` file:
+in `PGPASSWORD` or a `.pgpass` file. The same connection reads how much of
+each table changed since it was last analyzed, for
+[stale statistics](#stale-statistics):
 
 ```sh
 PGPASSWORD=… ./bin/queryguard -config queryguard.json \
@@ -231,7 +230,8 @@ ignored and logged.
 
 Each tenant has a bucket of planner cost units that fills at `rate` units a
 second, up to `burst`. A statement may start while its tenant owes nothing;
-its planned cost, at least `min_charge`, is then taken from the bucket, which
+its cost, [calibrated](#calibrated-costs) and at least `min_charge`, is then
+taken from the bucket, which
 can go below zero, so one large statement isn't starved and the long-run rate
 still holds. Once a tenant owes units, what happens to its next statement
 depends on `when_over`:
@@ -277,6 +277,79 @@ valid is logged and ignored, and the one in force stays. A valid one applies
 to new and open sessions alike, and tenants keep what they owe and their
 recent use.
 
+## Learning from how statements run
+
+QueryGuard times every statement it explains, from when the statement goes to
+PostgreSQL until PostgreSQL has answered it, and remembers each statement's
+plans by database, role and fingerprint. It explains statements when there
+are cost rules, budgets or slots. What it learns is kept in memory, so it
+starts again when QueryGuard restarts.
+
+### Calibrated costs
+
+The planner's cost units don't map to the same time for every plan: a
+statement whose rows are spread over the disk, or that waits on locks, takes
+longer per unit than one reading cached pages in order. For each plan,
+QueryGuard averages the time per cost unit over its last 50 or so runs of
+5 ms or more, and charges budgets the planned cost times that plan's time per
+unit over the server's. The server's is averaged over all such runs, in log
+terms and weighted by cost, so a cheap statement that waited long on a lock
+barely moves it. A quicker run is mostly the round trip and the work every
+statement does, and would make long plans look cheap next to it;
+`min_charge` covers it instead. A plan seen only a
+few times leans on the server's average instead: its own timing counts for
+n / (n + `credibility`) after n runs, as in Bühlmann's credibility formula.
+The factor stays between 1/100 and 100, and `max_cost` still judges the
+planner's own cost, the number `EXPLAIN` shows.
+
+```json
+{"calibration": {"mode": "on", "credibility": 10}}
+```
+
+`"mode": "off"` charges the planner's cost. The time measured includes the
+network round trip and the time the client takes to read the rows. Statements
+that share a `Sync`, as in a pipeline or a batch, aren't timed, because
+PostgreSQL sends their answers together at the `Sync`. Nor is `DECLARE`, since
+its query runs in the `FETCH`es that follow.
+
+### Plan flips
+
+A plan flip is a statement's plan suddenly getting worse, and QueryGuard
+catches two kinds:
+
+- A plan that reads a table in full where the statement's usual plan reads
+  it through an index, as after an index is dropped. The usual plan is the
+  one with the most recent runs, among plans run at least 5 times. A plan
+  that has run 5 times while the usual one kept running too is the plan for
+  other values, as a common value in skewed data gets, and isn't a flip.
+- A run more than 10 times slower than the plan usually takes, and at least
+  100 ms, since under load a quick statement now and then takes tens of
+  milliseconds. This is how a switch to a generic plan shows: QueryGuard explains a
+  prepared statement with its bound values, so its `EXPLAIN` shows the plan
+  for those values, not the generic plan PostgreSQL may run instead.
+
+A flipped statement runs in the slow lane, and the flip is logged once
+(`msg="plan flip"`). Each plan's past runs fade with `quarantine` as their
+half-life, so a new plan that stays in use becomes the usual one after about
+that long. After a slow run, the statement is explained again rather than
+taken from the plan cache, and DDL, `VACUUM` and `ANALYZE` sent through
+QueryGuard clear the database's cached plans once they are committed, so a
+dropped index shows before the statement next runs.
+
+```json
+{"plan_flips": {"mode": "enforce", "quarantine": "10m"}}
+```
+
+`"mode": "warn"` only logs flips; so does a config without a scheduler,
+which has no slow lane.
+
+### Stale statistics
+
+With `-catalog-dsn`, a flip's log line also names the tables the plan reads
+whose statistics are stale, with the hint to run `ANALYZE`. A table is stale
+when more than 50 rows plus 20% of it changed since it was last analyzed
+(`n_mod_since_analyze`), twice what makes autovacuum analyze it by default.
+
 ## Connection caps
 
 `max_connections` caps all sessions through QueryGuard, `tenant_max_connections`
@@ -306,8 +379,8 @@ PostgreSQL normally keeps running a query after its client has gone, until
 the query next reads or writes the socket. QueryGuard sends a CancelRequest
 for the statement as soon as the client's connection closes, and also sends
 `client_connection_check_interval=2000` with each new session, so the query
-stops within about 2 seconds even if the proxy itself goes away. A value the client sets, directly or in
-`options`, is kept. Change it with `-client-check-interval`; `0` leaves the
+stops within about 2 seconds even if the proxy itself goes away. A value the
+client sets, directly or in `options`, is kept. Change it with `-client-check-interval`; `0` leaves the
 server's setting alone, and is needed on platforms where PostgreSQL rejects a
 non-zero value.
 
@@ -319,7 +392,7 @@ all three versions:
 
 | Client | Checked |
 | --- | --- |
-| pgx 5.11 | plaintext, TLS, direct TLS, protocol 3.2, prepared statements, COPY, cancel on 3.0, 3.2 and 3.2 over TLS, keepalive settings; rejections in all three query modes, in a transaction and in a pipeline; warn mode; connection cap; cost rules in all three query modes and in a transaction, errors from `EXPLAIN`, the plan cache, table sizes; budgets that reject and that queue, busy slots, statement and idle-in-transaction timeouts, cancel on disconnect, tenant tags |
+| pgx 5.11 | plaintext, TLS, direct TLS, protocol 3.2, prepared statements, COPY, cancel on 3.0, 3.2 and 3.2 over TLS, keepalive settings; rejections in all three query modes, in a transaction and in a pipeline; warn mode; connection cap; cost rules in all three query modes and in a transaction, errors from `EXPLAIN`, the plan cache, table sizes; budgets that reject and that queue, busy slots, statement and idle-in-transaction timeouts, cancel on disconnect, tenant tags; plan flips from a dropped index and from a forced generic plan, stale statistics |
 | psql 18 | plaintext, TLS, direct TLS, protocol 3.2, Ctrl-C; rejection, in a transaction; costly statement |
 | node-postgres 8 | plaintext, TLS, parameters, cancel; rejection, in a transaction; costly statement, with and without parameters |
 | psycopg 3.3 (libpq 18) | plaintext, TLS, direct TLS, protocol 3.2, parameters, cancel, cancel over TLS; rejection, in a transaction and in a pipeline; costly statement, prepared and not |
@@ -373,17 +446,19 @@ about 169,000), with 8 slots shared fairly. Apple M1, PostgreSQL 18 in Docker:
 
 | Scenario | Innocent p50 | Innocent p99 | Rogue statements run |
 | --- | --- | --- | --- |
-| No rogue, straight to PostgreSQL | 0.26 ms | 0.50 ms | |
-| No rogue, through QueryGuard | 0.36 ms | 0.73 ms | |
-| Rogue, straight to PostgreSQL | 0.42 ms | 4.14 ms | 51 |
-| Rogue, QueryGuard, a role per tenant | 0.39 ms | 1.09 ms | 6 (14,160 refused) |
-| Rogue, QueryGuard, one shared role and tags | 0.40 ms | 1.03 ms | 6 (14,045 refused) |
+| No rogue, straight to PostgreSQL | 0.27 ms | 0.57 ms | |
+| No rogue, through QueryGuard | 0.35 ms | 0.74 ms | |
+| Rogue, straight to PostgreSQL | 0.44 ms | 4.18 ms | 52 |
+| Rogue, QueryGuard, a role per tenant | 0.40 ms | 1.10 ms | 6 (14,044 refused) |
+| Rogue, QueryGuard, one shared role and tags | 0.42 ms | 1.06 ms | 6 (13,994 refused) |
 
-Without QueryGuard the rogue raises innocent p99 more than eightfold. Through
+Without QueryGuard the rogue raises innocent p99 more than sevenfold. Through
 it, innocent p99 stays within 1.5 times the same path's baseline, the target
 the test checks, and the rogue runs exactly what its budget allows: 200,000
-units of burst plus 15 seconds at 50,000 pay for six full reads. These are
-laptop numbers; the full benchmark comes with v1.0.
+units of burst plus 15 seconds at 50,000 pay for six full reads. Its full
+reads are nearly the only runs long enough to calibrate costs by, so their factor
+stays 1, and no innocent lookup was taken for a plan flip. These are laptop
+numbers; the full benchmark comes with v1.0.
 
 ## License
 
