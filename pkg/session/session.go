@@ -59,6 +59,11 @@ type Admission struct {
 	Release           func()                  // frees the slot it took, once the server is idle; nil when it took none
 	Timeout           time.Duration           // how long it may run before the proxy cancels it; 0 means no limit
 	IdleInTransaction time.Duration           // how long the session may then sit idle in a transaction; 0 means no limit
+	// Ran is called once Postgres has answered the statement, with how long it took and whether it ended without an error; nil skips it.
+	// took is 0 when another statement shares its Sync, since Postgres holds a pipeline's answers until then.
+	Ran func(took time.Duration, finished bool)
+	// Settled is called once the session is next idle outside a transaction, so what the statement did is committed or undone.
+	Settled func()
 }
 
 // Explain gets the plan of the statement about to run.
@@ -155,6 +160,8 @@ func Relay(client, server net.Conn, opts Options) error {
 	defer s.mu.Unlock()
 	s.stopTimers()
 	s.freeSlot()
+	// Postgres rolls back what the session left open, so it has settled too.
+	s.settle()
 	return first
 }
 
@@ -186,17 +193,24 @@ type session struct {
 	idleTimer  *time.Timer   // ends the session idle in a transaction too long
 	idleGen    int           // bumped by each client message, so an idle timer firing late does nothing
 	timedOut   bool          // the proxy cancelled for a timeout, so Postgres's cancel error says so
+	settled    []func()      // from admissions, called once the session is idle outside a transaction
 
 	// Only fromClient uses these.
-	inBatch    bool                 // extended-protocol messages went to the server since the last Sync
-	discard    untilSync            // what to do with client messages after a rejected Parse
-	statements map[string]statement // prepared statements with a cost check, by name
+	inBatch    bool                      // extended-protocol messages went to the server since the last Sync
+	discard    untilSync                 // what to do with client messages after a rejected Parse
+	statements map[string]statement      // prepared statements with a cost check, by name
+	ran        func(time.Duration, bool) // from the last admission, for the message that runs its statement
+	ranOn      byte                      // that message: Q for a simple query, E for a bound statement
+	ranPortal  string                    // the portal an E must name to run it
 }
 
 // sent is a message the server will answer.
 type sent struct {
-	typ byte
-	how answer
+	typ    byte
+	how    answer
+	ran    func(time.Duration, bool) // reports how the statement it runs went, if anyone asked
+	start  time.Time                 // when it went to the server, if ran is set and nothing ran ahead of it
+	failed bool                      // Postgres answered with an error
 }
 
 // answer says where the server's answers to a message go.
@@ -263,6 +277,8 @@ func (s *session) fromClient() error {
 			err = s.checkStatement(typ, n)
 		case typ == 'B' && len(s.statements) > 0:
 			err = s.checkBind(n)
+		case typ == 'E' && s.ran != nil:
+			err = s.execute(n)
 		case typ == 'C' && len(s.statements) > 0:
 			err = s.closeStatement(n)
 		default:
@@ -372,7 +388,7 @@ func (s *session) checkQueryCost(sql string, gate Gate) (handled bool, err error
 		return false, nil
 	}
 	var refused *pgproto3.ErrorResponse
-	rej := s.admit(gate, Explain{Run: func() (string, error) {
+	rej := s.admit(gate, 'Q', Explain{Run: func() (string, error) {
 		var out string
 		out, refused, err = s.explain(len(explainPrefix), &pgproto3.Query{String: explainPrefix + sql})
 		return out, err
@@ -395,16 +411,17 @@ func (s *session) checkBind(n int) error {
 	if err != nil {
 		return unexpected(err)
 	}
-	_, rest, ok := bytes.Cut(head, []byte{0})
+	portal, rest, ok := bytes.Cut(head, []byte{0})
 	name, rest, ok2 := bytes.Cut(rest, []byte{0})
 	st, found := s.statements[string(name)]
 	// EXPLAIN reads the text again, which only reads the same as at Parse under the same settings.
 	if !ok || !ok2 || !found || s.failedTransaction() {
 		return s.forward('B', n)
 	}
+	s.ranPortal = string(portal)
 	if !st.plain && (st.set == Settings{} || s.settings().reading() != st.set) {
 		// The statement still takes its slot and budget, judged without a plan.
-		if rej := s.admit(st.gate, Explain{}); rej != nil {
+		if rej := s.admit(st.gate, 'E', Explain{}); rej != nil {
 			if _, err := s.clientIn.Discard(n); err != nil {
 				return unexpected(err)
 			}
@@ -436,7 +453,7 @@ func (s *session) checkBind(n int) error {
 	}
 
 	var refused *pgproto3.ErrorResponse
-	rej := s.admit(st.gate, Explain{Generic: prefix == genericPrefix, Run: func() (string, error) {
+	rej := s.admit(st.gate, 'E', Explain{Generic: prefix == genericPrefix, Run: func() (string, error) {
 		var out string
 		out, refused, err = s.explain(len(prefix),
 			&pgproto3.Close{ObjectType: 'S', Name: explainName},
@@ -470,8 +487,24 @@ func (s *session) checkBind(n int) error {
 	return s.send('B', body)
 }
 
-// admit passes gate for a statement about to be sent, keeps the slot and limits it gives, and returns the error to send instead.
-func (s *session) admit(gate Gate, e Explain) *pgproto3.ErrorResponse {
+// execute forwards an Execute, which runs the admitted statement only if it names that statement's portal.
+func (s *session) execute(n int) error {
+	head, err := s.clientIn.Peek(min(n, bufSize))
+	if err != nil {
+		return unexpected(err)
+	}
+	if portal, _, _ := bytes.Cut(head, []byte{0}); string(portal) != s.ranPortal {
+		// Another portal runs first; the admitted statement's Execute is still to come.
+		ran := s.ran
+		s.ran = nil
+		defer func() { s.ran = ran }()
+	}
+	return s.forward('E', n)
+}
+
+// admit passes gate for a statement about to run with message on, keeps the slot and limits it gives, and returns the error to send instead.
+func (s *session) admit(gate Gate, on byte, e Explain) *pgproto3.ErrorResponse {
+	s.ran = nil
 	s.mu.Lock()
 	running := s.slot != nil
 	s.admitting = true
@@ -495,6 +528,10 @@ func (s *session) admit(gate Gate, e Explain) *pgproto3.ErrorResponse {
 		return a.Reject
 	}
 	s.timeout, s.idleLimit = a.Timeout, a.IdleInTransaction
+	s.ran, s.ranOn = a.Ran, on
+	if a.Settled != nil {
+		s.settled = append(s.settled, a.Settled)
+	}
 	if a.Timeout > 0 {
 		if s.stmtTimer == nil {
 			s.stmtTimer = time.AfterFunc(a.Timeout, s.statementTimedOut)
@@ -581,6 +618,9 @@ func (s *session) becameIdle() {
 		return
 	}
 	s.freeSlot()
+	if s.status == 'I' {
+		s.settle()
+	}
 	if (s.status == 'T' || s.status == 'E') && s.idleLimit > 0 {
 		gen := s.idleGen
 		s.idleTimer = time.AfterFunc(s.idleLimit, func() { s.idleTimedOut(gen) })
@@ -601,6 +641,14 @@ func (s *session) idleTimedOut(gen int) {
 	}
 	s.mu.Unlock()
 	s.stop(ErrIdleInTransaction)
+}
+
+// settle calls what waits for the session to be outside a transaction; the caller holds mu.
+func (s *session) settle() {
+	for _, f := range s.settled {
+		f()
+	}
+	s.settled = nil
 }
 
 // freeSlot frees the slot the session holds, if any; the caller holds mu.
@@ -804,6 +852,14 @@ func (s *session) track(typ byte, how answer) {
 		// Flush, Terminate, copy data and password messages get no answer of their own.
 		return
 	}
+	m := sent{typ: typ, how: how}
+	if typ == s.ranOn && how == relayed {
+		m.ran = s.ran
+	}
+	if typ == s.ranOn || typ == 'S' {
+		// A statement bound but never executed before Sync reports nothing.
+		s.ran = nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if typ == 'S' {
@@ -811,7 +867,11 @@ func (s *session) track(typ byte, how answer) {
 	} else if s.skipping {
 		return
 	}
-	s.pending = append(s.pending, sent{typ: typ, how: how})
+	// Postgres sends a pipeline's answers together at Sync, so a statement behind another running one can't be timed on its own.
+	if m.ran != nil && !slices.ContainsFunc(s.pending, func(p sent) bool { return p.typ == 'Q' || p.typ == 'E' }) {
+		m.start = time.Now()
+	}
+	s.pending = append(s.pending, m)
 }
 
 // fromServer relays server messages to the client, dropping answers to the proxy's own hidden messages.
@@ -937,9 +997,20 @@ func (s *session) answered(typ byte) answer {
 	}
 	head := s.pending[0]
 	if !finishes(head.typ, typ) {
+		// A simple query's error comes before its ReadyForQuery.
+		s.pending[0].failed = s.pending[0].failed || typ == 'E'
 		return head.how
 	}
 	s.pending = s.pending[1:]
+	// A suspended portal or an empty query ran nothing that says how its plan does.
+	if head.ran != nil && typ != 's' && typ != 'I' {
+		var took time.Duration
+		// A pipeline's answers all arrive at its Sync, so a statement sharing one has no time of its own.
+		if !head.start.IsZero() && !(head.typ == 'E' && executesBeforeSync(s.pending)) {
+			took = time.Since(head.start)
+		}
+		head.ran(took, !head.failed && typ != 'E')
+	}
 	// Each statement of a pipeline gets the whole timeout from when the one before it ends.
 	if (head.typ == 'Q' || head.typ == 'E') && s.stmtTimer != nil && len(s.pending) > 0 {
 		s.stmtTimer.Reset(s.timeout)
@@ -954,6 +1025,19 @@ func (s *session) answered(typ byte) answer {
 		}
 	}
 	return head.how
+}
+
+// executesBeforeSync reports whether pending holds a statement to run before its next Sync.
+func executesBeforeSync(pending []sent) bool {
+	for _, p := range pending {
+		switch p.typ {
+		case 'S':
+			return false
+		case 'Q', 'E':
+			return true
+		}
+	}
+	return false
 }
 
 // finishes reports whether a server message of type reply is the last answer to a client message of type msg.

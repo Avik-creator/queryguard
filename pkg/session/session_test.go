@@ -509,6 +509,86 @@ func TestBindPassesGateEvenWhenItCannotBeExplained(t *testing.T) {
 	expect(t, a.running, false)
 }
 
+func TestReportsHowLongQueryRan(t *testing.T) {
+	a := newAdmitter()
+	h := start(t, fakeChecker{admit: a})
+
+	h.send(&pgproto3.Query{String: "select slot"})
+	h.serverGets(&pgproto3.Query{String: "select slot"})
+	time.Sleep(50 * time.Millisecond)
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	if r := <-a.ran; !r.finished || r.took < 50*time.Millisecond || r.took > time.Second {
+		t.Errorf("ran %+v; want finished after about 50ms", r)
+	}
+}
+
+func TestReportsFailedQuery(t *testing.T) {
+	a := newAdmitter()
+	h := start(t, fakeChecker{admit: a})
+
+	h.send(&pgproto3.Query{String: "select slot"})
+	h.serverGets(&pgproto3.Query{String: "select slot"})
+	h.reply(postgresError, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	if r := <-a.ran; r.finished {
+		t.Errorf("ran %+v; want unfinished, since Postgres raised an error", r)
+	}
+}
+
+func TestReportsNoTimeForStatementsOfAPipeline(t *testing.T) {
+	a := newAdmitter()
+	h := start(t, fakeChecker{admit: a})
+	p1, p2 := &pgproto3.Parse{Name: "a", Query: "select slot 1"}, &pgproto3.Parse{Name: "b", Query: "select slot 2"}
+
+	h.send(p1, p2, &pgproto3.Bind{PreparedStatement: "a"}, &pgproto3.Execute{}, &pgproto3.Bind{PreparedStatement: "b"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	h.serverGets(p1, p2, &pgproto3.Bind{PreparedStatement: "a"}, &pgproto3.Execute{}, &pgproto3.Bind{PreparedStatement: "b"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	time.Sleep(50 * time.Millisecond)
+	// Postgres holds its answers until Sync, so the first statement's answer arrives only once the second has run.
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, &pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")},
+		&pgproto3.BindComplete{}, postgresError, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	first, second := <-a.ran, <-a.ran
+	if !first.finished || first.took != 0 || second.finished || second.took != 0 {
+		t.Errorf("ran %+v, then %+v; want finished, then failed, neither with a time of its own", first, second)
+	}
+}
+
+func TestReportsStatementOfItsOwnPortal(t *testing.T) {
+	a := newAdmitter()
+	h := start(t, fakeChecker{admit: a})
+	p1, p2 := &pgproto3.Parse{Name: "a", Query: "select slot"}, &pgproto3.Parse{Name: "b", Query: "select 1"}
+	b1, b2 := &pgproto3.Bind{DestinationPortal: "p1", PreparedStatement: "a"}, &pgproto3.Bind{DestinationPortal: "p2", PreparedStatement: "b"}
+
+	h.send(p1, p2, b1, b2, &pgproto3.Execute{Portal: "p2"}, &pgproto3.Execute{Portal: "p1"}, &pgproto3.Sync{})
+	h.serverGets(p1, p2, b1, b2, &pgproto3.Execute{Portal: "p2"}, &pgproto3.Execute{Portal: "p1"}, &pgproto3.Sync{})
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, &pgproto3.BindComplete{},
+		&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
+
+	// p2's statement wasn't admitted, so its answer says nothing of how p1's ran.
+	expectNone(t, a.ran, "p2's run was reported for p1's statement")
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	expect(t, a.ran, run{finished: true})
+}
+
+func TestSettlesOnceOutsideTransaction(t *testing.T) {
+	a := newAdmitter()
+	h := start(t, fakeChecker{admit: a})
+	h.send(&pgproto3.Query{String: "begin"})
+	h.serverGets(&pgproto3.Query{String: "begin"})
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("BEGIN")}, &pgproto3.ReadyForQuery{TxStatus: 'T'})
+
+	h.send(&pgproto3.Query{String: "create index slot"})
+	h.serverGets(&pgproto3.Query{String: "create index slot"})
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("CREATE INDEX")}, &pgproto3.ReadyForQuery{TxStatus: 'T'})
+	expectNone(t, a.settled, "settled inside the transaction")
+
+	h.send(&pgproto3.Query{String: "commit"})
+	h.serverGets(&pgproto3.Query{String: "commit"})
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("COMMIT")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	expect(t, a.settled, struct{}{})
+}
+
 // expect waits up to 2s for a value on ch and compares it with want.
 func expect[T comparable](t *testing.T, ch <-chan T, want T) {
 	t.Helper()
@@ -603,10 +683,19 @@ type admitter struct {
 	running       chan bool     // gets running from each gate
 	released      chan struct{} // gets a value when a slot is freed
 	waited        chan error    // gets why each "wait" statement's wait ended
+	ran           chan run      // gets how each admitted statement ran
+	settled       chan struct{} // gets a value when an admitted statement's transaction has ended
+}
+
+// run is what a session reports of a statement once it ends.
+type run struct {
+	took     time.Duration
+	finished bool
 }
 
 func newAdmitter() *admitter {
-	return &admitter{running: make(chan bool, 10), released: make(chan struct{}, 10), waited: make(chan error, 10)}
+	return &admitter{running: make(chan bool, 10), released: make(chan struct{}, 10), waited: make(chan error, 10), ran: make(chan run, 10),
+		settled: make(chan struct{}, 10)}
 }
 
 func (c fakeChecker) Check(sql string, set Settings) (*pgproto3.ErrorResponse, Gate) {
@@ -625,7 +714,9 @@ func (c fakeChecker) Check(sql string, set Settings) (*pgproto3.ErrorResponse, G
 	case strings.Contains(sql, "slot"):
 		return nil, func(_ context.Context, _ Explain, running bool) Admission {
 			c.admit.running <- running
-			a := Admission{Timeout: c.admit.timeout, IdleInTransaction: c.admit.idle}
+			a := Admission{Timeout: c.admit.timeout, IdleInTransaction: c.admit.idle, Ran: func(took time.Duration, finished bool) {
+				c.admit.ran <- run{took, finished}
+			}, Settled: func() { c.admit.settled <- struct{}{} }}
 			if !running {
 				a.Release = sync.OnceFunc(func() { c.admit.released <- struct{}{} })
 			}
