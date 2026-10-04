@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -9,16 +10,47 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/Avik-creator/queryguard/pkg/wire"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
+func TestForwardsStartupToUpstream(t *testing.T) {
+	pg := startFakePostgres(t)
+	addr, _ := startProxy(t, newServer(t, pg.addr))
+
+	startSession(t, addr)
+
+	got := mustReceive[*pgproto3.StartupMessage](t, pg.received)
+	if got.Parameters["user"] != "alice" || got.Parameters["database"] != "shop" {
+		t.Errorf("upstream got %v; want user alice, database shop", got.Parameters)
+	}
+}
+
 func TestRelaysBytesBothWays(t *testing.T) {
-	addr, _ := startProxy(t, newServer(t, startEcho(t)))
-	conn := dial(t, addr)
+	pg := startFakePostgres(t)
+	addr, _ := startProxy(t, newServer(t, pg.addr))
+	conn := startSession(t, addr)
 
 	roundTrip(t, conn, "hello")
 }
 
-func TestClosesClientWhenUpstreamUnreachable(t *testing.T) {
+func TestForwardsCancelRequest(t *testing.T) {
+	pg := startFakePostgres(t)
+	addr, _ := startProxy(t, newServer(t, pg.addr))
+	conn := dial(t, addr)
+	key := bytes.Repeat([]byte{9}, 32)
+
+	send(t, conn, &pgproto3.CancelRequest{ProcessID: 42, SecretKey: key})
+
+	got := mustReceive[*pgproto3.CancelRequest](t, pg.received)
+	if got.ProcessID != 42 || !bytes.Equal(got.SecretKey, key) {
+		t.Errorf("upstream got %+v; want process 42 and the same key", got)
+	}
+	expectClosed(t, conn)
+}
+
+func TestSendsFatalErrorWhenUpstreamUnreachable(t *testing.T) {
 	// A port that was just released has nothing listening on it.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -28,8 +60,16 @@ func TestClosesClientWhenUpstreamUnreachable(t *testing.T) {
 	ln.Close()
 
 	addr, _ := startProxy(t, newServer(t, upstream))
-	conn := dial(t, addr)
+	conn := startSession(t, addr)
 
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	msg, err := pgproto3.NewFrontend(conn, nil).Receive()
+	if err != nil {
+		t.Fatalf("want an ErrorResponse: %v", err)
+	}
+	if e, ok := msg.(*pgproto3.ErrorResponse); !ok || e.Severity != "FATAL" || e.Code != "08006" {
+		t.Fatalf("got %#v; want FATAL 08006", msg)
+	}
 	expectClosed(t, conn)
 }
 
@@ -50,13 +90,23 @@ func TestClosesClientWhenUpstreamCloses(t *testing.T) {
 	}()
 
 	addr, _ := startProxy(t, newServer(t, ln.Addr().String()))
+	conn := startSession(t, addr)
+
+	expectClosed(t, conn)
+}
+
+func TestClosesClientThatSendsNoStartup(t *testing.T) {
+	s := newServer(t, startFakePostgres(t).addr)
+	s.StartupTimeout = 100 * time.Millisecond
+	addr, _ := startProxy(t, s)
+
 	conn := dial(t, addr)
 
 	expectClosed(t, conn)
 }
 
 func TestServeReturnsNilWhenStopped(t *testing.T) {
-	_, stop := startProxy(t, newServer(t, startEcho(t)))
+	_, stop := startProxy(t, newServer(t, startFakePostgres(t).addr))
 
 	if err := stop(); err != nil {
 		t.Fatalf("Serve returned %v; want nil", err)
@@ -64,10 +114,10 @@ func TestServeReturnsNilWhenStopped(t *testing.T) {
 }
 
 func TestShutdownWaitsForOpenSessions(t *testing.T) {
-	s := newServer(t, startEcho(t))
+	s := newServer(t, startFakePostgres(t).addr)
 	s.ShutdownTimeout = 5 * time.Second
 	addr, stop := startProxy(t, s)
-	conn := dial(t, addr)
+	conn := startSession(t, addr)
 	roundTrip(t, conn, "before")
 
 	done := make(chan error, 1)
@@ -96,10 +146,10 @@ func TestShutdownWaitsForOpenSessions(t *testing.T) {
 }
 
 func TestShutdownClosesSessionsAfterTimeout(t *testing.T) {
-	s := newServer(t, startEcho(t))
+	s := newServer(t, startFakePostgres(t).addr)
 	s.ShutdownTimeout = 100 * time.Millisecond
 	addr, stop := startProxy(t, s)
-	conn := dial(t, addr)
+	conn := startSession(t, addr)
 	roundTrip(t, conn, "hello")
 
 	start := time.Now()
@@ -115,19 +165,25 @@ func TestShutdownClosesSessionsAfterTimeout(t *testing.T) {
 // newServer returns a Server for upstream that logs to the test output.
 func newServer(t *testing.T, upstream string) *Server {
 	return &Server{
-		Upstream: upstream,
+		Upstream: Dialer{Addr: upstream},
 		Logger:   slog.New(slog.NewTextHandler(t.Output(), nil)),
 	}
 }
 
-// startEcho starts a TCP server that writes back what it reads, standing in for Postgres.
-func startEcho(t *testing.T) string {
+// fakePostgres records each client's startup packet, then echoes bytes back.
+type fakePostgres struct {
+	addr     string
+	received chan pgproto3.FrontendMessage
+}
+
+func startFakePostgres(t *testing.T) *fakePostgres {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
+	pg := &fakePostgres{addr: ln.Addr().String(), received: make(chan pgproto3.FrontendMessage, 10)}
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -136,11 +192,18 @@ func startEcho(t *testing.T) string {
 			}
 			go func() {
 				defer conn.Close()
-				io.Copy(conn, conn)
+				msg, err := wire.Negotiate(conn)
+				if err != nil {
+					return
+				}
+				pg.received <- msg
+				if _, ok := msg.(*pgproto3.StartupMessage); ok {
+					io.Copy(conn, conn)
+				}
 			}()
 		}
 	}()
-	return ln.Addr().String()
+	return pg
 }
 
 // startProxy runs s.Serve on a free port and returns its address and a stop function.
@@ -176,6 +239,44 @@ func dial(t *testing.T, addr string) net.Conn {
 	}
 	t.Cleanup(func() { conn.Close() })
 	return conn
+}
+
+// startSession connects to the proxy and sends a startup message for alice.
+func startSession(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	conn := dial(t, addr)
+	send(t, conn, &pgproto3.StartupMessage{
+		ProtocolVersion: pgproto3.ProtocolVersion30,
+		Parameters:      map[string]string{"user": "alice", "database": "shop"},
+	})
+	return conn
+}
+
+func send(t *testing.T, conn net.Conn, msg interface{ Encode([]byte) ([]byte, error) }) {
+	t.Helper()
+	buf, err := msg.Encode(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(buf); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// mustReceive waits up to 2s for the next message on ch and checks its type.
+func mustReceive[T pgproto3.FrontendMessage](t *testing.T, ch <-chan pgproto3.FrontendMessage) T {
+	t.Helper()
+	select {
+	case msg := <-ch:
+		got, ok := msg.(T)
+		if !ok {
+			t.Fatalf("upstream got %T; want %T", msg, *new(T))
+		}
+		return got
+	case <-time.After(2 * time.Second):
+		t.Fatalf("upstream got nothing in 2s; want %T", *new(T))
+		panic("unreachable")
+	}
 }
 
 // roundTrip sends msg through conn and checks the echo comes back.

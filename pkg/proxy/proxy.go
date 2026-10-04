@@ -4,19 +4,27 @@ package proxy
 import (
 	"cmp"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/Avik-creator/queryguard/pkg/wire"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
-// DefaultShutdownTimeout is used when Server.ShutdownTimeout is zero.
-const DefaultShutdownTimeout = 30 * time.Second
+// Defaults used when the matching Server field is zero.
+const (
+	DefaultStartupTimeout  = 10 * time.Second
+	DefaultShutdownTimeout = 30 * time.Second
+)
 
 // Server relays client connections to Upstream, one server connection per client.
 type Server struct {
-	Upstream        string        // host:port of the Postgres server
+	Upstream        Upstream
+	StartupTimeout  time.Duration // how long a new client has to send its startup message
 	ShutdownTimeout time.Duration // how long sessions may drain after Serve stops
 	Logger          *slog.Logger  // nil means slog.Default()
 }
@@ -45,7 +53,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			}
 			break
 		}
-		sessions.Go(func() { s.relay(sessionCtx, log, client) })
+		sessions.Go(func() { s.handle(sessionCtx, log, client) })
 	}
 
 	drained := make(chan struct{})
@@ -65,17 +73,42 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	return nil
 }
 
-// relay copies bytes between client and a new upstream connection until either side closes.
-func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn) {
+// handle reads the client's startup packet and either forwards a cancel or starts a session.
+func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) {
 	defer client.Close()
+	stop := context.AfterFunc(ctx, func() { client.Close() })
+	defer stop()
 
-	var d net.Dialer
-	server, err := d.DialContext(ctx, "tcp", s.Upstream)
+	client.SetDeadline(time.Now().Add(cmp.Or(s.StartupTimeout, DefaultStartupTimeout)))
+	msg, err := wire.Negotiate(client)
 	if err != nil {
-		log.Error("connect to upstream", "upstream", s.Upstream, "client", client.RemoteAddr(), "err", err)
+		// A client that connects and leaves without a word, like a TCP health check, is not an error.
+		if !errors.Is(err, io.EOF) {
+			log.Warn("client startup failed", "client", client.RemoteAddr(), "err", err)
+		}
 		return
 	}
-	defer server.Close()
+	client.SetDeadline(time.Time{})
+
+	switch msg := msg.(type) {
+	case *pgproto3.CancelRequest:
+		if err := s.Upstream.Cancel(ctx, msg); err != nil {
+			log.Warn("forward cancel request", "client", client.RemoteAddr(), "err", err)
+		}
+	case *pgproto3.StartupMessage:
+		s.relay(ctx, log, client, msg)
+	}
+}
+
+// relay connects client to an upstream connection and copies bytes both ways until either side closes.
+func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, startup *pgproto3.StartupMessage) {
+	server, err := s.Upstream.Acquire(ctx, startup)
+	if err != nil {
+		log.Error("connect to upstream", "client", client.RemoteAddr(), "err", err)
+		wire.SendFatal(client, "08006", "queryguard: cannot connect to the database server")
+		return
+	}
+	defer s.Upstream.Release(server)
 
 	closeBoth := func() {
 		client.Close()

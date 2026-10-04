@@ -49,7 +49,7 @@ func run(listen, upstream string, shutdownTimeout time.Duration, log *slog.Logge
 	}
 	log.Info("queryguard started", "version", version, "listen", ln.Addr(), "upstream", upstream)
 
-	s := &proxy.Server{Upstream: upstream, ShutdownTimeout: shutdownTimeout, Logger: log}
+	s := &proxy.Server{Upstream: proxy.Dialer{Addr: upstream}, ShutdownTimeout: shutdownTimeout, Logger: log}
 	if err := s.Serve(ctx, ln); err != nil {
 		return err
 	}
