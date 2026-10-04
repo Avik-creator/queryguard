@@ -5,22 +5,19 @@ speaks the Postgres wire protocol. It estimates what each query will cost before
 it runs and gives every tenant a budget, so one tenant's expensive queries can't
 starve everyone else.
 
-> **Status:** early development. Milestones M1 (a transparent proxy), M2
-> (rules and connection caps) and M3 (plans and cost rules) are done:
-> QueryGuard relays sessions, cancel requests and TLS, and can block
-> statements by rule or by their planned cost, but does not enforce tenant
-> budgets yet.
+> **Status:** early development. Milestones M1 to M4 are done: QueryGuard
+> relays sessions, cancel requests and TLS; blocks statements by rule or by
+> their planned cost; and gives each tenant a cost budget, a fair share of
+> the server and time limits. Costs are the planner's own estimates for now.
 
 ## Planned features
 
-- Tenants identified by database role, or by a sqlcommenter tag sent from a
-  trusted role.
-- Cost estimates from an inline `EXPLAIN`, corrected over time by comparing
-  them with how long queries actually took.
-- Per-tenant budgets with a burst limit and a share of the server. Queries
-  over budget are queued, sent to a slow lane or rejected.
-- Rules in warn or enforce mode, matching on role, `application_name`, client
-  address or tags.
+- Costs corrected over time by comparing the planner's estimates with how
+  long queries actually took.
+- Plan flips, such as an index scan turning into a full read, detected and
+  sent to the slow lane.
+- The number of statements running at once adjusted to the server's
+  latency and lock waits.
 - Prometheus metrics and a log of every decision.
 
 ## Requirements
@@ -92,8 +89,21 @@ before it reaches PostgreSQL:
 | `schema_allowlist` | Naming a schema outside `schemas`, in a statement or in `search_path`, including a `search_path` set at login; `pg_catalog`, `information_schema` and the session's temporary schema are always allowed |
 
 Every statement in a query string is checked, including those inside CTEs,
-`EXPLAIN` and `PREPARE`. A rule, or a tenant (keyed by role), in `warn` mode
-only logs what it would have rejected.
+`EXPLAIN` and `PREPARE`. A rule, or a tenant, in `warn` mode only logs what it
+would have rejected.
+
+A rule can be narrowed with `match`; every field it sets must match, and a
+rule without one applies to everyone:
+
+```json
+{"check": "deny_ddl", "match": {
+  "roles": ["app"], "tenants": ["acme"], "application_names": ["batch"],
+  "clients": ["10.0.0.0/8", "192.168.1.7"], "tags": {"route": "/admin"}
+}}
+```
+
+`application_name` and tags are set by the client, so they only label a
+statement; they are not a way to tell who sent it.
 
 A rejected statement fails with SQLSTATE `42501` and a hint, and the
 connection stays usable. Outside a transaction QueryGuard answers it itself;
@@ -192,6 +202,81 @@ PGPASSWORD=… ./bin/queryguard -config queryguard.json \
 QueryGuard won't start with `max_scan_rows` and no `-catalog-dsn`. A table
 that has never been analyzed has no size yet, and isn't judged.
 
+## Tenants, budgets and the scheduler
+
+A tenant is the database role by default. Roles listed in `trusted_roles`,
+such as an application's one shared role, can name the tenant of each
+statement with a [sqlcommenter](https://google.github.io/sqlcommenter/) tag,
+`/*tenant='acme'*/` (the key is `tenant_tag`). A tag from any other role is
+ignored and logged.
+
+```json
+{
+  "trusted_roles": ["app"],
+  "scheduler": {"max_active": 16, "queue_timeout": "5s",
+                "slow_lane": {"max_active": 2, "queue_timeout": "60s"}},
+  "tenant_defaults": {
+    "budget": {"rate": 200000, "burst": 1000000, "min_charge": 10},
+    "statement_timeout": "30s",
+    "idle_in_transaction_timeout": "1m"
+  },
+  "tenants": {
+    "reporting": {"budget": {"rate": 50000, "burst": 500000, "share": 2, "when_over": "slow"}},
+    "acme": {"budget": {"rate": 20000, "when_over": "reject"}}
+  }
+}
+```
+
+### Budgets
+
+Each tenant has a bucket of planner cost units that fills at `rate` units a
+second, up to `burst`. A statement may start while its tenant owes nothing;
+its planned cost, at least `min_charge`, is then taken from the bucket, which
+can go below zero, so one large statement isn't starved and the long-run rate
+still holds. Once a tenant owes units, what happens to its next statement
+depends on `when_over`:
+
+| `when_over` | The statement |
+| --- | --- |
+| `queue` (the default) | Waits for the bucket to refill; if that would take longer than `queue_timeout`, fails at once |
+| `slow` | Runs in the slow lane |
+| `reject` | Fails at once |
+
+A statement that fails this way gets SQLSTATE `53000` (`insufficient_resources`).
+The budget is looked at before `EXPLAIN`, the costliest step, and charged
+once the cost is known, in one step, so statements that arrive together can't
+all spend the same budget. Statements `EXPLAIN` can't plan, such as `BEGIN` or
+a string of several statements, cost `min_charge`. Plans come from the cache
+described under cost rules, explained again about one hit in 100.
+
+### Slots
+
+`max_active` limits how many statements run at once in the fast lane, and
+the slow lane has its own limit. When the slots are taken, statements queue,
+and each slot that comes free goes to the waiting tenant that has used least
+for its `share` lately (use fades with a 10-second half-life). A statement
+that finds no slot within its lane's `queue_timeout` fails with `53000`. A
+session holds one slot until PostgreSQL has answered everything it sent, so
+a pipeline needs just one.
+
+### Time limits
+
+- `statement_timeout`: QueryGuard cancels a statement running longer, and
+  the client gets SQLSTATE `57014` saying it was the statement timeout. A
+  client can't lift it with `SET`, as it could PostgreSQL's own.
+- `idle_in_transaction_timeout`: a session left idle in a transaction longer
+  is ended with `FATAL 25P03`, and PostgreSQL rolls the transaction back.
+- A client that disconnects mid-statement has its statement cancelled, and
+  one that disconnects while its statement waits for a slot or a budget never
+  has it run.
+
+### Reloading the config
+
+`kill -HUP` makes QueryGuard read its `-config` file again. A file that isn't
+valid is logged and ignored, and the one in force stays. A valid one applies
+to new and open sessions alike, and tenants keep what they owe and their
+recent use.
+
 ## Connection caps
 
 `max_connections` caps all sessions through QueryGuard, `tenant_max_connections`
@@ -218,9 +303,10 @@ the operating system's timing.
 ## Clients that disconnect mid-query
 
 PostgreSQL normally keeps running a query after its client has gone, until
-the query next reads or writes the socket. QueryGuard sends
+the query next reads or writes the socket. QueryGuard sends a CancelRequest
+for the statement as soon as the client's connection closes, and also sends
 `client_connection_check_interval=2000` with each new session, so the query
-stops within about 2 seconds. A value the client sets, directly or in
+stops within about 2 seconds even if the proxy itself goes away. A value the client sets, directly or in
 `options`, is kept. Change it with `-client-check-interval`; `0` leaves the
 server's setting alone, and is needed on platforms where PostgreSQL rejects a
 non-zero value.
@@ -233,7 +319,7 @@ all three versions:
 
 | Client | Checked |
 | --- | --- |
-| pgx 5.11 | plaintext, TLS, direct TLS, protocol 3.2, prepared statements, COPY, cancel on 3.0, 3.2 and 3.2 over TLS, keepalive settings; rejections in all three query modes, in a transaction and in a pipeline; warn mode; connection cap; cost rules in all three query modes and in a transaction, errors from `EXPLAIN`, the plan cache, table sizes |
+| pgx 5.11 | plaintext, TLS, direct TLS, protocol 3.2, prepared statements, COPY, cancel on 3.0, 3.2 and 3.2 over TLS, keepalive settings; rejections in all three query modes, in a transaction and in a pipeline; warn mode; connection cap; cost rules in all three query modes and in a transaction, errors from `EXPLAIN`, the plan cache, table sizes; budgets that reject and that queue, busy slots, statement and idle-in-transaction timeouts, cancel on disconnect, tenant tags |
 | psql 18 | plaintext, TLS, direct TLS, protocol 3.2, Ctrl-C; rejection, in a transaction; costly statement |
 | node-postgres 8 | plaintext, TLS, parameters, cancel; rejection, in a transaction; costly statement, with and without parameters |
 | psycopg 3.3 (libpq 18) | plaintext, TLS, direct TLS, protocol 3.2, parameters, cancel, cancel over TLS; rejection, in a transaction and in a pipeline; costly statement, prepared and not |
@@ -276,6 +362,28 @@ explains a statement only once, so they show the cache's cost, not
 `EXPLAIN`'s; the proxy logs the time spent explaining every minute. The
 4.8 ms p99 came from one noisy run; the other two were under 1.4 ms. These
 are laptop numbers; the full benchmark matrix comes with v1.0.
+
+## A rogue tenant
+
+`make rogue` runs three innocent tenants doing indexed lookups (six
+connections) next to a rogue one running full reads of the 10M-row `orders`
+table (six connections), for 15 seconds a scenario. Through QueryGuard the
+rogue gets a budget of 50,000 cost units a second (a full read is planned at
+about 169,000), with 8 slots shared fairly. Apple M1, PostgreSQL 18 in Docker:
+
+| Scenario | Innocent p50 | Innocent p99 | Rogue statements run |
+| --- | --- | --- | --- |
+| No rogue, straight to PostgreSQL | 0.26 ms | 0.50 ms | |
+| No rogue, through QueryGuard | 0.36 ms | 0.73 ms | |
+| Rogue, straight to PostgreSQL | 0.42 ms | 4.14 ms | 51 |
+| Rogue, QueryGuard, a role per tenant | 0.39 ms | 1.09 ms | 6 (14,160 refused) |
+| Rogue, QueryGuard, one shared role and tags | 0.40 ms | 1.03 ms | 6 (14,045 refused) |
+
+Without QueryGuard the rogue raises innocent p99 more than eightfold. Through
+it, innocent p99 stays within 1.5 times the same path's baseline, the target
+the test checks, and the rogue runs exactly what its budget allows: 200,000
+units of burst plus 15 seconds at 50,000 pay for six full reads. These are
+laptop numbers; the full benchmark comes with v1.0.
 
 ## License
 
