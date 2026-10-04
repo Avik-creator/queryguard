@@ -41,7 +41,7 @@ case $got in
 *) echo "FAIL rejection fails the transaction: $got"; failed=1 ;;
 esac
 
-# QG_COST_PORT blocks statements planned to cost more than 50,000, such as a full read of the 10M-row orders table.
+# QG_COST_PORT blocks statements planned to cost more than half a full read of orders, such as that read.
 got=$(psql "$cost" -XAt -c "select id from orders where id = 7" -c "select count(*) from orders where note = 'x'" -c "select 'ok'" 2>&1) || true
 case $got in
 7*"rule max_cost blocks this statement"*ok) echo "ok   costly statement" ;;

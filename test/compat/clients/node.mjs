@@ -11,7 +11,7 @@ const plain = {
 }
 // QG_RULES_PORT blocks UPDATE and DELETE without WHERE.
 const rules = { ...plain, port: Number(process.env.QG_RULES_PORT) }
-// QG_COST_PORT blocks statements planned to cost more than 50,000, such as a full read of the 10M-row orders table.
+// QG_COST_PORT blocks statements planned to cost more than half a full read of orders, such as that read.
 const cost = { ...plain, port: Number(process.env.QG_COST_PORT) }
 const tls = { ...plain, host: 'localhost', ssl: { ca: fs.readFileSync(process.env.QG_CA), servername: 'localhost' } }
 

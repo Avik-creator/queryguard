@@ -103,8 +103,28 @@ func TestConnectionCap(t *testing.T) {
 	}
 }
 
-// costConfig blocks statements planned to cost more than a full read of tenants by far, and full reads of orders.
-const costConfig = `{"rules": [{"check": "max_cost", "cost": 50000}, {"check": "max_scan_rows", "rows": 100000}]}`
+// costConfig sets both cost rules at half of what a full read of orders takes, whatever the size of the test data, so
+// such a read is blocked while index lookups and full reads of the 100-row tenants stay well under both limits.
+func costConfig(t testing.TB) string {
+	t.Helper()
+	conn := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
+	var out string
+	var rows float64
+	if err := conn.QueryRow(t.Context(), "explain (format json) select count(*) from orders where note = 'x'").Scan(&out); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.QueryRow(t.Context(), "select reltuples from pg_class where oid = 'orders'::regclass").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	p, err := plan.Parse(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Cost/2 < 20 || rows/2 < 200 {
+		t.Fatalf("orders is too small for the cost tests: a full read costs %.0f and it has %.0f rows", p.Cost, rows)
+	}
+	return fmt.Sprintf(`{"rules": [{"check": "max_cost", "cost": %.0f}, {"check": "max_scan_rows", "rows": %.0f}]}`, p.Cost/2, rows/2)
+}
 
 func TestPgxCostRules(t *testing.T) {
 	conn := startCostProxy(t, nil).connect(t, "sslmode=disable")
@@ -116,7 +136,7 @@ func TestPgxCostRules(t *testing.T) {
 		}{
 			{"select id from orders where id = $1", 7, ""},
 			{"select count(*) from orders where note = $1", "x", "max_cost"},
-			// Cheap, but it starts a full read of a 10M-row table that a WHERE clause would turn into a slow one.
+			// Cheap, but it starts a full read of orders that a WHERE clause would turn into a slow one.
 			{"select * from orders where total_cents > $1 limit 1", 0, "max_scan_rows"},
 			{"select * from tenants where name <> $1", "x", ""},
 		} {
@@ -190,11 +210,16 @@ func TestPlanCacheServesRepeatedStatements(t *testing.T) {
 
 func TestCatalogReadsTableSizes(t *testing.T) {
 	c := &plan.Catalog{DSN: catalogDSN(t)}
+	var want float64
+	direct := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
+	if err := direct.QueryRow(t.Context(), "select reltuples from pg_class where oid = 'orders'::regclass").Scan(&want); err != nil {
+		t.Fatal(err)
+	}
 
 	rows, ok := c.Rows("queryguard", plan.Table{Schema: "public", Name: "orders"})
 
-	if !ok || rows < 1e6 {
-		t.Errorf("orders has %v rows (%v); want the test schema's millions", rows, ok)
+	if !ok || rows != want || rows <= 0 {
+		t.Errorf("orders has %v rows (%v); want pg_class's %v", rows, ok, want)
 	}
 }
 
@@ -202,7 +227,7 @@ func TestCatalogReadsTableSizes(t *testing.T) {
 func startCostProxy(t testing.TB, configure func(*proxy.Server)) *queryGuard {
 	t.Helper()
 	return startProxyWith(t, func(s *proxy.Server) {
-		s.Policy = mustPolicy(t, costConfig)
+		s.Policy = mustPolicy(t, costConfig(t))
 		s.Catalog = &plan.Catalog{DSN: catalogDSN(t)}
 		if configure != nil {
 			configure(s)

@@ -11,7 +11,7 @@ PLAIN = f"host={os.environ['QG_HOST']} port={os.environ['QG_PORT']} user=postgre
 TLS = f"host=localhost port={os.environ['QG_PORT']} user=postgres dbname=queryguard sslmode=verify-full sslrootcert={os.environ['QG_CA']}"
 # QG_RULES_PORT blocks DELETE without WHERE; the table doesn't exist, so a missed rejection fails with 42P01 instead.
 RULES = f"host={os.environ['QG_HOST']} port={os.environ['QG_RULES_PORT']} user=postgres dbname=queryguard sslmode=disable"
-# QG_COST_PORT blocks statements planned to cost more than 50,000, such as a full read of the 10M-row orders table.
+# QG_COST_PORT blocks statements planned to cost more than half a full read of orders, such as that read.
 COST = f"host={os.environ['QG_HOST']} port={os.environ['QG_COST_PORT']} user=postgres dbname=queryguard sslmode=disable"
 BLOCKED = "delete from qg_no_such_table"
 LIBPQ = psycopg.pq.version()
