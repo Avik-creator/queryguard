@@ -106,6 +106,8 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 		return
 	}
 	client.SetDeadline(time.Time{})
+	// Closing a TLS conn sends close_notify first; libpq's encrypted cancel reports an error without it.
+	defer conn.Close()
 
 	switch msg := msg.(type) {
 	case *pgproto3.CancelRequest:

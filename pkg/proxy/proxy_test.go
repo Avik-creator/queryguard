@@ -143,6 +143,26 @@ func TestForwardsCancelRequestOverTLS(t *testing.T) {
 	expectServerKey(t, mustReceive[*pgproto3.CancelRequest](t, pg.received))
 }
 
+func TestEndsTLSCancelConnectionWithCloseNotify(t *testing.T) {
+	cert, clientTLS := testcert.Pair(t)
+	s := newServer(t, startFakePostgres(t).addr)
+	s.TLSConfig = wire.ServerTLSConfig(cert)
+	// Without session tickets, the only bytes the proxy can send after the handshake are the close_notify alert.
+	s.TLSConfig.SessionTicketsDisabled = true
+	addr, _ := startProxy(t, s)
+	key := login(t, dial(t, addr))
+
+	raw := dial(t, addr)
+	clientTLS.NextProtos = []string{"postgresql"}
+	send(t, tls.Client(raw, clientTLS), &pgproto3.CancelRequest{ProcessID: key.ProcessID, SecretKey: key.SecretKey})
+
+	// libpq's encrypted cancel reports "SSL error: unexpected eof" when the proxy just drops the connection.
+	raw.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if after, err := io.ReadAll(raw); len(after) == 0 {
+		t.Fatalf("proxy closed the TLS cancel connection without close_notify (%v)", err)
+	}
+}
+
 func TestPassesChannelBindingWhenProxyHasPostgresCertificate(t *testing.T) {
 	cert, _ := testcert.Pair(t)
 
