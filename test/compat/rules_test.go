@@ -2,15 +2,18 @@ package compat
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
@@ -194,7 +197,10 @@ func TestPgxCostRejectionInTransactionFailsIt(t *testing.T) {
 
 func TestPlanCacheServesRepeatedStatements(t *testing.T) {
 	var s *proxy.Server
-	conn := startCostProxy(t, func(srv *proxy.Server) { s = srv }).connect(t, "sslmode=disable")
+	conn := startCostProxy(t, func(srv *proxy.Server) {
+		srv.Plans.RefreshOneIn = -1
+		s = srv
+	}).connect(t, "sslmode=disable")
 
 	for id := range 5 {
 		var got int64
@@ -221,6 +227,120 @@ func TestCatalogReadsTableSizes(t *testing.T) {
 	if !ok || rows != want || rows <= 0 {
 		t.Errorf("orders has %v rows (%v); want pg_class's %v", rows, ok, want)
 	}
+}
+
+func TestBudgetRejectsTenantThatSpentIt(t *testing.T) {
+	// Each statement costs at least 100 units, and 250 are saved up, so the fourth finds the budget spent.
+	conn := startPolicyProxy(t, `{"tenants": {"postgres": {"budget": {"rate": 1, "burst": 250, "min_charge": 100, "when_over": "reject"}}}}`).
+		connect(t, "sslmode=disable")
+
+	var codes []string
+	for range 4 {
+		_, err := conn.Exec(t.Context(), "select id from orders where id = $1", 7)
+		codes = append(codes, sqlState(err))
+	}
+
+	if !slices.Equal(codes, []string{"", "", "", "53000"}) {
+		t.Errorf("SQLSTATEs %q; want the fourth statement rejected with 53000", codes)
+	}
+}
+
+func TestBudgetQueuesUntilRefilled(t *testing.T) {
+	conn := startPolicyProxy(t, `{"tenants": {"postgres": {"budget": {"rate": 100, "burst": 100, "min_charge": 150}}}}`).
+		connect(t, "sslmode=disable")
+	expectSelectOne(t, conn)
+
+	// The first statement left 50 units owed, which take half a second to come back.
+	start := time.Now()
+	expectSelectOne(t, conn)
+
+	if waited := time.Since(start); waited < 400*time.Millisecond || waited > 2*time.Second {
+		t.Errorf("second statement took %v; want about 500ms in the queue", waited)
+	}
+}
+
+func TestStatementTimeoutCancelsStatement(t *testing.T) {
+	conn := startPolicyProxy(t, `{"tenant_defaults": {"statement_timeout": "300ms"}}`).connect(t, "sslmode=disable")
+
+	start := time.Now()
+	_, err := conn.Exec(t.Context(), "select pg_sleep(10)")
+
+	pgErr, ok := errors.AsType[*pgconn.PgError](err)
+	if !ok || pgErr.Code != "57014" || !strings.Contains(pgErr.Message, "statement timeout") {
+		t.Fatalf("pg_sleep(10) ended with %v; want 57014 from the statement timeout", err)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Errorf("cancel took %v", took)
+	}
+	expectSelectOne(t, conn)
+}
+
+func TestIdleInTransactionEndsSession(t *testing.T) {
+	conn := startPolicyProxy(t, `{"tenant_defaults": {"idle_in_transaction_timeout": "300ms"}}`).connect(t, "sslmode=disable")
+	ctx := t.Context()
+	if _, err := conn.Exec(ctx, "begin"); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(time.Second)
+
+	if _, err := conn.Exec(ctx, "select 1"); err == nil {
+		t.Error("a statement ran in a transaction left idle past its limit")
+	}
+}
+
+func TestCancelsQueryWhenClientVanishes(t *testing.T) {
+	// With Postgres's own socket check off, only the proxy's CancelRequest can stop the query quickly.
+	qg := startProxyWith(t, func(s *proxy.Server) { s.ClientCheckInterval = 0 })
+	app := fmt.Sprintf("qg_vanish_%d", time.Now().UnixNano())
+	victim := qg.connect(t, "sslmode=disable application_name="+app)
+	watcher := qg.connect(t, "sslmode=disable")
+	running := make(chan struct{})
+	go func() {
+		defer close(running)
+		victim.Exec(t.Context(), "select pg_sleep(30)")
+	}()
+	waitFor(t, 5*time.Second, func() bool { return activeQueries(t, watcher, app) == 1 })
+
+	victim.PgConn().Conn().Close()
+	<-running
+
+	waitFor(t, 2*time.Second, func() bool { return activeQueries(t, watcher, app) == 0 })
+}
+
+func TestTenantTagFromTrustedRole(t *testing.T) {
+	conn := startPolicyProxy(t, `{"trusted_roles": ["postgres"], "rules": [{"check": "require_where", "match": {"tenants": ["acme"]}}]}`).
+		connect(t, "sslmode=disable")
+
+	_, acme := conn.Exec(t.Context(), "delete from qg_no_such_table /*tenant='acme'*/")
+	_, other := conn.Exec(t.Context(), "delete from qg_no_such_table /*tenant='other'*/")
+
+	// Only acme's rule applies, so other's statement reaches Postgres and fails there.
+	if sqlState(acme) != "42501" || sqlState(other) != "42P01" {
+		t.Errorf("acme got %v and other got %v; want 42501 and 42P01", acme, other)
+	}
+}
+
+func TestBusyWhenNoSlotComesFree(t *testing.T) {
+	qg := startPolicyProxy(t, `{"scheduler": {"max_active": 1, "queue_timeout": "300ms"}}`)
+	holder, waiter := qg.connect(t, "sslmode=disable"), qg.connect(t, "sslmode=disable")
+	// The holder's statement ends before the test closes its connection, which pgx can't use from two goroutines.
+	var holding sync.WaitGroup
+	defer holding.Wait()
+	holding.Go(func() { holder.Exec(context.Background(), "select pg_sleep(1)") })
+	time.Sleep(300 * time.Millisecond)
+
+	_, err := waiter.Exec(t.Context(), "select 1")
+
+	if sqlState(err) != "53000" {
+		t.Errorf("statement with the only slot taken got %v; want 53000", err)
+	}
+}
+
+// startPolicyProxy starts a proxy with config.
+func startPolicyProxy(t testing.TB, config string) *queryGuard {
+	t.Helper()
+	return startProxyWith(t, func(s *proxy.Server) { s.Policy = mustPolicy(t, config) })
 }
 
 // startCostProxy starts a proxy with costConfig and a catalog, letting configure see the server too.
