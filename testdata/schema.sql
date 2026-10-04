@@ -45,8 +45,8 @@ SELECT i,
        CASE WHEN i <= 5 THEN 'enterprise' WHEN i <= 30 THEN 'pro' ELSE 'free' END
 FROM generate_series(1, 100) AS i;
 
--- ceil(100 * r^3) for uniform r puts about 22% of rows in tenant 1 and
--- about 0.1% in tenant 100.
+-- ceil(100 * r^3) for uniform r puts about 21.5% of rows in tenant 1 and
+-- about 0.3% in tenant 100.
 INSERT INTO customers (tenant_id, email, country, created_at)
 SELECT greatest(1, ceil(100 * power(r1, 3)))::int,
        'user' || i || '@example.com',
