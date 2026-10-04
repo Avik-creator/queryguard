@@ -1,4 +1,4 @@
-// Runs node-postgres through QueryGuard: plaintext, TLS, parameters, cancel keys and cancel.
+// Runs node-postgres through QueryGuard: plaintext, TLS, parameters, cancel keys, cancel and rule rejections.
 import fs from 'node:fs'
 import pg from 'pg'
 
@@ -9,6 +9,8 @@ const plain = {
   database: 'queryguard',
   password: process.env.PGPASSWORD,
 }
+// QG_RULES_PORT blocks UPDATE and DELETE without WHERE.
+const rules = { ...plain, port: Number(process.env.QG_RULES_PORT) }
 const tls = { ...plain, host: 'localhost', ssl: { ca: fs.readFileSync(process.env.QG_CA), servername: 'localhost' } }
 
 let failed = false
@@ -70,6 +72,29 @@ await check('cancel', () =>
     setTimeout(() => new pg.Client(plain).cancel(c, c.activeQuery), 300)
     const err = await sleep.then(() => null, (e) => e)
     expect(err?.code === '57014', `pg_sleep(30) ended with ${err?.code ?? 'no error'}`)
+  }))
+
+// The tables don't exist, so a missed rejection fails with 42P01 instead.
+await check('rejected statement', () =>
+  withClient(rules, async (c) => {
+    // Without parameters node-postgres sends a simple Query; with them, Parse/Bind/Execute.
+    for (const [text, values] of [['delete from qg_no_such_table', []], ['update qg_no_such_table set n = $1', [1]]]) {
+      const err = await c.query(text, values).then(() => null, (e) => e)
+      expect(err?.code === '42501', `${text} ended with ${err?.code ?? 'no error'}`)
+      const { rows } = await c.query('select 1 as one')
+      expect(rows[0].one === 1, 'connection unusable after the rejection')
+    }
+  }))
+
+await check('rejection fails the transaction', () =>
+  withClient(rules, async (c) => {
+    await c.query('begin')
+    const rejected = await c.query('delete from qg_no_such_table').then(() => null, (e) => e)
+    expect(rejected?.code === '42501', `delete ended with ${rejected?.code ?? 'no error'}`)
+    const next = await c.query('select 1').then(() => null, (e) => e)
+    expect(next?.code === '25P02', `next statement ended with ${next?.code ?? 'no error'}`)
+    await c.query('rollback')
+    await c.query('select 1')
   }))
 
 process.exitCode = failed ? 1 : 0

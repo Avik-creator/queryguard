@@ -200,6 +200,12 @@ type queryGuard struct {
 
 func startProxy(t testing.TB) *queryGuard {
 	t.Helper()
+	return startProxyWith(t, func(*proxy.Server) {})
+}
+
+// startProxyWith starts a proxy as startProxy does, letting configure change the server first.
+func startProxyWith(t testing.TB, configure func(*proxy.Server)) *queryGuard {
+	t.Helper()
 	upstream := os.Getenv("QG_TEST_UPSTREAM")
 	if upstream == "" {
 		t.Skip("set QG_TEST_UPSTREAM to a Postgres host:port, for example 127.0.0.1:5418 after make up")
@@ -222,6 +228,7 @@ func startProxy(t testing.TB) *queryGuard {
 		KeepAlive:           proxy.DefaultKeepAlive,
 		Logger:              slog.New(slog.NewTextHandler(t.Output(), nil)),
 	}
+	configure(s)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(ctx, ln) }()

@@ -1,6 +1,7 @@
 package compat
 
 import (
+	"io"
 	"os"
 	"slices"
 	"testing"
@@ -10,6 +11,7 @@ import (
 // BenchmarkOverhead compares query latency straight to Postgres with latency through QueryGuard.
 func BenchmarkOverhead(b *testing.B) {
 	qg := startProxy(b)
+	rules := startRulesProxy(b, io.Discard)
 	upstream := os.Getenv("QG_TEST_UPSTREAM")
 
 	for _, q := range []struct{ name, sql string }{
@@ -20,6 +22,9 @@ func BenchmarkOverhead(b *testing.B) {
 			{"direct", upstream, "sslmode=disable"},
 			{"proxy", qg.addr, "sslmode=disable"},
 			{"proxy_TLS", qg.addr, "sslmode=verify-full sslrootcert=" + qg.caFile},
+			{"proxy_rules", rules.addr, "sslmode=disable"},
+			// The simple protocol sends the SQL every time, so every run is parsed and checked.
+			{"proxy_rules_simple", rules.addr, "sslmode=disable default_query_exec_mode=simple_protocol"},
 		} {
 			b.Run(q.name+"/"+path.name, func(b *testing.B) {
 				conn := connectTo(b, path.addr, path.opts)
