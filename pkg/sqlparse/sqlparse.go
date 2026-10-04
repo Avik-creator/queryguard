@@ -3,6 +3,7 @@ package sqlparse
 
 import (
 	"maps"
+	"net/url"
 	"slices"
 	"strings"
 
@@ -247,3 +248,55 @@ func Normalize(sql string) string {
 }
 
 var _ proto.Message = (*pg_query.ParseResult)(nil)
+
+// Tags returns the sqlcommenter key-value pairs in sql's last /* */ comment, or nil when that comment holds none.
+func Tags(sql string) map[string]string {
+	if !strings.Contains(sql, "/*") {
+		return nil
+	}
+	scan, err := pg_query.Scan(sql)
+	if err != nil {
+		return nil
+	}
+	var comment string
+	for _, t := range slices.Backward(scan.Tokens) {
+		if t.Token == pg_query.Token_C_COMMENT {
+			comment = sql[t.Start:t.End]
+			break
+		}
+	}
+	body := strings.TrimSuffix(strings.TrimPrefix(comment, "/*"), "*/")
+	tags := map[string]string{}
+	// Pairs are key='value', comma-separated; both parts are URL-encoded, and a quote in a value is escaped as \'.
+	for rest := strings.TrimSpace(body); rest != ""; {
+		key, after, ok := strings.Cut(rest, "='")
+		end := -1
+		for i := 0; ok && i < len(after) && end < 0; i++ {
+			switch after[i] {
+			case '\\':
+				i++
+			case '\'':
+				end = i
+			}
+		}
+		if end < 0 {
+			return nil
+		}
+		k, kerr := url.PathUnescape(strings.ReplaceAll(strings.TrimSpace(key), `\'`, "'"))
+		v, verr := url.PathUnescape(strings.ReplaceAll(after[:end], `\'`, "'"))
+		if kerr != nil || verr != nil {
+			return nil
+		}
+		tags[k] = v
+		rest = strings.TrimSpace(after[end+1:])
+		if rest != "" {
+			if rest, ok = strings.CutPrefix(rest, ","); !ok {
+				return nil
+			}
+		}
+	}
+	if len(tags) == 0 {
+		return nil
+	}
+	return tags
+}

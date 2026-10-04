@@ -1,6 +1,7 @@
 package sqlparse
 
 import (
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -203,6 +204,25 @@ func TestBackslashInString(t *testing.T) {
 	} {
 		if got := BackslashInString(sql); got != want {
 			t.Errorf("BackslashInString(%q) = %v; want %v", sql, got, want)
+		}
+	}
+}
+
+func TestTags(t *testing.T) {
+	for sql, want := range map[string]map[string]string{
+		`select 1 /*tenant='acme',route='%2Forders'*/`: {"tenant": "acme", "route": "/orders"},
+		`select 1 /*a='1'*/ /*tenant='b'*/`:            {"tenant": "b"},
+		`select 1 /*name='O\'Brien',x%20y='a%2Cb'*/`:   {"name": "O'Brien", "x y": "a,b"},
+		`select 1`:                          nil,
+		`select 1 /*just a note*/`:          nil,
+		`select 1 /*tenant='acme',broken*/`: nil,
+		`select 1 -- tenant='acme'`:         nil,
+		`select '/*tenant=''acme''*/'`:      nil,
+		`select 1 /*tenant='%zz'*/`:         nil,
+		`select 'unterminated`:              nil,
+	} {
+		if got := Tags(sql); !maps.Equal(got, want) {
+			t.Errorf("Tags(%q) = %v; want %v", sql, got, want)
 		}
 	}
 }
