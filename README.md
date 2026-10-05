@@ -547,7 +547,9 @@ key, at its `-advertise-addr` (by default `-listen`).
 With `learned_timeouts` on, each statement's timeout is a multiple of its own
 p99 from the [query stats](#query-stats), never below `floor` and never above
 its tenant's `statement_timeout`. A statement that usually takes 20 ms then
-can't run for 30 s because its plan went wrong.
+can't run for 30 s because its plan went wrong. `FETCH`, `MOVE` and
+`EXECUTE` keep the tenant's timeout, since every cursor's or prepared
+statement's reads the same.
 
 ```json
 {"learned_timeouts": {"mode": "on", "multiple": 10, "min_runs": 100, "floor": "1s"}}
@@ -560,7 +562,8 @@ list, by fingerprint, for `watch` (10 minutes). Each time it runs again,
 `action` decides: `log` (the default) logs its first run back, `slow` runs it
 in the slow lane, and `reject` turns it away with SQLSTATE `53000` and a hint
 saying when the watch ends. A statement cancelled for another reason, such as
-the DDL guard's lock timeout, isn't watched. The admin console's `SHOW WATCH`
+the DDL guard's lock timeout, isn't watched, and neither are `FETCH`, `MOVE`
+and `EXECUTE`, whose text doesn't say what they run. The admin console's `SHOW WATCH`
 lists the watch and `UNWATCH` ends one early.
 
 ```json

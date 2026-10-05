@@ -1713,6 +1713,30 @@ func TestStatementThatBreaksItsTimeoutIsWatched(t *testing.T) {
 	}
 }
 
+func TestAFetchOrExecuteIsNeitherWatchedNorTimedByItsText(t *testing.T) {
+	config := `{"runaway": {"action": "reject", "watch": "10m"}, "learned_timeouts": {"mode": "on", "min_runs": 10},
+		"tenant_defaults": {"statement_timeout": "30s"}}`
+	c := gateChecker(t, config, "alice", discard)
+	c.Env.Runaways = &Watch{}
+	c.Env.P99 = func(string, string, string, string) (time.Duration, int64) { return time.Millisecond, 1000 }
+
+	// Every cursor's FETCH, and every prepared statement's EXECUTE, reads the same, whatever it runs.
+	for _, sql := range []string{"fetch 100 from c1", "execute a(1)"} {
+		a := pass(t, c, sql, costing(1), false)
+		if a.Timeout != 30*time.Second {
+			t.Errorf("%s: timeout %v; want the tenant's 30s, not one learned from others with its text", sql, a.Timeout)
+		}
+		if a.Broke != nil {
+			a.Broke(session.Interruption{Code: "57014"})
+		}
+	}
+	for _, sql := range []string{"fetch 100 from c2", "execute b(1)"} {
+		if a := pass(t, c, sql, costing(1), false); a.Reject != nil {
+			t.Errorf("%s got %v after another with its text broke its timeout; want it run", sql, a.Reject)
+		}
+	}
+}
+
 func TestWatchedStatementCoolsDownInTheSlowLane(t *testing.T) {
 	config := `{"runaway": {"action": "slow"}, "scheduler": {"max_active": 1, "queue_timeout": "10ms"}, "tenant_defaults": {"statement_timeout": "1s"}}`
 	c := gateChecker(t, config, "alice", discard)

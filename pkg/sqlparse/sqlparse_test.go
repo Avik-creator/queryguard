@@ -71,7 +71,7 @@ func TestAnalyze(t *testing.T) {
 		{"declare c cursor for select * from orders", Query{Explainable: true, Cursor: true}},
 		{"create table orders_copy as select * from orders", Query{DDL: true, Explainable: true}},
 		// EXECUTE runs a statement prepared earlier in the session, so its text says nothing about its plan.
-		{"execute wipe(1)", Query{}},
+		{"execute wipe(1)", Query{Named: true}},
 		{"select 1;", Query{Explainable: true}},
 		{"select * from billing.invoices join public.orders using (id)", Query{Schemas: []string{"billing", "public"}, Explainable: true}},
 		{"select * from public.orders o join public.customers c on c.id = o.customer_id", Query{Schemas: []string{"public"}, Explainable: true}},
@@ -302,6 +302,24 @@ func TestAnalyzeKnowsWhichStatementsOnlyRead(t *testing.T) {
 		}
 		if q.ReadOnly != want {
 			t.Errorf("Analyze(%q).ReadOnly = %v; want %v", sql, q.ReadOnly, want)
+		}
+	}
+}
+
+func TestAnalyzeKnowsWhichStatementsRunOneNamedElsewhere(t *testing.T) {
+	for sql, want := range map[string]bool{
+		"fetch 100 from c1":        true,
+		"move forward 10 in c":     true,
+		"execute a(1)":             true,
+		"select * from orders":     false,
+		"fetch 1 from c; select 1": false,
+	} {
+		q, err := Analyze(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if q.Named != want {
+			t.Errorf("Analyze(%q).Named = %v; want %v", sql, q.Named, want)
 		}
 	}
 }

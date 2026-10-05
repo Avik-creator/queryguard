@@ -1282,7 +1282,8 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 		}
 		var fingerprint string
 		runaway, cooled := p.cfg.Runaway, false
-		if w := c.Env.Runaways; w != nil && runaway.Action != "off" {
+		// A FETCH or EXECUTE reads the same whatever cursor or statement it runs, so its text can't mark it a runaway.
+		if w := c.Env.Runaways; w != nil && runaway.Action != "off" && !q.Named {
 			if !w.empty() {
 				fingerprint = sqlparse.Fingerprint(sql)
 				if left, first, ok := w.watched(c.Env.Database, fingerprint, time.Now()); ok {
@@ -1364,7 +1365,7 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 			ctx, cancel = context.WithDeadline(ctx, start)
 			defer cancel()
 		}
-		if l := p.cfg.LearnedTimeouts; l.Mode == "on" && c.Env.P99 != nil {
+		if l := p.cfg.LearnedTimeouts; l.Mode == "on" && c.Env.P99 != nil && !q.Named {
 			if fingerprint == "" {
 				fingerprint = sqlparse.Fingerprint(sql)
 			}

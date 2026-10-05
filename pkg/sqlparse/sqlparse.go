@@ -28,6 +28,7 @@ type Query struct {
 	ChangesRole         bool     // may change the role statements run as: SET ROLE, SET SESSION AUTHORIZATION, or set_config of them or of an unknown name
 	Functions           []string // functions called by name, as schema.name when qualified, sorted, without duplicates
 	ReadOnly            bool     // only SELECTs or VALUES, without INTO, FOR UPDATE and the like, or a CTE that changes rows
+	Named               bool     // a single FETCH, MOVE or EXECUTE, which runs a cursor or prepared statement its text only names
 }
 
 // notDDL lists the statement types Postgres's GetCommandLogLevel does not log as DDL; every other *Stmt is DDL.
@@ -61,6 +62,10 @@ func Analyze(sql string) (Query, error) {
 			q.Explainable = true
 		}
 		_, q.Cursor = tree.Stmts[0].GetStmt().GetNode().(*pg_query.Node_DeclareCursorStmt)
+		switch tree.Stmts[0].GetStmt().GetNode().(type) {
+		case *pg_query.Node_FetchStmt, *pg_query.Node_ExecuteStmt:
+			q.Named = true
+		}
 	}
 	q.TransactionControl = len(tree.Stmts) > 0 && !slices.ContainsFunc(tree.Stmts, func(s *pg_query.RawStmt) bool {
 		_, ok := s.GetStmt().GetNode().(*pg_query.Node_TransactionStmt)
