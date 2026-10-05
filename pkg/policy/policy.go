@@ -604,14 +604,20 @@ var checks = map[string]check{
 }
 
 // deniedFunctions are the built-ins with effects beyond the statement's own rows: ending sessions, reading or writing the server's
-// files, large objects, reaching other servers, changing settings and roles, and WAL control.
+// files, writing large objects, reaching other servers, changing settings and roles, WAL and replication control, session advisory
+// locks, and running SQL text given as a value.
 var deniedFunctions = []string{
 	"pg_terminate_backend", "pg_cancel_backend", "pg_reload_conf", "pg_rotate_logfile", "pg_promote",
 	"pg_switch_wal", "pg_create_restore_point", "pg_backup_start", "pg_backup_stop", "pg_logical_emit_message",
+	"pg_wal_replay_pause", "pg_wal_replay_resume",
+	"pg_create_physical_replication_slot", "pg_create_logical_replication_slot", "pg_drop_replication_slot",
 	"pg_read_file", "pg_read_binary_file", "pg_ls_dir", "pg_stat_file", "pg_file_write", "pg_file_rename", "pg_file_unlink",
+	"pg_ls_logdir", "pg_ls_waldir", "pg_ls_tmpdir", "pg_ls_archive_statusdir",
 	"lo_import", "lo_export", "lo_unlink", "lo_from_bytea", "lo_put",
+	"lo_create", "lo_creat", "lo_open", "lowrite", "lo_truncate", "lo_truncate64",
 	"dblink", "dblink_exec", "dblink_connect", "dblink_connect_u", "dblink_send_query",
-	"set_config", "pg_advisory_lock", "pg_advisory_lock_shared",
+	"set_config", "pg_advisory_lock", "pg_advisory_lock_shared", "pg_try_advisory_lock", "pg_try_advisory_lock_shared",
+	"query_to_xml", "query_to_xmlschema", "query_to_xml_and_xmlschema", "cursor_to_xml",
 }
 
 // bareName returns a function's name without its schema.

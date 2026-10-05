@@ -92,7 +92,7 @@ before it reaches PostgreSQL:
 | `require_where` | `UPDATE` or `DELETE` without `WHERE`, and `TRUNCATE`; `WHERE true` changes every row on purpose |
 | `index_concurrently` | `CREATE INDEX`, `DROP INDEX` and `REINDEX` without `CONCURRENTLY`; `CREATE INDEX ON ONLY`, the first step in indexing a partitioned table, is allowed |
 | `schema_allowlist` | Naming a schema outside `schemas`, in a statement or in `search_path`, including a `search_path` set at login; `pg_catalog`, `information_schema` and the session's temporary schema are always allowed |
-| `deny_functions` | Calling a function in `functions`, by name with or without its schema, even in a `SELECT`; without `functions`, the built-ins with effects beyond the statement: ending sessions (`pg_terminate_backend`), the server's files (`pg_read_file`, `lo_export`), other servers (`dblink_exec`), settings and roles (`set_config`), WAL control and session advisory locks |
+| `deny_functions` | Calling a function in `functions`, by name with or without its schema, even in a `SELECT`; without `functions`, the built-ins with effects beyond the statement: ending sessions (`pg_terminate_backend`), the server's files (`pg_read_file`, `lo_export`), other servers (`dblink_exec`), settings and roles (`set_config`), WAL and replication control, session advisory locks, and SQL run from text (`query_to_xml`) |
 
 `deny_functions` sees the calls written in the statement. A function, view or
 trigger that calls one in turn, or `EXECUTE` of text built at run time, is

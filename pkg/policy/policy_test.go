@@ -1537,11 +1537,19 @@ func retryIn(t *testing.T, hint string) time.Duration {
 func TestDenyFunctionsBlocksSideEffectsEvenInASelect(t *testing.T) {
 	c := mustParse(t, `{"rules": [{"check": "deny_functions"}]}`).Checker("alice", discard)
 	for sql, blocked := range map[string]bool{
-		"select pg_terminate_backend(42)":                        true,
-		"select pg_catalog.pg_terminate_backend(42)":             true,
-		"select * from dblink_exec('host=x', 'drop table t')":    true,
-		"select set_config('role', 'admin', false)":              true,
-		"select upper(name), count(*) from customers group by 1": false,
+		"select pg_terminate_backend(42)":                     true,
+		"select pg_catalog.pg_terminate_backend(42)":          true,
+		"select * from dblink_exec('host=x', 'drop table t')": true,
+		"select set_config('role', 'admin', false)":           true,
+		"select pg_try_advisory_lock(1)":                      true,
+		"select lowrite(lo_open(lo_create(0), 131072), 'x')":  true,
+		"select pg_wal_replay_pause()":                        true,
+		"select * from pg_ls_waldir()":                        true,
+		"select pg_drop_replication_slot('s')":                true,
+		// It runs the text it is given, which would get round the whole list.
+		"select query_to_xml('select pg_terminate_backend(1)', true, false, '')": true,
+		"select pg_advisory_xact_lock(1)":                                        false,
+		"select upper(name), count(*) from customers group by 1":                 false,
 	} {
 		rej, _ := c.Check(sql, standard)
 		if got := ruleOf(rej) == "deny_functions"; got != blocked {
