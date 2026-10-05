@@ -1773,6 +1773,33 @@ func TestKilledTenantOrStatementIsTurnedAway(t *testing.T) {
 	}
 }
 
+func TestKillStopsAStatementPreparedBeforeIt(t *testing.T) {
+	kills := &Kills{}
+	for _, config := range []string{`{}`, `{"tenants": {"acme": {"statement_timeout": "5s"}}}`} {
+		c := mustParse(t, config).Checker("acme", discard)
+		c.Env = Env{Database: "shop", Kills: kills, Scheduler: sched.New(sched.Config{})}
+		const sql = "select * from orders where id = $1"
+		rej, gate := c.Check(sql, standard)
+		if rej != nil || gate == nil {
+			t.Fatalf("%s: Check = %v and gate %v; want a gate, which each execution of a prepared statement passes", config, rej, gate != nil)
+		}
+
+		kills.Kill(KillTenant, "acme", time.Now().Add(time.Minute))
+		if a := gate(t.Context(), session.Explain{}, false); codeOf(a.Reject) != "53000" {
+			t.Errorf("%s: prepared statement of a killed tenant got %v; want 53000", config, a.Reject)
+		}
+		kills.Unkill(KillTenant, "acme")
+		kills.Kill(KillFingerprint, sqlparse.Fingerprint(sql), time.Now().Add(time.Minute))
+		if a := gate(t.Context(), session.Explain{}, false); codeOf(a.Reject) != "53000" {
+			t.Errorf("%s: killed prepared statement got %v; want 53000", config, a.Reject)
+		}
+		kills.Unkill(KillFingerprint, sqlparse.Fingerprint(sql))
+		if a := gate(t.Context(), session.Explain{}, false); a.Reject != nil {
+			t.Errorf("%s: after the kills ended got %v; want it run", config, a.Reject)
+		}
+	}
+}
+
 func TestKillsEnd(t *testing.T) {
 	var kills Kills
 	now := time.Now()

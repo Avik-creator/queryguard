@@ -1052,6 +1052,43 @@ func (p *Policy) trusted(role string) bool { return slices.Contains(p.cfg.Truste
 
 // Check returns the error to send instead of running sql, or nil, and the gate it passes just before it executes, if any.
 func (c *Checker) Check(sql string, set session.Settings) (*pgproto3.ErrorResponse, session.Gate) {
+	rej, gate := c.check(sql, set)
+	if rej != nil || c.Env.Kills == nil {
+		return rej, gate
+	}
+	// A prepared statement runs again without being checked, so each run looks at the kills made since.
+	return nil, func(ctx context.Context, e session.Explain, running bool) session.Admission {
+		if rej := c.killedNow(c.policy(), sql); rej != nil {
+			return session.Admission{Reject: rej}
+		}
+		if gate == nil {
+			return session.Admission{}
+		}
+		return gate(ctx, e, running)
+	}
+}
+
+// killedNow returns the error for sql when its tenant or the statement is killed, or nil.
+func (c *Checker) killedNow(p *Policy, sql string) *pgproto3.ErrorResponse {
+	k := c.Env.Kills
+	if k == nil || k.empty() {
+		return nil
+	}
+	now := time.Now()
+	tenant := c.tenant(p, sqlparse.Tags(sql))
+	if left, ok := k.killed(KillTenant, tenant, now); ok {
+		c.log.Warn("rejected statement", "rule", "kill", "tenant", tenant)
+		return killed("tenant", left)
+	}
+	if left, ok := k.killed(KillFingerprint, sqlparse.Fingerprint(sql), now); ok {
+		c.log.Warn("rejected statement", "rule", "kill", "tenant", tenant, "query", sqlparse.Normalize(sql))
+		return killed("statement", left)
+	}
+	return nil
+}
+
+// check is Check without the kills made after it.
+func (c *Checker) check(sql string, set session.Settings) (*pgproto3.ErrorResponse, session.Gate) {
 	p := c.policy()
 	if l := p.cfg.Allowlist; l.applies(c.role) && c.Env.Allowlist != nil {
 		fp := sqlparse.Fingerprint(sql)
@@ -1066,17 +1103,8 @@ func (c *Checker) Check(sql string, set session.Settings) (*pgproto3.ErrorRespon
 				"Only statements learned for this role may run.", "Learn it first with the allowlist in learn mode."), nil
 		}
 	}
-	if k := c.Env.Kills; k != nil && !k.empty() {
-		now := time.Now()
-		tenant := c.tenant(p, sqlparse.Tags(sql))
-		if left, ok := k.killed(KillTenant, tenant, now); ok {
-			c.log.Warn("rejected statement", "rule", "kill", "tenant", tenant)
-			return killed("tenant", left), nil
-		}
-		if left, ok := k.killed(KillFingerprint, sqlparse.Fingerprint(sql), now); ok {
-			c.log.Warn("rejected statement", "rule", "kill", "tenant", tenant, "query", sqlparse.Normalize(sql))
-			return killed("statement", left), nil
-		}
+	if rej := c.killedNow(p, sql); rej != nil {
+		return rej, nil
 	}
 	// Without a Backend to tell, nothing needs DDL found, so a policy with nothing else to check needn't parse the statement.
 	guardsDDL := p.guardsDDL && c.Env.Backend != nil
