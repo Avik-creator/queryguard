@@ -56,12 +56,14 @@ const checkIntervalParam = "client_connection_check_interval"
 
 // Server relays client connections to Upstream, one server connection per client.
 type Server struct {
-	Upstream        Upstream
-	TLSConfig       *tls.Config   // nil means clients are told TLS is unavailable
-	StartupTimeout  time.Duration // how long a new client has to send its startup message
-	ShutdownTimeout time.Duration // how long sessions may drain after Serve stops
-	MaxStartups     int           // connections at once that have yet to send their startup message; 0 means DefaultMaxStartups
-	Logger          *slog.Logger  // nil means slog.Default()
+	Upstream  Upstream
+	TLSConfig *tls.Config // nil means clients are told TLS is unavailable
+	// RequireClientTLS refuses a login without TLS, which hostssl in pg_hba.conf can't do since Postgres sees only the proxy.
+	RequireClientTLS bool
+	StartupTimeout   time.Duration // how long a new client has to send its startup message
+	ShutdownTimeout  time.Duration // how long sessions may drain after Serve stops
+	MaxStartups      int           // connections at once that have yet to send their startup message; 0 means DefaultMaxStartups
+	Logger           *slog.Logger  // nil means slog.Default()
 
 	// ClientCheckInterval is sent as client_connection_check_interval unless the client set it; 0 sends nothing.
 	ClientCheckInterval time.Duration
@@ -189,6 +191,10 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 			log.Warn("forward cancel request", "client", client.RemoteAddr(), "err", err)
 		}
 	case *pgproto3.StartupMessage:
+		if _, encrypted := conn.(*tls.Conn); s.RequireClientTLS && !encrypted {
+			wire.SendFatal(conn, "28000", "queryguard requires TLS: connect with sslmode=require or stronger")
+			return
+		}
 		s.relay(ctx, log, conn, msg)
 	}
 }

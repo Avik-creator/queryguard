@@ -39,6 +39,12 @@ make certs   # self-signed certificate for local testing
 ./bin/queryguard -tls-cert certs/server.crt -tls-key certs/server.key
 ```
 
+PostgreSQL sees every client as the proxy: `pg_hba.conf` rules match
+QueryGuard's address, and `hostssl` is met by QueryGuard's own connection,
+not the client's. Start QueryGuard with `-require-client-tls` to refuse logins
+without TLS, so passwords never cross the network in plaintext; cancel
+requests, which carry no password, are still accepted without it.
+
 TLS to PostgreSQL is set with `-upstream-sslmode` (`disable`, `require` or
 `verify-full`, with the same meanings as in libpq) and `-upstream-ca` for a
 private CA.

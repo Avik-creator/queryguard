@@ -31,6 +31,7 @@ type options struct {
 	upstream        string
 	tlsCert         string
 	tlsKey          string
+	requireTLS      bool
 	upstreamSSL     string
 	upstreamCA      string
 	clientCheck     time.Duration
@@ -46,6 +47,8 @@ func main() {
 	flag.StringVar(&opts.upstream, "upstream", "127.0.0.1:5418", "host:port of the Postgres server")
 	flag.StringVar(&opts.tlsCert, "tls-cert", "", "PEM certificate for client TLS; needs -tls-key")
 	flag.StringVar(&opts.tlsKey, "tls-key", "", "PEM private key for client TLS; needs -tls-cert")
+	flag.BoolVar(&opts.requireTLS, "require-client-tls", false,
+		"refuse logins without TLS, which pg_hba.conf can't do since PostgreSQL sees only the proxy; needs -tls-cert")
 	flag.StringVar(&opts.upstreamSSL, "upstream-sslmode", "disable", "TLS to Postgres: disable, require or verify-full")
 	flag.StringVar(&opts.upstreamCA, "upstream-ca", "", "PEM CA certificates for verify-full; default is the system roots")
 	flag.DurationVar(&opts.clientCheck, "client-check-interval", proxy.DefaultClientCheckInterval,
@@ -73,7 +76,7 @@ func main() {
 }
 
 func run(opts options, log *slog.Logger) error {
-	tlsConfig, err := loadTLS(opts.tlsCert, opts.tlsKey)
+	tlsConfig, err := loadTLS(opts.tlsCert, opts.tlsKey, opts.requireTLS)
 	if err != nil {
 		return err
 	}
@@ -99,7 +102,7 @@ func run(opts options, log *slog.Logger) error {
 		return err
 	}
 	log.Info("queryguard started", "version", version, "listen", ln.Addr(), "upstream", opts.upstream,
-		"tls", tlsConfig != nil, "upstream_sslmode", opts.upstreamSSL, "config", opts.config)
+		"tls", tlsConfig != nil, "require_client_tls", opts.requireTLS, "upstream_sslmode", opts.upstreamSSL, "config", opts.config)
 
 	var keepAlive net.KeepAliveConfig
 	if opts.keepAlive {
@@ -108,6 +111,7 @@ func run(opts options, log *slog.Logger) error {
 	s := &proxy.Server{
 		Upstream:            proxy.Dialer{Addr: opts.upstream, TLSConfig: upstreamTLSConfig, KeepAlive: keepAlive},
 		TLSConfig:           tlsConfig,
+		RequireClientTLS:    opts.requireTLS,
 		ClientCheckInterval: opts.clientCheck,
 		KeepAlive:           keepAlive,
 		Policy:              pol,
@@ -147,9 +151,12 @@ func newCatalog(dsn string, pol *policy.Policy, log *slog.Logger) (*plan.Catalog
 	return &plan.Catalog{DSN: dsn, Log: log}, nil
 }
 
-// loadTLS returns the client TLS config, or nil when neither file is given.
-func loadTLS(certFile, keyFile string) (*tls.Config, error) {
+// loadTLS returns the client TLS config, or nil when neither file is given, which require forbids.
+func loadTLS(certFile, keyFile string, require bool) (*tls.Config, error) {
 	if certFile == "" && keyFile == "" {
+		if require {
+			return nil, errors.New("-require-client-tls needs -tls-cert and -tls-key")
+		}
 		return nil, nil
 	}
 	if certFile == "" || keyFile == "" {

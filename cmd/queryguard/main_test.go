@@ -13,6 +13,12 @@ import (
 	"github.com/Avik-creator/queryguard/pkg/proxy"
 )
 
+func TestRequireClientTLSNeedsCertificate(t *testing.T) {
+	if _, err := loadTLS("", "", true); err == nil || !strings.Contains(err.Error(), "-require-client-tls") {
+		t.Fatalf("got %v; want an error naming -require-client-tls", err)
+	}
+}
+
 func TestUpstreamTLSDisable(t *testing.T) {
 	cfg, err := upstreamTLS("disable", "", "db:5432")
 	if err != nil || cfg != nil {

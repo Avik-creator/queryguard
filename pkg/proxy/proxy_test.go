@@ -358,6 +358,28 @@ func TestRelaysOverDirectTLS(t *testing.T) {
 	roundTrip(t, conn, "hello over TLS")
 }
 
+func TestRequiresClientTLS(t *testing.T) {
+	cert, clientTLS := testcert.Pair(t)
+	pg := startFakePostgres(t)
+	s := newServer(t, pg.addr)
+	s.TLSConfig, s.RequireClientTLS = wire.ServerTLSConfig(cert), true
+	addr, _ := startProxy(t, s)
+
+	// Postgres sees only the proxy's connection, so its hostssl rules can't stop a password sent in plaintext.
+	plain := dial(t, addr)
+	sendStartup(t, plain)
+	expectFatal(t, plain, "28000")
+
+	clientTLS.NextProtos = []string{"postgresql"}
+	key := login(t, tls.Client(dial(t, addr), clientTLS))
+	// A cancel request carries no password, and libpq before 17 sends it without TLS.
+	send(t, dial(t, addr), &pgproto3.CancelRequest{ProcessID: key.ProcessID, SecretKey: key.SecretKey})
+
+	// Only the TLS login reached Postgres.
+	mustReceive[*pgproto3.StartupMessage](t, pg.received)
+	expectServerKey(t, mustReceive[*pgproto3.CancelRequest](t, pg.received))
+}
+
 func TestForwardsCancelRequestOverTLS(t *testing.T) {
 	cert, clientTLS := testcert.Pair(t)
 	pg := startFakePostgres(t)
