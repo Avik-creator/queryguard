@@ -600,6 +600,51 @@ whose statistics are stale, with the hint to run `ANALYZE`. A table is stale
 when more than 50 rows plus 20% of it changed since it was last analyzed
 (`n_mod_since_analyze`), twice what makes autovacuum analyze it by default.
 
+## Query stats
+
+QueryGuard keeps numbers for every statement that goes through it, much as
+`pg_stat_statements` does, but by tenant and as the client sees them. Each
+row is one statement fingerprint, run by one tenant through one role in one
+database:
+
+- calls, rows returned or changed, and the time from when the statement
+  went to PostgreSQL until it was answered, with p50, p95 and p99;
+- PostgreSQL's errors by SQLSTATE, and QueryGuard's own rejections apart
+  from them. An error at `Parse` or `Bind`, or one PostgreSQL gave the cost
+  check's `EXPLAIN`, is counted as an error but not a call;
+- shared buffer hits and reads, temporary file blocks (a sort or hash that
+  spilled past `work_mem`) and WAL bytes, from `pg_stat_statements` when it
+  is installed.
+
+Statements that share a `Sync`, as a pipeline's do, are counted without a
+time: PostgreSQL sends their answers together, so none has a time of its
+own. A multi-statement query string is one row. The percentiles come from
+buckets about 2% apart, so they are within 1% of the true value.
+
+QueryGuard keeps up to `-stats-max` rows (5000, as `pg_stat_statements.max`)
+and drops the least called one to make room; `-stats-max 0` keeps none. Error
+text can carry row values, so only the codes are kept unless
+`-stats-error-text` is set. Statements are parsed off the sessions' path; if
+that falls behind, statements are dropped from the stats rather than slowing
+anyone, and counted.
+
+For buffers and temp spills, load the library and create the extension in
+the database `-catalog-dsn` names, with a role that has `pg_read_all_stats`
+(part of `pg_monitor`), or other roles' statements stay hidden:
+
+```
+shared_preload_libraries = 'pg_stat_statements'
+```
+
+```sql
+CREATE EXTENSION pg_stat_statements;
+```
+
+QueryGuard reads it every 10 seconds and matches its entries by
+fingerprinting their text, so a statement need not be explained to be
+matched. `pg_stat_statements` counts by role, not tenant, so tenants that
+share a trusted role see that role's buffers.
+
 ## Connection caps
 
 `max_connections` caps all sessions through QueryGuard, `tenant_max_connections`
