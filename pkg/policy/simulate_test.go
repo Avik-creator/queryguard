@@ -78,3 +78,31 @@ func TestSimulateReplaysTheAllowlist(t *testing.T) {
 		t.Errorf("not simulated %q; want the allowlist named", r.NotSimulated)
 	}
 }
+
+func TestSimulateLetsAWarnTenantOverBudgetRun(t *testing.T) {
+	p := mustParse(t, `{"tenants": {"app": {"mode": "warn", "budget": {"rate": 10, "when_over": "reject"}}}}`)
+	at := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	rec := stats.Record{At: at, Database: "shop", Role: "app", Tenant: "app", Query: "select $1", Units: 100}
+
+	r := Simulate(p, nil, []stats.Record{rec, rec, rec})
+
+	if b := r.Budgets["app"]; r.NewlyRejected != 0 || b != nil && b.Rejected != 0 {
+		t.Errorf("budget %+v, newly rejected %d; want a warn tenant's statements all run", b, r.NewlyRejected)
+	}
+}
+
+func TestSimulateRefusesAWaitPastTheQueueTimeout(t *testing.T) {
+	p := mustParse(t, `{"tenants": {"app": {"budget": {"rate": 10, "burst": 10}}}}`)
+	at := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	// The first leaves 190 owed, 19s at 10 a second, past the 5s a statement may queue.
+	recs := []stats.Record{
+		{At: at, Database: "shop", Role: "app", Tenant: "app", Query: "select $1", Units: 200},
+		{At: at, Database: "shop", Role: "app", Tenant: "app", Query: "select $1", Units: 1},
+	}
+
+	r := Simulate(p, nil, recs)
+
+	if b := r.Budgets["app"]; b == nil || b.Rejected != 1 || b.Waited != 0 || r.NewlyRejected != 1 {
+		t.Errorf("budget %+v, newly rejected %d; want the second refused, not waiting 19s", b, r.NewlyRejected)
+	}
+}

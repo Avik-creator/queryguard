@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Avik-creator/queryguard/pkg/sched"
 	"github.com/Avik-creator/queryguard/pkg/session"
 	"github.com/Avik-creator/queryguard/pkg/stats"
 )
@@ -108,7 +109,8 @@ func Simulate(p *Policy, list *Allowlist, records []stats.Record) Simulation {
 
 // spend charges rec to its tenant's budget, as of when it ran, and reports whether the budget would have refused it.
 func (sim *Simulation) spend(p *Policy, buckets map[string]*bucket, rec stats.Record) bool {
-	b := p.tenant(rec.Tenant).Budget
+	tenant := p.tenant(rec.Tenant)
+	b := tenant.Budget
 	if b == nil || b.Rate <= 0 {
 		return false
 	}
@@ -125,16 +127,21 @@ func (sim *Simulation) spend(p *Policy, buckets map[string]*bucket, rec stats.Re
 		s = &SimulatedBudget{}
 		sim.Budgets[rec.Tenant] = s
 	}
-	if t.tokens < 0 {
-		switch b.WhenOver {
-		case "reject":
+	// A tenant in warn mode only logs what its budget would do.
+	if t.tokens < 0 && tenant.Mode != Warn {
+		switch wait := time.Duration(-t.tokens / b.Rate * float64(time.Second)); {
+		case b.WhenOver == "reject":
 			s.Rejected++
 			return true
-		case "slow":
+		case b.WhenOver == "slow":
 			s.Slowed++
+		case wait > cmp.Or(time.Duration(p.cfg.Scheduler.QueueTimeout), sched.DefaultQueueTimeout):
+			// The scheduler refuses at once a wait that would end past the queue timeout.
+			s.Rejected++
+			return true
 		default:
 			s.Waited++
-			s.Wait += time.Duration(-t.tokens / b.Rate * float64(time.Second))
+			s.Wait += wait
 		}
 	}
 	t.tokens -= max(rec.Units, b.MinCharge)
