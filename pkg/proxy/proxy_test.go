@@ -1361,6 +1361,7 @@ type fakePostgres struct {
 	tls         *tls.Config          // when set, plaintext connections are dropped
 	greeting    []encoder            // sent after a startup message; a trust login with fakeServerKey when empty
 	greetingFor map[string][]encoder // replaces greeting for logins to these databases
+	password    string               // when set, asked for in clear text before the greeting, which a wrong one doesn't get
 }
 
 // fakeServerKey is the cancel key data fakePostgres gives every session.
@@ -1405,6 +1406,9 @@ func serveFakePostgres(t *testing.T, pg *fakePostgres) *fakePostgres {
 				if g, ok := pg.greetingFor[startup.Parameters["database"]]; ok {
 					reply = g
 				}
+				if pg.password != "" && !askPassword(conn, pg.password) {
+					return
+				}
 				for _, m := range reply {
 					buf, _ := m.Encode(nil)
 					conn.Write(buf)
@@ -1414,6 +1418,26 @@ func serveFakePostgres(t *testing.T, pg *fakePostgres) *fakePostgres {
 		}
 	}()
 	return pg
+}
+
+// askPassword asks the client for a clear-text password and reports whether it is want, refusing the login if not.
+func askPassword(conn net.Conn, want string) bool {
+	ask, _ := (&pgproto3.AuthenticationCleartextPassword{}).Encode(nil)
+	conn.Write(ask)
+	var head [5]byte
+	if _, err := io.ReadFull(conn, head[:]); err != nil || head[0] != 'p' {
+		return false
+	}
+	body := make([]byte, binary.BigEndian.Uint32(head[1:])-4)
+	if _, err := io.ReadFull(conn, body); err != nil {
+		return false
+	}
+	if string(body) != want+"\x00" {
+		refused, _ := (&pgproto3.ErrorResponse{Severity: "FATAL", Code: "28P01", Message: "password authentication failed"}).Encode(nil)
+		conn.Write(refused)
+		return false
+	}
+	return true
 }
 
 // offeredMechanisms logs in through a proxy presenting proxyCert to a Postgres presenting pgCert that offers both SCRAM methods.
@@ -1854,6 +1878,31 @@ func TestAdminConsoleLogsInThroughPostgresAndKills(t *testing.T) {
 	for _, sql := range []string{"show stats", "show tenants", "show anomalies", "show flips", "show watch", "show help"} {
 		adminQuery(t, conn, sql)
 	}
+}
+
+func TestAdminConsolePassesThePasswordToPostgres(t *testing.T) {
+	pg := serveFakePostgres(t, &fakePostgres{password: "secret", greeting: []encoder{&pgproto3.AuthenticationOk{},
+		&pgproto3.ParameterStatus{Name: "is_superuser", Value: "on"}, fakeServerKey, &pgproto3.ReadyForQuery{TxStatus: 'I'}}})
+	s := newServer(t, pg.addr)
+	s.AdminDatabase = "qgadmin"
+	addr, _ := startProxy(t, s)
+	loginWith := func(password string) net.Conn {
+		conn := dial(t, addr)
+		send(t, conn, &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30, Parameters: map[string]string{"user": "alice", "database": "qgadmin"}})
+		if msg := receive(t, conn); !isType[*pgproto3.AuthenticationCleartextPassword](msg) {
+			t.Fatalf("got %#v; want Postgres's request for a password", msg)
+		}
+		send(t, conn, &pgproto3.PasswordMessage{Password: password})
+		return conn
+	}
+
+	conn := loginWith("secret")
+	finishLogin(t, conn)
+	// The console reads what follows the login, not Postgres.
+	if _, tag := adminQuery(t, conn, "show kills"); tag != "SHOW" {
+		t.Errorf("tag %q; want SHOW", tag)
+	}
+	expectFatal(t, loginWith("wrong"), "28P01")
 }
 
 func TestAdminConsoleRefusesWhatItDoesNotKnow(t *testing.T) {

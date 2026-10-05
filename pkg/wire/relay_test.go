@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"io"
@@ -242,5 +243,23 @@ func TestRefusedLoginCarriesPostgresCode(t *testing.T) {
 	}
 	if !bytes.Equal(client.Bytes(), encode(t, refusal)) {
 		t.Errorf("client got %q; want the refusal as sent", client.Bytes())
+	}
+}
+
+func TestRelayAuthRepliesStopsAtTheFirstOtherMessage(t *testing.T) {
+	password, sasl := encode(t, &pgproto3.PasswordMessage{Password: "secret"}), encode(t, &pgproto3.SASLResponse{Data: []byte("proof")})
+	query := encode(t, &pgproto3.Query{String: "show kills"})
+	client := bufio.NewReader(bytes.NewReader(concat(password, sasl, query)))
+	var server bytes.Buffer
+
+	if err := RelayAuthReplies(client, &server); err != nil {
+		t.Fatal(err)
+	}
+
+	if want := concat(password, sasl); !bytes.Equal(server.Bytes(), want) {
+		t.Errorf("server got %q; want the password and SASL replies", server.Bytes())
+	}
+	if rest, _ := io.ReadAll(client); !bytes.Equal(rest, query) {
+		t.Errorf("left %q unread; want the query", rest)
 	}
 }

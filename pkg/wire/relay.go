@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -35,6 +36,35 @@ type StartupOptions struct {
 	Report         func(name, value string)                                       // gets each ParameterStatus; nil ignores them
 	// Authenticated runs once AuthenticationOk has reached the client; an *Error it returns goes to the client as FATAL and ends the login.
 	Authenticated func() *Error
+}
+
+// passwordMessageType is the client's password, SASL and GSSAPI replies during login.
+const passwordMessageType = 'p'
+
+// maxAuthReplyLen is the longest authentication reply Postgres reads, PG_MAX_AUTH_TOKEN_LENGTH.
+const maxAuthReplyLen = 65535
+
+// RelayAuthReplies copies the client's authentication replies to server until the client sends anything else, which it leaves unread.
+func RelayAuthReplies(client *bufio.Reader, server io.Writer) error {
+	for {
+		head, err := client.Peek(5)
+		if err != nil {
+			return err
+		}
+		if head[0] != passwordMessageType {
+			return nil
+		}
+		size := int64(binary.BigEndian.Uint32(head[1:])) - 4
+		if size < 0 || size > maxAuthReplyLen {
+			return fmt.Errorf("client message %q has invalid length %d", head[0], size+4)
+		}
+		var h [5]byte
+		copy(h[:], head)
+		client.Discard(5)
+		if err := forward(server, client, h[:], size); err != nil {
+			return err
+		}
+	}
 }
 
 // RelayStartup copies server messages to client until ReadyForQuery, or an ErrorResponse that refuses the login, reading nothing past it.

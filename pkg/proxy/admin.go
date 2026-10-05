@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"cmp"
 	"context"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Avik-creator/queryguard/internal/safe"
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/wire"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -41,6 +43,14 @@ func (s *Server) admin(ctx context.Context, log *slog.Logger, client net.Conn, s
 		return
 	}
 	superuser := false
+	// The console reads the client only after the login, so until then the client's password goes on to Postgres from here.
+	clientIn := bufio.NewReader(client)
+	replied := make(chan struct{})
+	go func() {
+		defer close(replied)
+		defer safe.Recover(func(err error) { log.Error("relay the admin login", "err", err) })
+		wire.RelayAuthReplies(clientIn, server)
+	}()
 	err = wire.RelayStartup(client, server, wire.StartupOptions{
 		ChannelBinding: sameCertificate(client, server, s.TLSConfig),
 		Report: func(name, value string) {
@@ -49,6 +59,9 @@ func (s *Server) admin(ctx context.Context, log *slog.Logger, client net.Conn, s
 			}
 		},
 	})
+	client.SetReadDeadline(time.Now())
+	<-replied
+	client.SetReadDeadline(time.Time{})
 	// The console answers everything itself, so the server connection was only for the login.
 	s.Upstream.Release(server)
 	if e, ok := errors.AsType[*wire.LoginRefusedError](err); ok && (e.Code == "28P01" || e.Code == "28000") && throttle.Failures > 0 {
@@ -67,7 +80,7 @@ func (s *Server) admin(ctx context.Context, log *slog.Logger, client net.Conn, s
 	stop := context.AfterFunc(ctx, func() { client.Close() })
 	defer stop()
 
-	backend := pgproto3.NewBackend(client, client)
+	backend := pgproto3.NewBackend(clientIn, client)
 	failed := false // an extended-protocol message was refused, so the rest up to Sync are skipped
 	for {
 		msg, err := backend.Receive()
