@@ -42,6 +42,7 @@ type Budget struct {
 	Share     float64 // the tenant's weight when slots are handed out; 0 means 1
 	MinCharge float64 // the least any statement costs, so a tight loop of cheap ones still counts
 	WhenOver  Action  // "" means Queue
+	Capacity  float64 // a share of the server's measured capacity, which whoever configures the Scheduler turns into Rate; 0 means none
 }
 
 // Lane is a pool of slots, each running one statement at a time.
@@ -289,6 +290,39 @@ func (s *Scheduler) charge(name string, b Budget, t *tenant, cost float64) {
 	if len(s.tenants) > maxTenants {
 		s.forgetIdle()
 	}
+}
+
+// TenantState is what a tenant has left and runs now.
+type TenantState struct {
+	Name    string
+	Tokens  float64 // cost units left; below zero, what it owes
+	Rate    float64 // its budget's units a second; 0 means no limit
+	Usage   float64 // its recent use, which decides who is served first
+	Running int     // statements it runs now
+}
+
+// Tenants returns every tenant the scheduler knows, by name.
+func (s *Scheduler) Tenants() []TenantState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]TenantState, 0, len(s.tenants))
+	for name := range s.tenants {
+		t := s.refresh(name)
+		out = append(out, TenantState{Name: name, Tokens: t.tokens, Rate: s.budget(name).Rate, Usage: t.usage, Running: s.running[name]})
+	}
+	slices.SortFunc(out, func(a, b TenantState) int { return cmp.Compare(a.Name, b.Name) })
+	return out
+}
+
+// RetryAfter returns how long until tenant owes nothing at its budget's rate; 0 when it owes nothing or has no budget.
+func (s *Scheduler) RetryAfter(tenant string) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, t := s.budget(tenant), s.refresh(tenant)
+	if b.Rate <= 0 || t.tokens >= 0 {
+		return 0
+	}
+	return time.Duration(math.Ceil(-t.tokens / b.Rate * float64(time.Second)))
 }
 
 // Spent reports whether tenant owes cost units, so its next statement would wait, go to the slow lane or fail.
@@ -731,6 +765,21 @@ func (s *Scheduler) CapTenant(tenant string, n int) {
 	}
 	s.grant(Fast)
 	s.grant(Slow)
+}
+
+// Surcharge adds cost to what tenant has spent, without a minimum, as for the bytes a statement returned or the WAL it wrote.
+func (s *Scheduler) Surcharge(tenant string, cost float64) {
+	if cost <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, t := s.budget(tenant), s.refresh(tenant)
+	if b.Rate > 0 {
+		t.tokens -= cost
+	}
+	t.usage += cost
+	s.demand.Spent[tenant] += cost
 }
 
 // TrueUp charges tenant the difference between a statement's cost when it ran, actual, and what it was charged; less is paid back.

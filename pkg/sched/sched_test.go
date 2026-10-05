@@ -952,3 +952,52 @@ func acquire(t *testing.T, s *Scheduler, tenant string, lane LaneID) func() {
 	}
 	return release
 }
+
+func TestRetryAfterIsHowLongUntilTheTenantOwesNothing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Budgets: map[string]Budget{"acme": {Rate: 10, Burst: 10, WhenOver: Reject}}})
+		if d := s.RetryAfter("acme"); d != 0 {
+			t.Errorf("RetryAfter with budget left = %v; want 0", d)
+		}
+		s.Charge("acme", 35)
+
+		// 25 owed at 10 a second.
+		if d := s.RetryAfter("acme"); d != 2500*time.Millisecond {
+			t.Errorf("RetryAfter = %v; want 2.5s", d)
+		}
+		if d := s.RetryAfter("unlimited"); d != 0 {
+			t.Errorf("RetryAfter without a budget = %v; want 0", d)
+		}
+	})
+}
+
+func TestSurchargeTakesExactlyItsCost(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Budgets: map[string]Budget{"acme": {Rate: 10, Burst: 10, MinCharge: 5, WhenOver: Reject}}})
+
+		s.Surcharge("acme", 12)
+
+		// The minimum charge is for a statement, not for what is added to one, so 12 is owed less 10: 0.2s.
+		if d := s.RetryAfter("acme"); d != 200*time.Millisecond {
+			t.Errorf("RetryAfter = %v; want 200ms", d)
+		}
+	})
+}
+
+func TestTenantsSaysWhatEachTenantHasAndRuns(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Budgets: map[string]Budget{"acme": {Rate: 10, Burst: 100}}})
+		reserve(t, s, "acme", Fast)
+		s.Charge("acme", 30)
+		release, err := s.Acquire(t.Context(), "acme", Fast, Normal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer release()
+
+		got := s.Tenants()
+		if len(got) != 1 || got[0].Name != "acme" || got[0].Tokens != 70 || got[0].Rate != 10 || got[0].Running != 1 {
+			t.Errorf("Tenants = %+v; want acme with 70 left of a 10 a second budget, running 1", got)
+		}
+	})
+}
