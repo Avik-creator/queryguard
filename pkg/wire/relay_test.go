@@ -154,17 +154,25 @@ func TestRelayStartupRefusesAfterAuthentication(t *testing.T) {
 }
 
 func TestRelayStartupStopsAtEndOfStartup(t *testing.T) {
-	for name, end := range map[string]encoder{
-		"ready": &pgproto3.ReadyForQuery{TxStatus: 'I'},
-		"error": &pgproto3.ErrorResponse{Severity: "FATAL", Code: "28P01", Message: "password authentication failed"},
+	for name, tc := range map[string]struct {
+		end  encoder
+		want error
+	}{
+		"ready": {&pgproto3.ReadyForQuery{TxStatus: 'I'}, nil},
+		// Postgres sends an error during startup only to refuse the login, as for a wrong password.
+		"error": {&pgproto3.ErrorResponse{Severity: "FATAL", Code: "28P01", Message: "password authentication failed"}, ErrLoginRefused},
 	} {
 		t.Run(name, func(t *testing.T) {
-			server := bytes.NewReader(concat(encode(t, &pgproto3.AuthenticationOk{}), encode(t, end), []byte("after")))
+			server := bytes.NewReader(concat(encode(t, &pgproto3.AuthenticationOk{}), encode(t, tc.end), []byte("after")))
+			var client bytes.Buffer
 
-			if err := RelayStartup(io.Discard, server, StartupOptions{}); err != nil {
-				t.Fatal(err)
+			if err := RelayStartup(&client, server, StartupOptions{}); !errors.Is(err, tc.want) {
+				t.Fatalf("got %v; want %v", err, tc.want)
 			}
 
+			if !bytes.HasSuffix(client.Bytes(), encode(t, tc.end)) {
+				t.Errorf("client got %q; want it to end with the server's last message", client.Bytes())
+			}
 			if rest, _ := io.ReadAll(server); string(rest) != "after" {
 				t.Errorf("left %q unread; want %q", rest, "after")
 			}

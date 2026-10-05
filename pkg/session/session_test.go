@@ -620,6 +620,30 @@ func TestPassesEverythingWithoutChecker(t *testing.T) {
 	h.serverGets(&pgproto3.Query{String: "bad"})
 }
 
+func TestChecksNothingAfterRefusedLogin(t *testing.T) {
+	seen := make(chan Settings, 10)
+	refused, release := errors.New("password authentication failed"), make(chan struct{})
+	h := startWithLogin(t, fakeChecker{seen: seen}, func(io.Writer, io.Reader, func(string, string)) error {
+		<-release
+		return refused
+	})
+
+	// A client can send a statement without waiting for its login's outcome; the delay lets the session read it first.
+	h.send(&pgproto3.Query{String: "select 1"})
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	select {
+	case <-h.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Relay did not return")
+	}
+	if !errors.Is(h.err, refused) {
+		t.Errorf("Relay returned %v; want the login's error", h.err)
+	}
+	expectNone(t, seen, "statement checked for a client that never logged in")
+}
+
 func TestEndsWhenClientLeaves(t *testing.T) {
 	h := start(t, fakeChecker{})
 
@@ -759,21 +783,23 @@ type harness struct {
 
 func start(t *testing.T, check Checker) *harness {
 	t.Helper()
+	return startWithLogin(t, check, func(_ io.Writer, _ io.Reader, report func(name, value string)) error {
+		report("standard_conforming_strings", loginSettings.StandardConformingStrings)
+		report("client_encoding", loginSettings.ClientEncoding)
+		report("TimeZone", "UTC")
+		return nil
+	})
+}
+
+// startWithLogin is start with the given login in place of one that succeeds at once.
+func startWithLogin(t *testing.T, check Checker, login func(io.Writer, io.Reader, func(name, value string)) error) *harness {
+	t.Helper()
 	client, proxyClient := tcpPair(t)
 	pg, proxyServer := tcpPair(t)
 	h := &harness{t: t, client: client, pg: pg, done: make(chan struct{}), cancels: make(chan struct{}, 10)}
 	go func() {
 		defer close(h.done)
-		h.err = Relay(proxyClient, proxyServer, Options{
-			Check: check,
-			Login: func(_ io.Writer, _ io.Reader, report func(name, value string)) error {
-				report("standard_conforming_strings", loginSettings.StandardConformingStrings)
-				report("client_encoding", loginSettings.ClientEncoding)
-				report("TimeZone", "UTC")
-				return nil
-			},
-			Cancel: func() { h.cancels <- struct{}{} },
-		})
+		h.err = Relay(proxyClient, proxyServer, Options{Check: check, Login: login, Cancel: func() { h.cancels <- struct{}{} }})
 	}()
 	t.Cleanup(func() {
 		client.Close()

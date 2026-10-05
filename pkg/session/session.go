@@ -149,6 +149,7 @@ func Relay(client, server net.Conn, opts Options) error {
 		if err == nil {
 			s.loggedIn()
 		}
+		s.loginErr = err
 		close(s.ready)
 		if err == nil {
 			err = s.fromServer()
@@ -173,6 +174,7 @@ type session struct {
 	stop       func(error)   // ends the session, closing both connections
 	stopped    atomic.Bool   // stop has run
 	ready      chan struct{} // closed once login has ended
+	loginErr   error         // why login failed, set before ready is closed; nothing a client sends is checked before it logs in
 	serverGone chan struct{} // closed once nothing more is read from the server
 	clientIn   *bufio.Reader
 	serverIn   *bufio.Reader
@@ -273,7 +275,9 @@ func (s *session) fromClient() error {
 			err = s.dropUntilSync(typ, n)
 		case (typ == 'Q' || typ == 'P') && s.check != nil:
 			// The client gets ReadyForQuery before loggedIn runs; waiting keeps a quick first query from seeing status 0.
-			<-s.ready
+			if <-s.ready; s.loginErr != nil {
+				return s.loginErr
+			}
 			err = s.checkStatement(typ, n)
 		case typ == 'B' && len(s.statements) > 0:
 			err = s.checkBind(n)

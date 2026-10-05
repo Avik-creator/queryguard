@@ -106,6 +106,20 @@ func TestConnectionCap(t *testing.T) {
 	}
 }
 
+func TestWrongPasswordIsRefusedQuietly(t *testing.T) {
+	var logs lockedBuffer
+	qg := startRulesProxy(t, &logs)
+
+	_, err := pgx.Connect(t.Context(), "host=127.0.0.1 port="+port(qg)+" user=postgres dbname=queryguard sslmode=disable password=wrong")
+
+	if sqlState(err) != "28P01" {
+		t.Errorf("got %v; want 28P01 invalid_password", err)
+	}
+	if got := logs.String(); got != "" {
+		t.Errorf("proxy logged %q; want nothing", got)
+	}
+}
+
 // costConfig sets both cost rules at half of what a full read of orders takes, whatever the size of the test data, so
 // such a read is blocked while index lookups and full reads of the 100-row tenants stay well under both limits.
 func costConfig(t testing.TB) string {

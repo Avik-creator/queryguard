@@ -447,6 +447,26 @@ func TestStaysQuietWhenClientLeavesDuringLogin(t *testing.T) {
 	}
 }
 
+func TestEndsRefusedLoginQuietly(t *testing.T) {
+	pg := serveFakePostgres(t, &fakePostgres{greeting: []encoder{
+		&pgproto3.ErrorResponse{Severity: "FATAL", Code: "28P01", Message: "password authentication failed"},
+	}})
+	var logs bytes.Buffer
+	s := newServer(t, pg.addr)
+	s.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	addr, stop := startProxy(t, s)
+	conn := dial(t, addr)
+	sendStartup(t, conn)
+
+	expectFatal(t, conn, "28P01")
+	stop()
+
+	// Postgres logs a failed login itself; it is no fault of the proxy.
+	if logs.Len() > 0 {
+		t.Errorf("proxy logged %q; want nothing", logs.String())
+	}
+}
+
 func TestConnectsToUpstreamOverTLS(t *testing.T) {
 	cert, clientTLS := testcert.Pair(t)
 	pg := serveFakePostgres(t, &fakePostgres{tls: wire.ServerTLSConfig(cert)})

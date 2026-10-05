@@ -25,6 +25,9 @@ const (
 // maxKeyDataLen is the longest BackendKeyData body: a process ID and a 256-byte secret, the protocol 3.2 limit.
 const maxKeyDataLen = 4 + 256
 
+// ErrLoginRefused says the server ended the login with an error, which the client has already been sent.
+var ErrLoginRefused = errors.New("server refused the login")
+
 // StartupOptions says how RelayStartup rewrites the server's startup messages.
 type StartupOptions struct {
 	ChannelBinding bool                                                           // keep -PLUS SASL mechanisms
@@ -34,7 +37,7 @@ type StartupOptions struct {
 	Authenticated func() *Error
 }
 
-// RelayStartup copies server messages to client until ReadyForQuery or an ErrorResponse, reading nothing past it.
+// RelayStartup copies server messages to client until ReadyForQuery, or an ErrorResponse that refuses the login, reading nothing past it.
 func RelayStartup(client io.Writer, server io.Reader, opts StartupOptions) error {
 	for {
 		var head [5]byte
@@ -60,8 +63,11 @@ func RelayStartup(client io.Writer, server io.Reader, opts StartupOptions) error
 		if err != nil {
 			return err
 		}
-		if typ == readyForQueryType || typ == errorResponseType {
+		switch typ {
+		case readyForQueryType:
 			return nil
+		case errorResponseType:
+			return ErrLoginRefused
 		}
 	}
 }

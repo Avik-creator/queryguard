@@ -247,8 +247,8 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 			return wire.RelayStartup(client, server, opts)
 		}})
 	forget()
-	// A login refused over the cap was logged when it was refused.
-	if _, refused := errors.AsType[*wire.Error](err); !refused && !hungUp(err) {
+	// A login refused over the cap was logged when it was refused, and Postgres logs the logins it refuses.
+	if _, refused := errors.AsType[*wire.Error](err); !refused && !errors.Is(err, wire.ErrLoginRefused) && !hungUp(err) {
 		log.Warn("session ended", "client", client.RemoteAddr(), "err", err)
 	}
 }
