@@ -85,8 +85,9 @@ func TestUpstreamTLSRejects(t *testing.T) {
 }
 
 func TestLoadPolicy(t *testing.T) {
-	if p, err := loadPolicy(""); p != nil || err != nil {
-		t.Errorf("no -config gave %v, %v; want nil, nil", p, err)
+	// Without a config the policy checks nothing, but the kill switch still has a checker to act through.
+	if p, err := loadPolicy(""); p == nil || err != nil || p.NeedsCatalog() {
+		t.Errorf("no -config gave %v, %v; want an empty policy", p, err)
 	}
 
 	good := filepath.Join(t.TempDir(), "good.json")
@@ -189,5 +190,58 @@ func writeFile(t *testing.T, name string, data []byte) {
 	t.Helper()
 	if err := os.WriteFile(name, data, 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAllowlistFileIsLoadedAndSaved(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "allowlist.json")
+	var list policy.Allowlist
+	if err := loadAllowlist(&list, path); err != nil {
+		t.Fatalf("a missing file gave %v; want an empty allowlist", err)
+	}
+	writeFile(t, path, []byte(`{"agent": {"abc": "select $1"}}`))
+	if err := loadAllowlist(&list, path); err != nil {
+		t.Fatal(err)
+	}
+	if l := list.List(); len(l) != 1 || l[0].Role != "agent" {
+		t.Fatalf("loaded %+v; want agent's statement", l)
+	}
+
+	out := filepath.Join(t.TempDir(), "saved.json")
+	if err := saveAllowlist(&list, out); err != nil {
+		t.Fatal(err)
+	}
+	var again policy.Allowlist
+	if err := loadAllowlist(&again, out); err != nil || len(again.List()) != 1 {
+		t.Errorf("saved and loaded %+v, %v; want the one statement", again.List(), err)
+	}
+}
+
+func TestAdminCLIPrintsAnAlignedTable(t *testing.T) {
+	var out strings.Builder
+	printTable(&out, []string{"kind", "name"}, [][]string{{"tenant", "acme"}, {"statement", "ab12"}})
+	want := "kind       name\ntenant     acme\nstatement  ab12\n"
+	if out.String() != want {
+		t.Errorf("printed %q; want %q", out.String(), want)
+	}
+}
+
+func TestSimulateReadsBothTrafficFilesAndPrintsWhatChanges(t *testing.T) {
+	dir := t.TempDir()
+	traffic := filepath.Join(dir, "traffic.jsonl")
+	writeFile(t, traffic+".1", []byte(`{"at":"2026-10-04T12:00:00Z","database":"shop","role":"app","tenant":"app","query":"drop table orders"}`+"\n"))
+	writeFile(t, traffic, []byte(`{"at":"2026-10-05T12:00:00Z","database":"shop","role":"app","tenant":"app","query":"select $1"}`+"\n"))
+	config := filepath.Join(dir, "new.json")
+	writeFile(t, config, []byte(`{"rules": [{"check": "deny_ddl"}]}`))
+	var out, errs strings.Builder
+
+	if code := simulateCLI([]string{"-config", config, "-traffic", traffic}, &out, &errs); code != 0 {
+		t.Fatalf("exit %d: %s", code, errs.String())
+	}
+
+	for _, want := range []string{"2 statements", "deny_ddl", "drop table orders", "newly rejected: 1"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("printed %q; want %q", out.String(), want)
+		}
 	}
 }

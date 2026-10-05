@@ -9,11 +9,19 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"io/fs"
 	"log/slog"
+	"maps"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/Avik-creator/queryguard/internal/safe"
@@ -48,9 +56,21 @@ type options struct {
 	shutdownTimeout time.Duration
 	statsMax        int
 	statsErrorText  bool
+	adminDB         string
+	adminAuthDB     string
+	allowlistFile   string
+	trafficLog      string
 }
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "admin":
+			os.Exit(adminCLI(os.Args[2:], os.Stdout, os.Stderr))
+		case "simulate":
+			os.Exit(simulateCLI(os.Args[2:], os.Stdout, os.Stderr))
+		}
+	}
 	var opts options
 	flag.StringVar(&opts.listen, "listen", "127.0.0.1:6543", "address to accept client connections on")
 	flag.StringVar(&opts.upstream, "upstream", "127.0.0.1:5418", "host:port of the Postgres server")
@@ -77,6 +97,14 @@ func main() {
 		"statement fingerprints, by tenant, whose calls, times and errors are kept; the least called goes first; 0 keeps none")
 	flag.BoolVar(&opts.statsErrorText, "stats-error-text", false,
 		"keep each statement's last error text with its stats; off by default since error text can carry row values")
+	flag.StringVar(&opts.adminDB, "admin-db", "queryguard_admin",
+		"database name that opens the admin console (psql -d queryguard_admin) for superusers and admin_roles; empty turns it off")
+	flag.StringVar(&opts.adminAuthDB, "admin-auth-db", proxy.DefaultAdminAuthDatabase,
+		"real database a console login is checked against by Postgres")
+	flag.StringVar(&opts.allowlistFile, "allowlist-file", "",
+		"JSON file the learned allowlist is read from at start and saved to as it learns")
+	flag.StringVar(&opts.trafficLog, "traffic-log", "",
+		"JSON-lines file of every statement, without its values, kept for a day or two, for queryguard simulate; needs -stats-max above 0")
 	flag.DurationVar(&opts.shutdownTimeout, "shutdown-timeout", proxy.DefaultShutdownTimeout,
 		"how long open sessions may continue after a shutdown signal")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -148,6 +176,25 @@ func run(opts options, log *slog.Logger) error {
 	}
 	if opts.statsMax > 0 {
 		s.Stats = &stats.Table{Max: opts.statsMax, ErrorText: opts.statsErrorText}
+		if opts.trafficLog != "" {
+			s.Stats.Traffic = &stats.TrafficLog{Path: opts.trafficLog, Log: log}
+			defer s.Stats.Traffic.Close()
+		}
+	}
+	s.AdminDatabase, s.AdminAuthDatabase = opts.adminDB, opts.adminAuthDB
+	if opts.config != "" {
+		s.Reload = func() error { return reload(s, opts.config, catalog) }
+	}
+	if opts.allowlistFile != "" {
+		if err := loadAllowlist(&s.Allowlist, opts.allowlistFile); err != nil {
+			return err
+		}
+		go safe.Loop(ctx, log, "allowlist", func(ctx context.Context) { saveAllowlistEvery(ctx, &s.Allowlist, opts.allowlistFile, log) })
+		defer func() {
+			if err := saveAllowlist(&s.Allowlist, opts.allowlistFile); err != nil {
+				log.Error("save allowlist", "file", opts.allowlistFile, "err", err)
+			}
+		}()
 	}
 	s.Monitor = newMonitor(catalog, s, log)
 	if opts.config != "" {
@@ -163,9 +210,184 @@ func run(opts options, log *slog.Logger) error {
 // loadPolicy reads the policy file, or returns nil when there is none.
 func loadPolicy(path string) (*policy.Policy, error) {
 	if path == "" {
-		return nil, nil
+		// An empty policy checks nothing, but gives sessions a checker for the kill switch.
+		return policy.Parse([]byte("{}"))
 	}
 	return policy.Load(path)
+}
+
+// loadAllowlist reads the allowlist from path; a file that isn't there yet leaves it empty.
+func loadAllowlist(list *policy.Allowlist, path string) error {
+	f, err := os.Open(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := list.Load(f); err != nil {
+		return fmt.Errorf("read allowlist %s: %w", path, err)
+	}
+	return nil
+}
+
+// saveAllowlist writes the allowlist to path through a temporary file, so a crash never leaves half of one.
+func saveAllowlist(list *policy.Allowlist, path string) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".allowlist-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if err := list.Save(f); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
+}
+
+// allowlistSaveInterval is how often a changed allowlist is saved.
+const allowlistSaveInterval = 10 * time.Second
+
+// saveAllowlistEvery saves the allowlist whenever it has learned something, until ctx ends.
+func saveAllowlistEvery(ctx context.Context, list *policy.Allowlist, path string, log *slog.Logger) {
+	tick := time.Tick(allowlistSaveInterval)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick:
+		}
+		if list.Changed() {
+			if err := saveAllowlist(list, path); err != nil {
+				log.Error("save allowlist", "file", path, "err", err)
+			}
+		}
+	}
+}
+
+// adminCLI runs one admin console command, such as "show stats" or "kill tenant acme for 10m", and prints its answer.
+func adminCLI(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("queryguard admin", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	addr := flags.String("addr", "127.0.0.1:6543", "host:port QueryGuard listens on")
+	user := flags.String("user", cmp.Or(os.Getenv("PGUSER"), "postgres"), "a superuser or admin role; the password comes from PGPASSWORD or .pgpass")
+	db := flags.String("db", "queryguard_admin", "QueryGuard's -admin-db")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if flags.NArg() == 0 {
+		fmt.Fprintln(stderr, "usage: queryguard admin [-addr host:port] [-user role] [-db name] command, such as: show stats")
+		return 2
+	}
+	host, port, err := net.SplitHostPort(*addr)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, fmt.Sprintf("host=%s port=%s user=%s dbname=%s", host, port, *user, *db))
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	defer conn.Close(ctx)
+	// The console takes simple queries only.
+	rows, err := conn.Query(ctx, strings.Join(flags.Args(), " "), pgx.QueryExecModeSimpleProtocol)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	var columns []string
+	for _, f := range rows.FieldDescriptions() {
+		columns = append(columns, f.Name)
+	}
+	var table [][]string
+	for rows.Next() {
+		var row []string
+		for _, v := range rows.RawValues() {
+			row = append(row, string(v))
+		}
+		table = append(table, row)
+	}
+	if err := rows.Err(); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if columns == nil {
+		fmt.Fprintln(stdout, rows.CommandTag().String())
+		return 0
+	}
+	printTable(stdout, columns, table)
+	return 0
+}
+
+// simulateCLI replays the traffic log against a config and prints what it would have refused that ran, and the other way round.
+func simulateCLI(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("queryguard simulate", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	config := flags.String("config", "", "the config to try")
+	traffic := flags.String("traffic", "", "QueryGuard's -traffic-log; the file before it, with .1 added, is read too")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if *config == "" || *traffic == "" {
+		fmt.Fprintln(stderr, "usage: queryguard simulate -config new.json -traffic traffic.jsonl")
+		return 2
+	}
+	p, err := policy.Load(*config)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	var records []stats.Record
+	for _, path := range []string{*traffic + ".1", *traffic} {
+		recs, err := stats.ReadTraffic(path)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		records = append(records, recs...)
+	}
+	sim := policy.Simulate(p, records)
+
+	fmt.Fprintf(stdout, "%d statements from %s to %s\n\n", sim.Statements, sim.From.Format(time.RFC3339), sim.To.Format(time.RFC3339))
+	var rules [][]string
+	for _, name := range slices.Sorted(maps.Keys(sim.Rules)) {
+		r := sim.Rules[name]
+		rules = append(rules, []string{name, strconv.Itoa(r.Count), strings.Join(r.Examples, "; ")})
+	}
+	if rules != nil {
+		printTable(stdout, []string{"refused by", "statements", "such as"}, rules)
+		fmt.Fprintln(stdout)
+	}
+	var budgets [][]string
+	for _, tenant := range slices.Sorted(maps.Keys(sim.Budgets)) {
+		b := sim.Budgets[tenant]
+		budgets = append(budgets, []string{tenant, strconv.Itoa(b.Rejected), strconv.Itoa(b.Waited), b.Wait.String(), strconv.Itoa(b.Slowed)})
+	}
+	if budgets != nil {
+		printTable(stdout, []string{"tenant", "over budget, refused", "waited", "waited in all", "sent to the slow lane"}, budgets)
+		fmt.Fprintln(stdout)
+	}
+	fmt.Fprintf(stdout, "newly rejected: %d\nno longer rejected: %d\n", sim.NewlyRejected, sim.NoLongerRejected)
+	for _, n := range sim.NotSimulated {
+		fmt.Fprintf(stdout, "not simulated: %s\n", n)
+	}
+	return 0
+}
+
+// printTable writes columns and rows as text, each column as wide as its widest cell.
+func printTable(w io.Writer, columns []string, rows [][]string) {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, strings.Join(columns, "\t"))
+	for _, row := range rows {
+		fmt.Fprintln(tw, strings.Join(row, "\t"))
+	}
+	tw.Flush()
 }
 
 // newCatalog returns the table-size reader for dsn, or nil without one, which a policy with max_scan_rows can't do without.
