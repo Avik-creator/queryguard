@@ -263,7 +263,7 @@ type session struct {
 	statements map[string]statement // prepared statements with a cost check, by name
 	record     func(Finished)       // from Options
 	text       string               // the statement text of the client message being handled, when recording
-	rejecting  bool                 // the message being sent is the proxy's rejection of text
+	rejecting  byte                 // while the proxy sends its rejection of text, the type of the message it refused; else 0
 	texts      map[string]string    // every prepared statement's text, by name, when recording
 	portals    map[string]string    // the text of each portal's statement, by portal name, when recording
 	ran        *hooks               // from the last admission, for the message that runs its statement
@@ -284,6 +284,7 @@ type sent struct {
 	worked   bool      // Postgres answered with more than an EmptyQueryResponse, so a statement ran
 	sql      string    // the statement it belongs to, when recording
 	rejected bool      // it is the proxy's rejection of sql
+	notRun   bool      // it is the proxy's rejection of sql at Parse or Bind
 	reply    reply     // what Postgres's answers to it said so far
 }
 
@@ -1050,13 +1051,13 @@ func (s *session) forward(typ byte, n int) error {
 
 // reject answers a rejected Query or Parse itself when nothing is in flight, and otherwise makes Postgres raise the error.
 func (s *session) reject(typ byte, rej *pgproto3.ErrorResponse) error {
-	s.rejecting = true
-	defer func() { s.rejecting = false }()
+	s.rejecting = typ
+	defer func() { s.rejecting = 0 }()
 	s.mu.Lock()
 	if s.status == 'I' && len(s.pending) == 0 && !s.inBatch {
 		defer s.mu.Unlock()
 		if s.record != nil && s.text != "" {
-			s.record(Finished{SQL: s.text, Code: rej.Code, Message: rej.Message, Rejected: true, NotRun: typ == 'P'})
+			s.record(Finished{SQL: s.text, Code: rej.Code, Message: rej.Message, Rejected: true, NotRun: typ == 'P' || typ == 'B'})
 		}
 		buf, err := rej.Encode(nil)
 		if err != nil {
@@ -1132,7 +1133,9 @@ func (s *session) track(typ byte, how answer) {
 	}
 	// The proxy's rejection through Postgres runs as a hidden Execute, which is what answers for the rejected statement.
 	if s.record != nil && strings.ContainsRune("QPBE", rune(typ)) && (how == relayed || (how == hidden && typ == 'E')) {
-		m.sql, m.rejected = s.text, s.rejecting
+		m.sql, m.rejected = s.text, s.rejecting != 0
+		// The hidden Execute raising a rejected Parse's or Bind's error stands for a statement that never ran.
+		m.notRun = s.rejecting == 'P' || s.rejecting == 'B'
 	}
 	if typ == s.ranOn || typ == 'S' {
 		// A statement bound but never executed before Sync reports nothing.
@@ -1415,6 +1418,9 @@ func (s *session) recordAnswer(head sent, typ byte, took time.Duration) {
 		// A suspended portal runs on at the next Execute, and an empty query runs nothing.
 		if typ == 's' || typ == 'I' {
 			return
+		}
+		if head.notRun {
+			f.Took, f.NotRun = 0, true
 		}
 	case 'P', 'B':
 		if typ != 'E' {

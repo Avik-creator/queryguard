@@ -1261,6 +1261,27 @@ func TestRecordsARejectionPostgresRaisesForTheProxy(t *testing.T) {
 	}
 }
 
+func TestRecordsARejectedParseAsNotRunOnEitherPath(t *testing.T) {
+	rec := make(chan Finished, 10)
+	h := startWith(t, Options{Check: fakeChecker{}, Record: func(f Finished) { rec <- f }, Login: loginReporting})
+
+	h.send(&pgproto3.Parse{Query: "select bad"}, &pgproto3.Sync{})
+	h.clientGets(rejected, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	if f := expectFinished(t, rec); !f.Rejected || !f.NotRun || f.Took != 0 {
+		t.Errorf("recorded %+v; want a rejection that didn't run", f)
+	}
+
+	// With a query in flight the rejection comes from Postgres, through a hidden Execute, and is still one that didn't run.
+	h.send(&pgproto3.Query{String: "select 1"}, &pgproto3.Parse{Query: "select bad"}, &pgproto3.Sync{})
+	h.serverGets(&pgproto3.Query{String: "select 1"}, &pgproto3.Parse{Query: wantDo}, &pgproto3.Bind{}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'},
+		&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, rejected, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	expectFinished(t, rec)
+	if f := expectFinished(t, rec); f.SQL != "select bad" || !f.Rejected || !f.NotRun || f.Took != 0 {
+		t.Errorf("recorded %+v; want the same rejection that didn't run", f)
+	}
+}
+
 // loginReporting is the login start uses, which reports the settings a checked statement needs.
 func loginReporting(_ io.Writer, _ io.Reader, report func(name, value string)) error {
 	report("standard_conforming_strings", loginSettings.StandardConformingStrings)
