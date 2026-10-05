@@ -32,6 +32,7 @@ type Statement struct {
 	Code           string        // the SQLSTATE of its error; "" when it succeeded
 	Message        string        // the error's text, kept only with Table.ErrorText
 	Rejected       bool          // QueryGuard refused it, not Postgres
+	NotRun         bool          // it failed before running, at Parse or Bind
 }
 
 // Counters are one pg_stat_statements entry's cumulative numbers.
@@ -178,6 +179,9 @@ func (t *Table) add(st Statement) {
 			}
 			r.lastErrors[st.Code] = st.Message
 		}
+	}
+	if st.NotRun {
+		return
 	}
 	r.calls++
 	r.n += st.Rows

@@ -191,3 +191,12 @@ func find(t *testing.T, rows []Row, role string) Row {
 	t.Fatalf("no row for role %s in %+v", role, rows)
 	return Row{}
 }
+
+func TestErrorsBeforeRunningAreNotCalls(t *testing.T) {
+	var tb Table
+	tb.add(Statement{Database: "shop", Role: "app", SQL: "select $1::int", Code: "22P02", NotRun: true})
+
+	if r := tb.Rows()[0]; r.Calls != 0 || r.Errors["22P02"] != 1 {
+		t.Errorf("row %+v; want the Bind's error counted and no call", r)
+	}
+}
