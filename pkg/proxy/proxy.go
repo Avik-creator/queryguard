@@ -543,12 +543,27 @@ func (s *Server) addSettings(startup *pgproto3.StartupMessage) {
 func sameCertificate(client, server net.Conn, cfg *tls.Config) bool {
 	_, clientTLS := client.(*tls.Conn)
 	serverTLS, ok := server.(*tls.Conn)
-	if !clientTLS || !ok || cfg == nil || len(cfg.Certificates) == 0 {
+	if !clientTLS || !ok || cfg == nil {
 		return false
 	}
+	own := ownCertificate(cfg)
 	// The handshake proved the server holds the key for the certificate it sent, so a copied certificate can't pass.
 	peer := serverTLS.ConnectionState().PeerCertificates
-	return len(peer) > 0 && bytes.Equal(peer[0].Raw, cfg.Certificates[0].Certificate[0])
+	return own != nil && len(peer) > 0 && bytes.Equal(peer[0].Raw, own.Certificate[0])
+}
+
+// ownCertificate returns the certificate cfg offers clients now, which GetCertificate may change on a reload, or nil.
+func ownCertificate(cfg *tls.Config) *tls.Certificate {
+	if cfg.GetCertificate != nil {
+		if cert, err := cfg.GetCertificate(&tls.ClientHelloInfo{}); err == nil && cert != nil && len(cert.Certificate) > 0 {
+			return cert
+		}
+		return nil
+	}
+	if len(cfg.Certificates) == 0 || len(cfg.Certificates[0].Certificate) == 0 {
+		return nil
+	}
+	return &cfg.Certificates[0]
 }
 
 // logPlanStats logs at each tick the cache hit rate and average explain time, the latency the cost check adds, since the last line.

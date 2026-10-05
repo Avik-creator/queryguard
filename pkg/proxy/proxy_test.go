@@ -468,7 +468,19 @@ func TestEndsTLSCancelConnectionWithCloseNotify(t *testing.T) {
 func TestPassesChannelBindingWhenProxyHasPostgresCertificate(t *testing.T) {
 	cert, _ := testcert.Pair(t)
 
-	got := offeredMechanisms(t, cert, cert, true)
+	got := offeredMechanisms(t, wire.ServerTLSConfig(cert), cert, true)
+
+	if !slices.Equal(got, []string{"SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"}) {
+		t.Errorf("client was offered %q; want SCRAM-SHA-256-PLUS kept", got)
+	}
+}
+
+func TestPassesChannelBindingWhenAReloadableCertificateIsPostgres(t *testing.T) {
+	cert, _ := testcert.Pair(t)
+	cfg := wire.ServerTLSConfig(tls.Certificate{})
+	cfg.Certificates, cfg.GetCertificate = nil, func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &cert, nil }
+
+	got := offeredMechanisms(t, cfg, cert, true)
 
 	if !slices.Equal(got, []string{"SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"}) {
 		t.Errorf("client was offered %q; want SCRAM-SHA-256-PLUS kept", got)
@@ -479,7 +491,7 @@ func TestHidesChannelBindingWhenCertificatesDiffer(t *testing.T) {
 	proxyCert, _ := testcert.Pair(t)
 	pgCert, _ := testcert.Pair(t)
 
-	got := offeredMechanisms(t, proxyCert, pgCert, true)
+	got := offeredMechanisms(t, wire.ServerTLSConfig(proxyCert), pgCert, true)
 
 	if !slices.Equal(got, []string{"SCRAM-SHA-256"}) {
 		t.Errorf("client was offered %q; want only SCRAM-SHA-256", got)
@@ -489,7 +501,7 @@ func TestHidesChannelBindingWhenCertificatesDiffer(t *testing.T) {
 func TestHidesChannelBindingFromPlaintextClient(t *testing.T) {
 	cert, _ := testcert.Pair(t)
 
-	got := offeredMechanisms(t, cert, cert, false)
+	got := offeredMechanisms(t, wire.ServerTLSConfig(cert), cert, false)
 
 	if !slices.Equal(got, []string{"SCRAM-SHA-256"}) {
 		t.Errorf("client was offered %q; want only SCRAM-SHA-256", got)
@@ -1467,14 +1479,14 @@ func askPassword(conn net.Conn, want string) bool {
 	return true
 }
 
-// offeredMechanisms logs in through a proxy presenting proxyCert to a Postgres presenting pgCert that offers both SCRAM methods.
-func offeredMechanisms(t *testing.T, proxyCert, pgCert tls.Certificate, clientTLS bool) []string {
+// offeredMechanisms logs in through a proxy with proxyTLS to a Postgres presenting pgCert that offers both SCRAM methods.
+func offeredMechanisms(t *testing.T, proxyTLS *tls.Config, pgCert tls.Certificate, clientTLS bool) []string {
 	t.Helper()
 	pg := serveFakePostgres(t, &fakePostgres{tls: wire.ServerTLSConfig(pgCert), greeting: []encoder{
 		&pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"}},
 	}})
 	s := newServer(t, pg.addr)
-	s.TLSConfig = wire.ServerTLSConfig(proxyCert)
+	s.TLSConfig = proxyTLS
 	// Certificate checks are tested elsewhere; here only the mechanism list matters.
 	s.Upstream = Dialer{Addr: pg.addr, TLSConfig: &tls.Config{InsecureSkipVerify: true}}
 	addr, _ := startProxy(t, s)
