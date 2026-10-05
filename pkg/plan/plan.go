@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Avik-creator/queryguard/internal/safe"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -539,7 +540,11 @@ func (c *Catalog) reload(database string, s *sizes) {
 	if load == nil {
 		load = c.query
 	}
-	tables, err := load(ctx, database)
+	// A panic in the load is a failed load, so the statements waiting on it go on without sizes.
+	tables, err := func() (_ map[Table]stats, err error) {
+		defer safe.Recover(func(p error) { err = p })
+		return load(ctx, database)
+	}()
 	if err != nil {
 		cmp.Or(c.Log, slog.Default()).Warn("read table sizes", "database", database, "err", err)
 	}

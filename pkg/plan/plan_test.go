@@ -1,6 +1,7 @@
 package plan
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -166,6 +167,19 @@ func TestCatalogWithoutSizesAfterFailedLoad(t *testing.T) {
 	c := &Catalog{load: func(context.Context, string) (map[Table]stats, error) { return nil, errors.New("refused") }}
 	if rows, ok := c.Rows("shop", Table{"public", "orders"}); ok {
 		t.Errorf("Rows = %v after a failed load; want unknown", rows)
+	}
+}
+
+func TestCatalogWithoutSizesAfterALoadPanics(t *testing.T) {
+	var logs bytes.Buffer
+	c := &Catalog{Log: slog.New(slog.NewTextHandler(&logs, nil)),
+		load: func(context.Context, string) (map[Table]stats, error) { panic("bug") }}
+
+	if rows, ok := c.Rows("shop", Table{"public", "orders"}); ok {
+		t.Errorf("Rows = %v after a load panicked; want unknown", rows)
+	}
+	if !strings.Contains(logs.String(), "bug") {
+		t.Errorf("log %q; want the panic", logs.String())
 	}
 }
 
