@@ -282,21 +282,29 @@ func inc(m map[string]int64, code string) map[string]int64 {
 
 // Counters takes a reading of pg_stat_statements; each entry's growth since the last reading is added to its row's Buffers.
 func (t *Table) Counters(cs []Counters) {
+	// Parsing a reading's new texts can take a while, so it is done before taking mu, which admissions wait on; a map once stored isn't changed.
+	t.mu.Lock()
+	known := t.queryPrints
+	t.mu.Unlock()
+	prints := make(map[int64]string, len(cs))
+	for _, c := range cs {
+		fp, ok := known[c.QueryID]
+		if !ok {
+			fp = sqlparse.Fingerprint(c.Query)
+		}
+		prints[c.QueryID] = fp
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	last := make(map[counterKey]Counters, len(cs))
-	prints := make(map[int64]string, len(cs))
 	seen := map[owner]bool{}
 	if t.buffers == nil {
 		t.buffers = map[owner]Buffers{}
 	}
 	for _, c := range cs {
 		ck := counterKey{c.Database, c.Role, c.QueryID}
-		fp, ok := t.queryPrints[c.QueryID]
-		if !ok {
-			fp = sqlparse.Fingerprint(c.Query)
-		}
-		prints[c.QueryID] = fp
+		fp := prints[c.QueryID]
 		before := t.last[ck]
 		// Counters that fell were reset, or the entry was dropped and made again, so all of them are new.
 		if c.Calls < before.Calls {
