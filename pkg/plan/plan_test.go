@@ -596,6 +596,34 @@ func TestMonitorSkipsFailedReads(t *testing.T) {
 	})
 }
 
+func TestMonitorReportsNothingKnownOnceReadsKeepFailing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var polls atomic.Int32
+		m := &Monitor{Log: slog.New(slog.DiscardHandler), read: func(context.Context, []Table) (Activity, error) {
+			if polls.Add(1) == 1 {
+				return Activity{Waiting: map[int32]Wait{7: {Blockers: []int32{3}}}, ReplicationLag: time.Minute}, nil
+			}
+			return Activity{}, errors.New("connection refused")
+		}}
+		var reports []Activity
+		var mu sync.Mutex
+		go m.Run(t.Context(), func(a Activity) {
+			mu.Lock()
+			defer mu.Unlock()
+			reports = append(reports, a)
+		})
+
+		time.Sleep((1+staleReads)*DefaultMonitorInterval + time.Millisecond)
+
+		mu.Lock()
+		defer mu.Unlock()
+		// Holds and limits set from the last reading would otherwise stay for as long as the reads fail.
+		if len(reports) != 2 || reports[1].LockWaits() != 0 || reports[1].ReplicationLag != 0 {
+			t.Errorf("reports %+v; want the reading, then nothing known after %d failed reads", reports, staleReads)
+		}
+	})
+}
+
 func TestMonitorReadsTheWatchedTables(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		jobs := Table{"public", "jobs"}

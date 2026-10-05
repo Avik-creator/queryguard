@@ -578,7 +578,11 @@ type Snapshot struct {
 // LockWaits is how many sessions wait on locks: those waiting now, or more when more waited since the last reading.
 func (a Activity) LockWaits() int { return max(len(a.Waiting), int(math.Round(a.FinishedWaits))) }
 
-// Run reads the activity every Interval and passes each reading to report, until ctx ends; a failed reading is logged and skipped.
+// staleReads is how many reads in a row may fail before the Monitor reports that it knows nothing of the server.
+const staleReads = 3
+
+// Run reads the activity every Interval and passes each reading to report, until ctx ends; a failed reading is logged and
+// skipped, and after staleReads of them in a row an empty Activity is reported.
 func (m *Monitor) Run(ctx context.Context, report func(Activity)) {
 	read := m.read
 	if read == nil {
@@ -588,6 +592,7 @@ func (m *Monitor) Run(ctx context.Context, report func(Activity)) {
 	}
 	var last Activity
 	var lastAt time.Time
+	failed := 0
 	tick := time.Tick(cmp.Or(m.Interval, DefaultMonitorInterval))
 	for {
 		select {
@@ -606,8 +611,14 @@ func (m *Monitor) Run(ctx context.Context, report func(Activity)) {
 			if ctx.Err() == nil {
 				cmp.Or(m.Log, slog.Default()).Warn("read server activity", "err", err)
 			}
+			if failed++; failed == staleReads {
+				// What the last reading set, such as a hold while a standby lagged, mustn't outlast it for good.
+				last, lastAt = Activity{}, time.Time{}
+				report(Activity{})
+			}
 			continue
 		}
+		failed = 0
 		// Lock wait time counts only once a wait ends, so its growth over a second is how many sessions waited on average.
 		if !lastAt.IsZero() && a.finishedWaitMS >= last.finishedWaitMS {
 			a.FinishedWaits = (a.finishedWaitMS - last.finishedWaitMS) / float64(time.Since(lastAt).Milliseconds())
