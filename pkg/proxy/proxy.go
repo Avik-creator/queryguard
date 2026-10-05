@@ -7,10 +7,12 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"iter"
 	"log/slog"
 	"maps"
+	"math"
 	"net"
 	"net/netip"
 	"strconv"
@@ -87,12 +89,26 @@ type Server struct {
 	History plan.History
 	// Stats gathers each statement's calls, time, rows and errors by fingerprint and tenant; nil gathers none.
 	Stats *stats.Table
+	// Runaways are the statements recently cancelled for breaking their timeout or a cap.
+	Runaways policy.Watch
+	// Kills are the tenants and statements blocked from the admin console.
+	Kills policy.Kills
+	// Allowlist holds each role's learned statements, for the allowlist in the config.
+	Allowlist policy.Allowlist
+	// AdminDatabase is the database name that opens the admin console instead of a session; "" turns the console off.
+	AdminDatabase string
+	// AdminAuthDatabase is the real database a console login is checked against; "" means DefaultAdminAuthDatabase.
+	AdminAuthDatabase string
+	// Reload reads the config file again, for the console's RELOAD; nil means there is none.
+	Reload func() error
 
 	keys     cancelKeys
 	sessions sessionCount
+	throttle loginThrottle
 	backends backends
 	policies policy.Holder
-	starting atomic.Int64 // connections that have yet to send their startup message
+	starting atomic.Int64  // connections that have yet to send their startup message
+	capacity atomic.Uint64 // the server's measured cost units a second, as float64 bits; 0 until measured
 
 	// Only the Monitor's goroutine uses these.
 	observed   time.Time              // when it last reported
@@ -168,8 +184,33 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		if s.Stats.Tenant == nil {
 			s.Stats.Tenant = s.tenantOf
 		}
+		if s.Stats.Units == nil {
+			s.Stats.Units = s.History.CostOf
+		}
 		go safe.Loop(ctx, log, "stats", s.Stats.Run)
+		go safe.Loop(ctx, log, "anomalies", func(ctx context.Context) {
+			tick := time.Tick(time.Minute)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case now := <-tick:
+					logAnomalies(log, s.Stats.Minute(now))
+				}
+			}
+		})
 	}
+	go safe.Loop(ctx, log, "capacity", func(ctx context.Context) {
+		tick := time.Tick(capacityInterval)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick:
+				s.applyCapacity()
+			}
+		}
+	})
 	if s.ActivePolicy() != nil {
 		tick := time.Tick(planStatsInterval)
 		go safe.Loop(ctx, log, "plan stats", func(ctx context.Context) { s.logPlanStats(ctx, log, tick) })
@@ -281,6 +322,15 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	role := pgName(startup.Parameters["user"])
 	// Postgres connects a client that names no database to the one named after its role.
 	database := pgName(cmp.Or(startup.Parameters["database"], role))
+	throttle, key := s.loginThrottle(), throttleKey{clientAddr(client), role}
+	if wait := s.throttle.coolingOff(key, time.Now()); wait > 0 && throttle.Failures > 0 {
+		wire.SendFatal(client, "28000", fmt.Sprintf("queryguard: too many failed logins; retry in about %s", wait.Round(time.Second)))
+		return
+	}
+	if s.AdminDatabase != "" && database == s.AdminDatabase {
+		s.admin(ctx, log, client, startup, role, key, throttle)
+		return
+	}
 	var (
 		check         session.Checker
 		authenticated func() *wire.Error
@@ -289,9 +339,13 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	)
 	if p := s.ActivePolicy(); p != nil {
 		c := s.policies.Checker(role, log.With("client", client.RemoteAddr()))
-		c.Env = policy.Env{Database: database, Client: clientAddr(client), Plans: &s.Plans, History: &s.History, Scheduler: s.scheduler()}
+		c.Env = policy.Env{Database: database, Client: clientAddr(client), Plans: &s.Plans, History: &s.History, Scheduler: s.scheduler(),
+			Runaways: &s.Runaways, Kills: &s.Kills, Allowlist: &s.Allowlist}
 		if s.Catalog != nil {
 			c.Env.Tables = s.Catalog
+		}
+		if s.Stats != nil {
+			c.Env.WAL, c.Env.P99, c.Env.Flipped = s.Stats.WALPerCall, s.Stats.P99, s.Stats.Flipped
 		}
 		if s.Monitor != nil {
 			running = &backend{}
@@ -318,6 +372,14 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	}
 	// Relay has returned, and with it the login that set release, by the time this runs.
 	defer func() { release() }()
+	capped := authenticated
+	authenticated = func() *wire.Error {
+		s.throttle.succeeded(key)
+		if capped != nil {
+			return capped()
+		}
+		return nil
+	}
 
 	s.addSettings(startup)
 	// A server that takes the connection and never answers would otherwise hold the session forever.
@@ -370,7 +432,7 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	var record func(session.Finished)
 	if t := s.Stats; t != nil {
 		record = func(f session.Finished) {
-			t.Record(stats.Statement{Database: database, Role: role, SQL: f.SQL, Took: f.Took, Rows: f.Rows, Code: f.Code,
+			t.Record(stats.Statement{At: time.Now(), Database: database, Role: role, SQL: f.SQL, Took: f.Took, Rows: f.Rows, Code: f.Code,
 				Message: f.Message, Rejected: f.Rejected, NotRun: f.NotRun})
 		}
 	}
@@ -386,12 +448,39 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 		}})
 	forget()
 	unfile()
+	// A wrong password and a pg_hba.conf rejection count; a server that is starting up or full doesn't.
+	if e, ok := errors.AsType[*wire.LoginRefusedError](err); ok && (e.Code == "28P01" || e.Code == "28000") && throttle.Failures > 0 {
+		if s.throttle.failed(key, time.Now(), throttle) {
+			log.Warn("refusing logins after repeated failures", "client", client.RemoteAddr(), "role", role,
+				"failures", throttle.Failures, "cool_off", time.Duration(throttle.CoolOff))
+		}
+	}
 	// A login refused over the cap was logged when it was refused, and Postgres logs the logins it refuses.
 	switch _, refused := errors.AsType[*wire.Error](err); {
 	case isPanic(err):
 		logPanic(log, client, err)
 	case !refused && !errors.Is(err, wire.ErrLoginRefused) && !hungUp(err):
 		log.Warn("session ended", "client", client.RemoteAddr(), "err", err)
+	}
+}
+
+// loginThrottle returns the login throttle of the policy in force, or the default one without a policy.
+func (s *Server) loginThrottle() policy.LoginThrottle {
+	if p := s.ActivePolicy(); p != nil {
+		return p.LoginThrottle()
+	}
+	return (&policy.Policy{}).LoginThrottle()
+}
+
+// logAnomalies logs each anomaly a minute started or ended.
+func logAnomalies(log *slog.Logger, anomalies []stats.Anomaly) {
+	for _, a := range anomalies {
+		if a.Ended {
+			log.Info("anomaly ended", "signal", a.Signal, "value", a.Value, "baseline", a.Baseline)
+			continue
+		}
+		log.Warn("anomaly", "signal", a.Signal, "value", a.Value, "baseline", a.Baseline, "statements", a.Statements, "flips", a.Flips,
+			"lock_waits", a.LockWaits)
 	}
 }
 
@@ -495,8 +584,11 @@ var lockTimeout = session.Interruption{Code: "55P03", Message: "queryguard: canc
 
 // observe acts on one reading of the server's activity.
 func (s *Server) observe(a plan.Activity) {
-	if a.Statements != nil && s.Stats != nil {
-		s.Stats.Counters(a.Statements)
+	if s.Stats != nil {
+		if a.Statements != nil {
+			s.Stats.Counters(a.Statements)
+		}
+		s.Stats.LockWaits(a.LockWaits())
 	}
 	now := time.Now()
 	elapsed := min(now.Sub(s.observed), maxObserveGap)
@@ -653,12 +745,12 @@ func (s *Server) SetPolicy(p *policy.Policy) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.sched == nil {
-		s.sched = sched.New(s.scaled(p.SchedConfig()))
+		s.sched = sched.New(s.schedConfig(p))
 		if s.serving != nil {
 			go safe.Loop(s.serving, cmp.Or(s.Logger, slog.Default()), "scheduler", s.sched.Run)
 		}
 	} else {
-		s.sched.Configure(s.scaled(p.SchedConfig()))
+		s.sched.Configure(s.schedConfig(p))
 	}
 	s.policies.Store(p)
 }
@@ -777,11 +869,54 @@ func (s *Server) applyFleet() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.sched != nil && p != nil {
-		s.sched.Configure(s.scaled(p.SchedConfig()))
+		s.sched.Configure(s.schedConfig(p))
 	}
 }
 
 // scaled returns cfg with each fleet-wide limit cut to this instance's share, and shut where it has none, as before its first lease.
+// schedConfig is p's scheduler config with budgets by capacity turned into rates and every rate scaled to this instance's lease.
+func (s *Server) schedConfig(p *policy.Policy) sched.Config {
+	cfg := p.SchedConfig()
+	capacity := math.Float64frombits(s.capacity.Load())
+	byCapacity := func(b sched.Budget) sched.Budget {
+		// Until statements have been timed the capacity isn't known, and the budget doesn't limit.
+		if b.Capacity > 0 && capacity > 0 {
+			b.Rate = b.Capacity * capacity
+		}
+		return b
+	}
+	for t, b := range cfg.Budgets {
+		cfg.Budgets[t] = byCapacity(b)
+	}
+	cfg.Default = byCapacity(cfg.Default)
+	return s.scaled(cfg)
+}
+
+// capacityInterval is how often the server's capacity is measured for budgets by capacity.
+const capacityInterval = 10 * time.Second
+
+// capacityChange is how far the measured capacity must move before budgets by capacity are set again.
+const capacityChange = 0.1
+
+// applyCapacity measures the server's capacity, max_active statements at its time per cost unit, and sets budgets by capacity from it.
+func (s *Server) applyCapacity() {
+	p := s.ActivePolicy()
+	perSecond, ok := s.History.CostOf(time.Second)
+	if p == nil || !ok {
+		return
+	}
+	capacity := float64(p.SchedConfig().Fast.MaxActive) * perSecond
+	if old := math.Float64frombits(s.capacity.Load()); old > 0 && math.Abs(capacity-old) <= capacityChange*old {
+		return
+	}
+	s.capacity.Store(math.Float64bits(capacity))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sched != nil {
+		s.sched.Configure(s.schedConfig(p))
+	}
+}
+
 func (s *Server) scaled(cfg sched.Config) sched.Config {
 	if s.Fleet == nil {
 		return cfg

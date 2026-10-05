@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -729,6 +730,95 @@ func TestMonitorsStatementCountersReachTheStats(t *testing.T) {
 		rows := s.Stats.Rows()
 		return len(rows) == 1 && rows[0].Buffers.TempWritten == 9 && rows[0].Buffers.Calls == 4
 	})
+}
+
+func TestRepeatedFailedLoginsAreRefusedBeforeReachingPostgres(t *testing.T) {
+	refused := &pgproto3.ErrorResponse{Severity: "FATAL", Code: "28P01", Message: "password authentication failed"}
+	pg := serveFakePostgres(t, &fakePostgres{greetingFor: map[string][]encoder{"mallory": {refused}}})
+	s := newServer(t, pg.addr)
+	s.Policy = mustPolicy(t, `{"login_throttle": {"failures": 2, "cool_off": "1m"}}`)
+	addr, _ := startProxy(t, s)
+
+	// The fake server answers by database, which a client that names none gets from its role, as in Postgres.
+	for range 2 {
+		conn := dial(t, addr)
+		send(t, conn, &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30, Parameters: map[string]string{"user": "mallory", "database": "mallory"}})
+		mustReceive[*pgproto3.StartupMessage](t, pg.received)
+		expectFatal(t, conn, "28P01")
+	}
+
+	// The third try from the same address and role is turned away by the proxy, holding no Postgres connection.
+	conn := sendStartupAs(t, dial(t, addr), "mallory")
+	expectFatal(t, conn, "28000")
+	select {
+	case msg := <-pg.received:
+		t.Fatalf("Postgres got %#v; want nothing while the address cools off", msg)
+	case <-time.After(100 * time.Millisecond):
+	}
+	// Another role from the same address, such as another app behind the same NAT, still logs in.
+	loginAs(t, dial(t, addr), "alice")
+}
+
+func TestASuccessfulLoginClearsFailures(t *testing.T) {
+	refused := &pgproto3.ErrorResponse{Severity: "FATAL", Code: "28P01", Message: "password authentication failed"}
+	pg := serveFakePostgres(t, &fakePostgres{greetingFor: map[string][]encoder{"wrong": {refused}}})
+	s := newServer(t, pg.addr)
+	s.Policy = mustPolicy(t, `{"login_throttle": {"failures": 2}}`)
+	addr, _ := startProxy(t, s)
+	// The role's database decides the fake server's answer, so one role fails or succeeds by the database it names.
+	fail := func() {
+		conn := dial(t, addr)
+		send(t, conn, &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30, Parameters: map[string]string{"user": "alice", "database": "wrong"}})
+		expectFatal(t, conn, "28P01")
+	}
+
+	fail()
+	login(t, dial(t, addr))
+	fail()
+
+	// One failure since the success, so the next try still reaches Postgres.
+	fail()
+}
+
+func TestCapacityBudgetsFollowTheMeasuredCapacity(t *testing.T) {
+	s := newServer(t, startFakePostgres(t).addr)
+	s.SetPolicy(mustPolicy(t, `{"scheduler": {"max_active": 4}, "tenant_defaults": {"budget": {"capacity": 0.5, "when_over": "reject"}}}`))
+	s.applyCapacity()
+	if d := retryAfterSpending(s, "early", 1e9); d != 0 {
+		t.Fatalf("owes for %v before any statement was timed; want no limit yet", d)
+	}
+
+	// 1000 cost units take 0.1s, so a statement-second is 10000 units, the server's 4 slots 40000, and half of that 20000 a second.
+	for range 10 {
+		s.History.Ran("", "s", plan.Plan{Cost: 1000, Shape: 1}, 100*time.Millisecond, true, plan.Tuning{})
+	}
+	s.applyCapacity()
+
+	// A second's worth is saved up, so spending 60000 owes 40000: two seconds.
+	if d := retryAfterSpending(s, "reporting", 60000); d < 1900*time.Millisecond || d > 2100*time.Millisecond {
+		t.Errorf("owes for %v; want about 2s at 20000 units a second", d)
+	}
+}
+
+// retryAfterSpending charges tenant cost and returns how long until it owes nothing.
+func retryAfterSpending(s *Server, tenant string, cost float64) time.Duration {
+	s.scheduler().Surcharge(tenant, cost)
+	return s.scheduler().RetryAfter(tenant)
+}
+
+func TestAnomaliesAreLoggedWithWhatIsBehindThem(t *testing.T) {
+	var logs bytes.Buffer
+	logAnomalies(slog.New(slog.NewTextHandler(&logs, nil)), []stats.Anomaly{
+		{Signal: "p99", Value: 2, Baseline: 0.01, Statements: []string{"select * from orders where note like $1"}, Flips: []string{"select $1"}, LockWaits: 7},
+		{Signal: "errors", Ended: true, Value: 0.001, Baseline: 0.001},
+	})
+
+	for _, want := range []string{`msg=anomaly signal=p99 value=2 baseline=0.01`, `statements="[select * from orders where note like $1]"`,
+		`flips="[select $1]"`, `lock_waits=7`, `msg="anomaly ended" signal=errors`} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log %q; want %q", logs.String(), want)
+		}
+	}
 }
 
 // panicOnce panics in its first Acquire, as a bug in a session would.
@@ -1632,4 +1722,150 @@ func waitUntil(t *testing.T, cond func() bool) {
 		}
 	}
 	t.Fatal("condition not met within 2s")
+}
+
+func TestLoginFailuresOutsideTheWindowDontAddUp(t *testing.T) {
+	var l loginThrottle
+	cfg := policy.LoginThrottle{Failures: 2, Window: policy.Duration(time.Minute), CoolOff: policy.Duration(time.Minute)}
+	k, now := throttleKey{role: "alice"}, time.Now()
+
+	l.failed(k, now, cfg)
+	if l.failed(k, now.Add(2*time.Minute), cfg) {
+		t.Error("two failures two minutes apart started a cool-off; want the first forgotten")
+	}
+	if !l.failed(k, now.Add(2*time.Minute+time.Second), cfg) || l.coolingOff(k, now.Add(2*time.Minute+2*time.Second)) == 0 {
+		t.Error("two failures within the window started no cool-off")
+	}
+	if l.coolingOff(k, now.Add(4*time.Minute)) != 0 {
+		t.Error("still cooling off after cool_off")
+	}
+}
+
+func TestLoginThrottleForgetsWhatNoLongerCounts(t *testing.T) {
+	var l loginThrottle
+	cfg := policy.LoginThrottle{Failures: 5, Window: policy.Duration(time.Minute), CoolOff: policy.Duration(time.Minute)}
+	now := time.Now()
+	for i := range maxThrottled {
+		l.failed(throttleKey{role: strconv.Itoa(i)}, now, cfg)
+	}
+
+	l.failed(throttleKey{role: "new"}, now.Add(2*time.Minute), cfg)
+
+	if n := len(l.seen); n != 1 {
+		t.Errorf("throttle remembers %d; want only the new one", n)
+	}
+}
+
+// adminServer starts a proxy with an admin console, in front of a fake server that says whether the login is a superuser.
+func adminServer(t *testing.T, superuser, config string) (*Server, *fakePostgres, string) {
+	t.Helper()
+	pg := serveFakePostgres(t, &fakePostgres{greetingFor: map[string][]encoder{"postgres": {&pgproto3.AuthenticationOk{},
+		&pgproto3.ParameterStatus{Name: "is_superuser", Value: superuser}, fakeServerKey, &pgproto3.ReadyForQuery{TxStatus: 'I'}}}})
+	s := newServer(t, pg.addr)
+	s.AdminDatabase = "qgadmin"
+	s.Stats = &stats.Table{}
+	if config != "" {
+		s.Policy = mustPolicy(t, config)
+	}
+	addr, _ := startProxy(t, s)
+	return s, pg, addr
+}
+
+// adminLogin logs in to the admin console as role.
+func adminLogin(t *testing.T, addr, role string) net.Conn {
+	t.Helper()
+	conn := dial(t, addr)
+	send(t, conn, &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30, Parameters: map[string]string{"user": role, "database": "qgadmin"}})
+	finishLogin(t, conn)
+	return conn
+}
+
+// adminQuery runs sql on the console and returns the rows of its answer and its command tag, failing on an error.
+func adminQuery(t *testing.T, conn net.Conn, sql string) ([][]string, string) {
+	t.Helper()
+	send(t, conn, &pgproto3.Query{String: sql})
+	var rows [][]string
+	var tag string
+	for {
+		switch msg := receive(t, conn).(type) {
+		case *pgproto3.RowDescription:
+		case *pgproto3.DataRow:
+			var row []string
+			for _, v := range msg.Values {
+				row = append(row, string(v))
+			}
+			rows = append(rows, row)
+		case *pgproto3.CommandComplete:
+			tag = string(msg.CommandTag)
+		case *pgproto3.ErrorResponse:
+			t.Fatalf("%s: %s", sql, msg.Message)
+		case *pgproto3.ReadyForQuery:
+			return rows, tag
+		default:
+			t.Fatalf("%s: got %#v", sql, msg)
+		}
+	}
+}
+
+func TestAdminConsoleLogsInThroughPostgresAndKills(t *testing.T) {
+	s, pg, addr := adminServer(t, "on", "")
+	conn := adminLogin(t, addr, "alice")
+
+	// Postgres checked the password, against a real database.
+	if got := mustReceive[*pgproto3.StartupMessage](t, pg.received); got.Parameters["database"] != "postgres" || got.Parameters["user"] != "alice" {
+		t.Errorf("Postgres got %v; want alice's login to the postgres database", got.Parameters)
+	}
+	if _, tag := adminQuery(t, conn, "KILL TENANT 'acme' FOR '10m';"); tag != "KILL" {
+		t.Errorf("tag %q; want KILL", tag)
+	}
+	if k := s.Kills.List(time.Now()); len(k) != 1 || k[0].Name != "acme" || time.Until(k[0].Until) < 9*time.Minute {
+		t.Errorf("kills %+v; want acme for 10 minutes", k)
+	}
+	rows, _ := adminQuery(t, conn, "show kills")
+	if len(rows) != 1 || rows[0][0] != "tenant" || rows[0][1] != "acme" {
+		t.Errorf("SHOW KILLS = %q; want acme", rows)
+	}
+	adminQuery(t, conn, "unkill tenant acme")
+	if k := s.Kills.List(time.Now()); len(k) != 0 {
+		t.Errorf("kills %+v after UNKILL; want none", k)
+	}
+	for _, sql := range []string{"show stats", "show tenants", "show anomalies", "show flips", "show watch", "show help"} {
+		adminQuery(t, conn, sql)
+	}
+}
+
+func TestAdminConsoleRefusesWhatItDoesNotKnow(t *testing.T) {
+	_, _, addr := adminServer(t, "on", "")
+	conn := adminLogin(t, addr, "alice")
+
+	send(t, conn, &pgproto3.Query{String: "drop table orders"})
+	if e, ok := receive(t, conn).(*pgproto3.ErrorResponse); !ok || e.Code != "42601" {
+		t.Fatalf("got %#v; want a syntax error", e)
+	}
+	mustBeReady(t, conn)
+	// pgx and other drivers use the extended protocol unless told not to.
+	for _, m := range []encoder{&pgproto3.Parse{Query: "show stats"}, &pgproto3.Bind{}, &pgproto3.Execute{}, &pgproto3.Sync{}} {
+		send(t, conn, m)
+	}
+	if e, ok := receive(t, conn).(*pgproto3.ErrorResponse); !ok || e.Code != "0A000" {
+		t.Fatalf("got %#v; want feature_not_supported", e)
+	}
+	mustBeReady(t, conn)
+	adminQuery(t, conn, "show kills")
+}
+
+func TestAdminConsoleIsForSuperusersAndAdminRoles(t *testing.T) {
+	_, _, addr := adminServer(t, "off", "")
+	conn := adminLogin(t, addr, "alice")
+	expectFatal(t, conn, "42501")
+
+	_, _, addr = adminServer(t, "off", `{"admin_roles": ["ops"]}`)
+	adminQuery(t, adminLogin(t, addr, "ops"), "show kills")
+}
+
+func mustBeReady(t *testing.T, conn net.Conn) {
+	t.Helper()
+	if _, ok := receive(t, conn).(*pgproto3.ReadyForQuery); !ok {
+		t.Fatal("no ReadyForQuery")
+	}
 }
