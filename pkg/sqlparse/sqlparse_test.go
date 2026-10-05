@@ -103,8 +103,8 @@ func TestAnalyze(t *testing.T) {
 			t.Errorf("Analyze(%q): %v", tc.sql, err)
 			continue
 		}
-		// The functions called and whether it only reads have tests of their own.
-		got.Functions, got.ReadOnly = nil, false
+		// The functions called and whether it only reads or may write have tests of their own.
+		got.Functions, got.ReadOnly, got.Writes = nil, false, false
 		if !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("Analyze(%q) = %+v; want %+v", tc.sql, got, tc.want)
 		}
@@ -320,6 +320,86 @@ func TestAnalyzeKnowsWhichStatementsRunOneNamedElsewhere(t *testing.T) {
 		}
 		if q.Named != want {
 			t.Errorf("Analyze(%q).Named = %v; want %v", sql, q.Named, want)
+		}
+	}
+}
+
+func TestAnalyzeKnowsWhatMayWrite(t *testing.T) {
+	for sql, want := range map[string]bool{
+		"select * from orders":                            false,
+		"select 1; select 2":                              false,
+		"show work_mem":                                   false,
+		"explain select * from orders":                    false,
+		"explain analyze select * from orders":            false,
+		"begin; select 1; commit":                         false,
+		"begin read only":                                 false,
+		"start transaction isolation level serializable":  false,
+		"savepoint a; rollback to savepoint a":            false,
+		"set statement_timeout = '5s'":                    false,
+		"set search_path = app":                           false,
+		"set transaction read only":                       false,
+		"declare c cursor for select * from orders":       false,
+		"fetch 10 from c":                                 false,
+		"close c":                                         false,
+		"prepare q as select * from orders where id = $1": false,
+		"execute q(1)":                                    false,
+		"deallocate q":                                    false,
+		"discard all":                                     false,
+		"copy orders to stdout":                           false,
+		"copy (select 1) to stdout":                       false,
+		"insert into orders values (1)":                   true,
+		"update orders set total = 0 where id = 1":        true,
+		"delete from orders where id = 1":                 true,
+		"merge into a using b on a.id = b.id when matched then delete": true,
+		"truncate orders":                 true,
+		"drop table orders":               true,
+		"create temp table t (id int)":    true,
+		"select * into t from orders":     true,
+		"create table t as select 1":      true,
+		"select * from orders for update": true,
+		"with gone as (delete from orders returning id) select * from gone":  true,
+		"explain analyze delete from orders where id = 1":                    true,
+		"prepare d as delete from orders where id = $1":                      true,
+		"commit; drop table orders":                                          true,
+		"rollback; insert into orders values (1)":                            true,
+		"begin read write":                                                   true,
+		"start transaction isolation level serializable, read write":         true,
+		"begin; set transaction read write":                                  true,
+		"set session characteristics as transaction read write":              true,
+		"set default_transaction_read_only = off":                            true,
+		"set session default_transaction_read_only to false":                 true,
+		"set transaction_read_only = off":                                    true,
+		"reset default_transaction_read_only":                                true,
+		"reset all":                                                          true,
+		"set role admin":                                                     true,
+		"set session authorization admin":                                    true,
+		"select set_config('default_transaction_read_only', 'off', false)":   true,
+		"select pg_catalog.set_config('transaction_read_only', 'off', true)": true,
+		"select nextval('orders_id_seq')":                                    true,
+		"select setval('orders_id_seq', 1)":                                  true,
+		"do $$ begin delete from orders; end $$":                             true,
+		"call cleanup()":                                                     true,
+		"lock table orders":                                                  true,
+		"vacuum orders":                                                      true,
+		"analyze orders":                                                     true,
+		"notify jobs":                                                        true,
+		"copy orders from stdin":                                             true,
+		"copy orders to '/tmp/orders'":                                       true,
+		"copy (select 1) to program 'id'":                                    true,
+		"prepare transaction 'x'":                                            true,
+		"grant select on orders to public":                                   true,
+		"alter system set default_transaction_read_only = off":               true,
+		"checkpoint":                       true,
+		"refresh materialized view totals": true,
+		"cluster orders":                   true,
+		"load 'plugin'":                    true,
+	} {
+		q, err := Analyze(sql)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		if q.Writes != want {
+			t.Errorf("Analyze(%q).Writes = %v; want %v", sql, q.Writes, want)
 		}
 	}
 }

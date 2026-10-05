@@ -29,7 +29,16 @@ type Query struct {
 	Functions           []string // functions called by name, as schema.name when qualified, sorted, without duplicates
 	ReadOnly            bool     // only SELECTs or VALUES, without INTO, FOR UPDATE and the like, or a CTE that changes rows
 	Named               bool     // a single FETCH, MOVE or EXECUTE, which runs a cursor or prepared statement its text only names
+	// Writes is anything but reading: DML, DDL, row locks, COPY FROM or to a file, a READ WRITE transaction, changing the read-only
+	// settings or the role, nextval, setval, set_config, and any statement not known to only read, such as NOTIFY or VACUUM.
+	Writes bool
 }
+
+// writingFunctions change state although a SELECT may call them, which a read-only transaction refuses too.
+var writingFunctions = []string{"nextval", "setval", "set_config"}
+
+// readOnlySettings turn a session's or transaction's read-only mode off when set or reset.
+var readOnlySettings = []string{"default_transaction_read_only", "transaction_read_only"}
 
 // notDDL lists the statement types Postgres's GetCommandLogLevel does not log as DDL; every other *Stmt is DDL.
 var notDDL = map[protoreflect.Name]bool{
@@ -78,6 +87,16 @@ func Analyze(sql string) (Query, error) {
 			schemas[schema] = true
 		}
 	}
+	for _, st := range tree.Stmts {
+		switch st.GetStmt().GetNode().(type) {
+		case *pg_query.Node_SelectStmt, *pg_query.Node_VariableShowStmt, *pg_query.Node_ExplainStmt, *pg_query.Node_TransactionStmt,
+			*pg_query.Node_VariableSetStmt, *pg_query.Node_DeclareCursorStmt, *pg_query.Node_FetchStmt, *pg_query.Node_ClosePortalStmt,
+			*pg_query.Node_PrepareStmt, *pg_query.Node_ExecuteStmt, *pg_query.Node_DeallocateStmt, *pg_query.Node_DiscardStmt,
+			*pg_query.Node_CopyStmt:
+		default:
+			q.Writes = true
+		}
+	}
 	walk(tree.ProtoReflect(), func(m protoreflect.Message) {
 		if name := m.Descriptor().Name(); strings.HasSuffix(string(name), "Stmt") && !notDDL[name] {
 			q.DDL = true
@@ -122,6 +141,19 @@ func Analyze(sql string) (Query, error) {
 			}
 		case *pg_query.DoStmt, *pg_query.CallStmt:
 			q.Opaque = true
+		case *pg_query.TransactionStmt:
+			switch n.Kind {
+			case pg_query.TransactionStmtKind_TRANS_STMT_PREPARE, pg_query.TransactionStmtKind_TRANS_STMT_COMMIT_PREPARED,
+				pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_PREPARED:
+				q.Writes = true
+			}
+		case *pg_query.DefElem:
+			// READ WRITE in BEGIN, SET TRANSACTION and SET SESSION CHARACTERISTICS is transaction_read_only = 0.
+			if n.Defname == "transaction_read_only" && n.GetArg().GetAConst().GetIval().GetIval() == 0 {
+				q.Writes = true
+			}
+		case *pg_query.CopyStmt:
+			q.Writes = q.Writes || n.IsFrom || n.IsProgram || n.Filename != ""
 		case *pg_query.VacuumStmt:
 			q.Analyzes = true
 		case *pg_query.RangeVar:
@@ -129,6 +161,9 @@ func Analyze(sql string) (Query, error) {
 		case *pg_query.FuncCall:
 			add(schemaOf(n.Funcname))
 			functions[funcName(n.Funcname)] = true
+			q.Writes = q.Writes || slices.ContainsFunc(writingFunctions, func(f string) bool {
+				return strings.EqualFold(f, n.Funcname[len(n.Funcname)-1].GetString_().GetSval())
+			})
 			if setting, ok := settingSet(n); ok {
 				q.ChangesTimeout = q.ChangesTimeout || setting == nil || strings.EqualFold(*setting, statementTimeout)
 				q.ChangesRole = q.ChangesRole || setting == nil || roleSetting(*setting)
@@ -159,6 +194,8 @@ func Analyze(sql string) (Query, error) {
 		case *pg_query.VariableSetStmt:
 			q.ChangesTimeout = q.ChangesTimeout || strings.EqualFold(n.Name, statementTimeout)
 			q.ChangesRole = q.ChangesRole || roleSetting(n.Name)
+			q.Writes = q.Writes || roleSetting(n.Name) || n.Kind == pg_query.VariableSetKind_VAR_RESET_ALL ||
+				slices.ContainsFunc(readOnlySettings, func(r string) bool { return strings.EqualFold(r, n.Name) })
 			if strings.EqualFold(n.Name, searchPath) {
 				for _, arg := range n.Args {
 					// "$user" stands for the role's own schema, which Postgres skips when it doesn't exist.
@@ -169,6 +206,7 @@ func Analyze(sql string) (Query, error) {
 			}
 		}
 	})
+	q.Writes = q.Writes || writes || q.DDL || q.Opaque
 	q.Schemas = slices.Sorted(maps.Keys(schemas))
 	q.ReadOnly = !writes && len(tree.Stmts) > 0 && !slices.ContainsFunc(tree.Stmts, func(s *pg_query.RawStmt) bool {
 		_, ok := s.GetStmt().GetNode().(*pg_query.Node_SelectStmt)
