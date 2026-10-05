@@ -63,13 +63,31 @@ services:
 
   pg18:
     <<: *postgres
-    image: postgres:18
+    # postgres:18 plus a test OAuth validator, for the OAUTHBEARER login in the compatibility suite.
+    build: testdata/oauth
+    image: queryguard-pg18-oauth
+    command:
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - track_io_timing=on
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem
+      - -c
+      - ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
+      - -c
+      - oauth_validator_libraries=qg_oauth
+      - -c
+      - hba_file=/queryguard/pg_hba.conf
     ports: ["127.0.0.1:5418:5432"]
     # From 18 the image keeps data under /var/lib/postgresql/18/docker, so the
     # volume mounts one level higher than for 16 and 17.
     volumes:
       - ./testdata/initdb:/docker-entrypoint-initdb.d:ro
       - ./testdata/schema.sql:/queryguard/schema.sql:ro
+      - ./testdata/oauth/pg_hba.conf:/queryguard/pg_hba.conf:ro
       - pg18:/var/lib/postgresql
 
   # Puts network faults between QueryGuard and a server, for the tests of the
