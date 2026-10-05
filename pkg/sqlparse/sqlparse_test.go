@@ -24,8 +24,16 @@ func TestAnalyze(t *testing.T) {
 		{"set local statement_timeout to 0", Query{ChangesTimeout: true}},
 		{"reset statement_timeout", Query{ChangesTimeout: true}},
 		{"select set_config('statement_timeout', '0', false)", Query{ChangesTimeout: true, Explainable: true}},
-		{"select set_config(current_setting('app.name'), '0', false)", Query{ChangesTimeout: true, UnknownSearchPath: true, Explainable: true}},
+		{"select set_config(current_setting('app.name'), '0', false)", Query{ChangesTimeout: true, ChangesRole: true, UnknownSearchPath: true, Explainable: true}},
 		{"set lock_timeout = '1s'", Query{}},
+		{"set role reporting", Query{ChangesRole: true}},
+		{"set local role reporting", Query{ChangesRole: true}},
+		{"reset role", Query{ChangesRole: true}},
+		{"set session authorization reporting", Query{ChangesRole: true}},
+		{`set "ROLE" = reporting`, Query{ChangesRole: true}},
+		{"select set_config('role', 'reporting', true)", Query{ChangesRole: true, Explainable: true}},
+		{"select set_config($1, 'reporting', true)", Query{ChangesTimeout: true, ChangesRole: true, UnknownSearchPath: true, Explainable: true}},
+		{"set work_mem = '64MB'", Query{}},
 		{"update orders set total = 0 where id = 1", Query{Explainable: true}},
 		{"update orders set total = 0", Query{ChangesEveryRow: true, Explainable: true}},
 		{"delete from orders", Query{ChangesEveryRow: true, Explainable: true}},
@@ -84,11 +92,11 @@ func TestAnalyze(t *testing.T) {
 		// Postgres looks setting names up ignoring case.
 		{`set "SEARCH_PATH" = billing`, Query{Schemas: []string{"billing"}}},
 		{"select set_config('SEARCH_PATH', 'billing', false)", Query{Schemas: []string{"billing"}, Explainable: true}},
-		{"select set_config(lower('SEARCH_PATH'), 'billing', false)", Query{UnknownSearchPath: true, ChangesTimeout: true, Explainable: true}},
+		{"select set_config(lower('SEARCH_PATH'), 'billing', false)", Query{UnknownSearchPath: true, ChangesTimeout: true, ChangesRole: true, Explainable: true}},
 		{"select set_config('application_name', 'billing', false)", Query{Explainable: true}},
 		// Updating pg_settings calls set_config for each row.
-		{"update pg_settings set setting = 'billing' where name = 'search_path'", Query{UnknownSearchPath: true, ChangesTimeout: true, Explainable: true}},
-		{"update pg_catalog.pg_settings set setting = 'billing' where name = 'search_path'", Query{Schemas: []string{"pg_catalog"}, UnknownSearchPath: true, ChangesTimeout: true, Explainable: true}},
+		{"update pg_settings set setting = 'billing' where name = 'search_path'", Query{UnknownSearchPath: true, ChangesTimeout: true, ChangesRole: true, Explainable: true}},
+		{"update pg_catalog.pg_settings set setting = 'billing' where name = 'search_path'", Query{Schemas: []string{"pg_catalog"}, UnknownSearchPath: true, ChangesTimeout: true, ChangesRole: true, Explainable: true}},
 	} {
 		got, err := Analyze(tc.sql)
 		if err != nil {

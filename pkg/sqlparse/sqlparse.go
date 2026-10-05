@@ -25,6 +25,7 @@ type Query struct {
 	Cursor              bool     // DECLARE, whose query runs in the FETCHes that follow
 	TransactionControl  bool     // only BEGIN, COMMIT, ROLLBACK, SAVEPOINT and the like, which do no work of their own
 	ChangesTimeout      bool     // may change statement_timeout: SET or RESET of it, or set_config of it or of a name known only when it runs
+	ChangesRole         bool     // may change the role statements run as: SET ROLE, SET SESSION AUTHORIZATION, or set_config of them or of an unknown name
 }
 
 // notDDL lists the statement types Postgres's GetCommandLogLevel does not log as DDL; every other *Stmt is DDL.
@@ -81,7 +82,7 @@ func Analyze(sql string) (Query, error) {
 			q.ChangesEveryRow = q.ChangesEveryRow || n.WhereClause == nil
 			// Updating the pg_settings view calls set_config for each row, with names and values known only when it runs.
 			if r := n.GetRelation(); r.GetRelname() == "pg_settings" && (r.GetSchemaname() == "" || r.GetSchemaname() == "pg_catalog") {
-				q.UnknownSearchPath, q.ChangesTimeout = true, true
+				q.UnknownSearchPath, q.ChangesTimeout, q.ChangesRole = true, true, true
 			}
 		case *pg_query.DeleteStmt:
 			q.ChangesEveryRow = q.ChangesEveryRow || n.WhereClause == nil
@@ -114,8 +115,9 @@ func Analyze(sql string) (Query, error) {
 			add(n.Schemaname)
 		case *pg_query.FuncCall:
 			add(schemaOf(n.Funcname))
-			if setting, ok := settingSet(n); ok && (setting == nil || strings.EqualFold(*setting, statementTimeout)) {
-				q.ChangesTimeout = true
+			if setting, ok := settingSet(n); ok {
+				q.ChangesTimeout = q.ChangesTimeout || setting == nil || strings.EqualFold(*setting, statementTimeout)
+				q.ChangesRole = q.ChangesRole || setting == nil || roleSetting(*setting)
 			}
 			if path, ok := searchPathSet(n); ok {
 				q.UnknownSearchPath = q.UnknownSearchPath || path == nil
@@ -142,6 +144,7 @@ func Analyze(sql string) (Query, error) {
 			}
 		case *pg_query.VariableSetStmt:
 			q.ChangesTimeout = q.ChangesTimeout || strings.EqualFold(n.Name, statementTimeout)
+			q.ChangesRole = q.ChangesRole || roleSetting(n.Name)
 			if strings.EqualFold(n.Name, searchPath) {
 				for _, arg := range n.Args {
 					// "$user" stands for the role's own schema, which Postgres skips when it doesn't exist.
@@ -169,6 +172,11 @@ const searchPath = "search_path"
 
 // statementTimeout is the setting that cancels statements running longer than it.
 const statementTimeout = "statement_timeout"
+
+// roleSetting reports whether name is a setting that changes the role statements run as, and so what row-level security lets them see.
+func roleSetting(name string) bool {
+	return strings.EqualFold(name, "role") || strings.EqualFold(name, "session_authorization")
+}
 
 // settingSet returns the name of the setting a set_config call changes, nil when it is known only when it runs; ok is false
 // for any other call.
