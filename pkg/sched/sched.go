@@ -32,9 +32,12 @@ const (
 	Reject   Action = "reject" // fail at once
 )
 
+// shutPoll is how often a statement waiting on a shut budget looks again, since it has no rate to work out its wait from.
+const shutPoll = 100 * time.Millisecond
+
 // Budget is one tenant's allowance of cost units.
 type Budget struct {
-	Rate      float64 // units added each second; 0 means the tenant is not limited
+	Rate      float64 // units added each second; 0 means the tenant is not limited, and below 0 that it may spend nothing for now
 	Burst     float64 // the most units saved up; 0 means Rate, a second's worth
 	Share     float64 // the tenant's weight when slots are handed out; 0 means 1
 	MinCharge float64 // the least any statement costs, so a tight loop of cheap ones still counts
@@ -43,7 +46,7 @@ type Budget struct {
 
 // Lane is a pool of slots, each running one statement at a time.
 type Lane struct {
-	MaxActive    int           // statements running at once; 0 means no limit
+	MaxActive    int           // statements running at once; 0 means no limit, and below 0 that none may run for now
 	QueueTimeout time.Duration // the longest a statement waits for its slot or budget; 0 means the lane's default
 	// A queue that has not been empty for StandingAfter stands: it serves the newest waiter first and drops those that waited
 	// longer than StandingTimeout, as CoDel does; 0 for either turns this off.
@@ -143,6 +146,7 @@ type Scheduler struct {
 	held       bool           // best-effort statements wait, however many slots are free
 	caps       map[string]int // the most statements a tenant may run at once, for tenants capped
 	running    map[string]int // statements each tenant runs now, in both lanes
+	demand     Demand         // since the last TakeDemand
 }
 
 // tenant is one tenant's state, brought up to date by refresh before each use.
@@ -170,7 +174,8 @@ type waiter struct {
 
 // New returns a Scheduler with cfg.
 func New(cfg Config) *Scheduler {
-	s := &Scheduler{tenants: map[string]*tenant{}, caps: map[string]int{}, running: map[string]int{}}
+	s := &Scheduler{tenants: map[string]*tenant{}, caps: map[string]int{}, running: map[string]int{},
+		demand: Demand{Spent: map[string]float64{}, Starved: map[string]bool{}}}
 	s.Configure(cfg)
 	return s
 }
@@ -184,8 +189,12 @@ func (s *Scheduler) Configure(cfg Config) {
 		s.refresh(name)
 	}
 	s.cfg = cfg
-	if cfg.Controller == nil || s.limit == 0 {
-		s.limit, s.overloaded = cfg.Fast.MaxActive, false
+	// A lane that was shut, as before a fleet's first lease, opens at its full limit.
+	if cfg.Controller == nil || s.limit <= 0 {
+		s.limit = cfg.Fast.MaxActive
+	}
+	if cfg.Controller == nil {
+		s.overloaded = false
 	}
 	s.limit = min(s.limit, cfg.Fast.MaxActive)
 	s.grant(Fast)
@@ -208,7 +217,24 @@ func (s *Scheduler) wait(ctx context.Context, tenant string, cost float64, charg
 		s.mu.Lock()
 		b, t := s.budget(tenant), s.refresh(tenant)
 		lane := Fast
+		if b.Rate < 0 {
+			s.demand.Starved[tenant] = true
+			s.mu.Unlock()
+			wait := min(shutPoll, time.Until(deadline))
+			if wait <= 0 {
+				return 0, ErrOverBudget
+			}
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return 0, ctx.Err()
+			case <-timer.C:
+			}
+			continue
+		}
 		if b.Rate > 0 && t.tokens < 0 {
+			s.demand.Starved[tenant] = true
 			switch b.WhenOver {
 			case Reject:
 				s.mu.Unlock()
@@ -257,6 +283,7 @@ func (s *Scheduler) charge(name string, b Budget, t *tenant, cost float64) {
 		t.tokens -= cost
 	}
 	t.usage += cost
+	s.demand.Spent[name] += cost
 	if len(s.tenants) > maxTenants {
 		s.forgetIdle()
 	}
@@ -279,6 +306,7 @@ func (s *Scheduler) Refund(tenant string, cost float64) {
 		t.tokens = min(b.Burst, t.tokens+cost)
 	}
 	t.usage = max(0, t.usage-cost)
+	s.demand.Spent[tenant] -= cost
 }
 
 // Acquire waits for a slot in lane, handed to the highest priority and then the least-served tenant first, and returns the func that frees it.
@@ -289,7 +317,7 @@ func (s *Scheduler) Acquire(ctx context.Context, tenant string, id LaneID, prio 
 	s.mu.Lock()
 	l, limit := &s.lanes[id], s.max(id)
 	w := &waiter{tenant: tenant, prio: prio, since: time.Now(), granted: make(chan struct{})}
-	full := limit > 0 && l.active >= limit
+	full := limit != 0 && l.active >= max(limit, 0)
 	if !full && s.eligible(w) && !slices.ContainsFunc(l.waiters, s.eligible) {
 		sl := s.take(id, tenant)
 		s.mu.Unlock()
@@ -311,6 +339,7 @@ func (s *Scheduler) Acquire(ctx context.Context, tenant string, id LaneID, prio 
 		l.lastEmpty = w.since
 	}
 	l.waiters = append(l.waiters, w)
+	s.demand.Slots[id] = max(s.demand.Slots[id], l.active+len(l.waiters))
 	s.mu.Unlock()
 
 	timer := time.NewTimer(timeout)
@@ -474,6 +503,7 @@ func (s *Scheduler) lane(id LaneID) Lane {
 func (s *Scheduler) take(id LaneID, tenant string) *slot {
 	s.lanes[id].active++
 	s.running[tenant]++
+	s.demand.Slots[id] = max(s.demand.Slots[id], s.lanes[id].active+len(s.lanes[id].waiters))
 	if id == Fast && s.limit > 0 && s.lanes[id].active >= s.limit {
 		s.saturated = true
 	}
@@ -519,11 +549,14 @@ func (s *Scheduler) refresh(name string) *tenant {
 	b := s.budget(name)
 	t, ok := s.tenants[name]
 	if !ok {
-		t = &tenant{tokens: b.Burst, updated: now}
+		t = &tenant{tokens: max(b.Burst, 0), updated: now}
 		s.tenants[name] = t
 	}
 	elapsed := now.Sub(t.updated).Seconds()
-	t.tokens = min(b.Burst, t.tokens+b.Rate*elapsed)
+	// A shut budget neither fills nor drains, so it opens where it stopped.
+	if b.Rate >= 0 {
+		t.tokens = min(b.Burst, t.tokens+b.Rate*elapsed)
+	}
 	t.usage *= math.Exp2(-elapsed / usageHalfLife.Seconds())
 	t.updated = now
 	return t
@@ -575,7 +608,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 func (s *Scheduler) adjust() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cfg.Controller == nil || s.limit == 0 {
+	if s.cfg.Controller == nil || s.limit <= 0 {
 		return
 	}
 	sig := Signal{LockWaits: s.lockWaits, Saturated: s.saturated}
@@ -654,11 +687,13 @@ func (s *Scheduler) Transfer(from, to string, cost float64) {
 		t.tokens = min(b.Burst, t.tokens+cost)
 	}
 	t.usage = max(0, t.usage-cost)
+	s.demand.Spent[from] -= cost
 	b, t = s.budget(to), s.refresh(to)
 	if b.Rate > 0 {
 		t.tokens -= cost
 	}
 	t.usage += cost
+	s.demand.Spent[to] += cost
 	if len(s.tenants) > maxTenants {
 		s.forgetIdle()
 	}
@@ -696,4 +731,29 @@ func (s *Scheduler) TrueUp(tenant string, charged, actual float64) {
 		t.tokens = min(b.Burst, t.tokens-diff)
 	}
 	t.usage = max(0, t.usage+diff)
+	s.demand.Spent[tenant] += diff
+}
+
+// Demand is what statements asked of the scheduler since the last TakeDemand, for sharing limits across instances.
+type Demand struct {
+	Spent   map[string]float64 // cost charged, by tenant
+	Starved map[string]bool    // tenants that found their budget spent
+	Slots   [2]int             // the most statements running or waiting at once, by lane
+}
+
+// TakeDemand returns the demand since its last call and starts counting again.
+func (s *Scheduler) TakeDemand() Demand {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d := s.demand
+	for t, n := range d.Spent {
+		if n <= 0 {
+			delete(d.Spent, t)
+		}
+	}
+	s.demand = Demand{Spent: map[string]float64{}, Starved: map[string]bool{}}
+	for id := range s.lanes {
+		s.demand.Slots[id] = s.lanes[id].active + len(s.lanes[id].waiters)
+	}
+	return d
 }

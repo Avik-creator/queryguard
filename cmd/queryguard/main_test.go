@@ -140,6 +140,26 @@ func TestNewMonitor(t *testing.T) {
 	}
 }
 
+func TestNewFleet(t *testing.T) {
+	if f, err := newFleet("", "", "127.0.0.1:6543", 0); f != nil || err != nil {
+		t.Errorf("no -state-dsn gave %v, %v; want no fleet", f, err)
+	}
+	if _, err := newFleet("host=db port=notanumber", "", "127.0.0.1:6543", 0); err == nil {
+		t.Error("an invalid -state-dsn gave no error")
+	}
+	// Peers can't send cancel requests to an address that names every interface.
+	if _, err := newFleet("host=db dbname=queryguard_state", "", "0.0.0.0:6543", 0); err == nil || !strings.Contains(err.Error(), "-advertise-addr") {
+		t.Errorf("listening on every interface without -advertise-addr gave %v; want an error naming the flag", err)
+	}
+	f, err := newFleet("host=db dbname=queryguard_state", "", "10.0.0.7:6543", 3)
+	if err != nil || f.Addr != "10.0.0.7:6543" || f.MaxInstances != 3 {
+		t.Errorf("fleet %+v, %v; want one advertising the listen address, of at most 3", f, err)
+	}
+	if f, err := newFleet("host=db dbname=queryguard_state", "qg-1.internal:6543", ":6543", 0); err != nil || f.Addr != "qg-1.internal:6543" {
+		t.Errorf("fleet %+v, %v; want one advertising -advertise-addr", f, err)
+	}
+}
+
 func TestReloadKeepsPolicyInForceOnBadConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "queryguard.json")
 	first, _ := policy.Parse([]byte(`{}`))

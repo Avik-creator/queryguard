@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"io"
+	"iter"
 	"log/slog"
 	"maps"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Avik-creator/queryguard/pkg/fleet"
 	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/sched"
@@ -75,6 +77,8 @@ type Server struct {
 	Catalog *plan.Catalog
 	// Monitor reports what the whole server is doing, such as lock waits, every second; nil reads nothing.
 	Monitor Monitor
+	// Fleet shares budgets and slots with the other instances in front of the same server; nil keeps them to this instance.
+	Fleet *fleet.Fleet
 	// Plans caches statement plans for every session's cost rules.
 	Plans plan.Cache
 	// History learns how each statement's plans run, for calibrated costs and plan flips.
@@ -92,6 +96,11 @@ type Server struct {
 	horizonPID int32                  // the backend whose snapshot is past max_age, or 0
 	deadBase   map[plan.Table]float64 // the watched tables' dead tuples when that snapshot passed max_age
 	capped     string                 // the tenant limited to one statement at a time for holding that snapshot, or ""
+
+	// fleetMu guards these, which say what the Fleet asks for.
+	fleetMu   sync.Mutex
+	known     map[string]time.Time // tenants with the default budget seen lately, when last seen
+	lastWants time.Time
 
 	mu      sync.Mutex
 	sched   *sched.Scheduler // made with the first policy and reconfigured by each one after
@@ -126,6 +135,28 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	s.mu.Unlock()
 	if s.Monitor != nil {
 		go s.Monitor.Run(ctx, s.observe)
+	}
+	if s.Fleet != nil {
+		// Sessions get the instance's ID in their cancel keys, which it has only once the store answered, so accepting waits a little.
+		first := make(chan struct{})
+		renewed := sync.OnceFunc(func() { close(first) })
+		go s.Fleet.Run(ctx, s.fleetWants, func() {
+			s.applyFleet()
+			renewed()
+		})
+		select {
+		case <-first:
+		case <-time.After(fleetStartWait):
+		case <-ctx.Done():
+		}
+		// Its leases go only once its sessions have ended, since until then they may use them.
+		defer func() {
+			rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cancelTimeout)
+			defer cancel()
+			if err := s.Fleet.Release(rctx); err != nil {
+				log.Warn("release fleet leases", "err", err)
+			}
+		}()
 	}
 	if s.ActivePolicy() != nil {
 		go s.logPlanStats(ctx, log, time.Tick(planStatsInterval))
@@ -209,6 +240,12 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 	case *pgproto3.CancelRequest:
 		req, ok := s.keys.lookup(msg)
 		if !ok {
+			if forwarded, err := s.forwardCancel(ctx, msg); forwarded {
+				if err != nil {
+					log.Warn("forward cancel request to its instance", "client", client.RemoteAddr(), "err", err)
+				}
+				return
+			}
 			log.Info("ignored cancel request with unknown key", "client", client.RemoteAddr())
 			return
 		}
@@ -284,7 +321,7 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 		IssueKey: func(key *pgproto3.BackendKeyData) *pgproto3.BackendKeyData {
 			serverKey.Store(key)
 			forget()
-			issued, f := s.keys.issue(key)
+			issued, f := s.keys.issue(key, s.fleetID())
 			forget = f
 			if running != nil {
 				unfile()
@@ -560,12 +597,12 @@ func (s *Server) SetPolicy(p *policy.Policy) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.sched == nil {
-		s.sched = sched.New(p.SchedConfig())
+		s.sched = sched.New(s.scaled(p.SchedConfig()))
 		if s.serving != nil {
 			go s.sched.Run(s.serving)
 		}
 	} else {
-		s.sched.Configure(p.SchedConfig())
+		s.sched.Configure(s.scaled(p.SchedConfig()))
 	}
 	s.policies.Store(p)
 }
@@ -582,6 +619,156 @@ func (s *Server) scheduler() *sched.Scheduler {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.sched
+}
+
+// fleetStartWait bounds how long Serve waits for the fleet's first lease before accepting.
+const fleetStartWait = 2 * time.Second
+
+// forgetTenantAfter is how long a tenant with the default budget goes without a statement before its share is no longer leased.
+const forgetTenantAfter = 5 * time.Minute
+
+// fleetID returns this instance's ID in the fleet, or 0.
+func (s *Server) fleetID() int {
+	if s.Fleet == nil {
+		return 0
+	}
+	return s.Fleet.ID()
+}
+
+// forwardCancel sends a cancel request with a key this instance didn't issue to the instance that did, reporting whether it
+// knew of one.
+func (s *Server) forwardCancel(ctx context.Context, req *pgproto3.CancelRequest) (bool, error) {
+	id := owner(req.ProcessID)
+	if s.Fleet == nil || id == 0 || id == s.Fleet.ID() {
+		return false, nil
+	}
+	addr, ok := s.Fleet.Peer(id)
+	if !ok {
+		return false, nil
+	}
+	dctx, cancel := context.WithTimeout(ctx, cancelTimeout)
+	defer cancel()
+	var d net.Dialer
+	conn, err := d.DialContext(dctx, "tcp", addr)
+	if err != nil {
+		return true, err
+	}
+	defer conn.Close()
+	return true, writeMessage(conn, req)
+}
+
+// fleetWants returns what this instance asks the fleet for: each budget's rate and each lane's slots, with what was used of them.
+func (s *Server) fleetWants() map[string]fleet.Want {
+	p, sc := s.ActivePolicy(), s.scheduler()
+	if p == nil || sc == nil {
+		return nil
+	}
+	cfg := p.SchedConfig()
+	d := sc.TakeDemand()
+	wants := map[string]fleet.Want{}
+	for _, l := range []struct {
+		resource string
+		lane     sched.Lane
+		id       sched.LaneID
+	}{{"slots:fast", cfg.Fast, sched.Fast}, {"slots:slow", cfg.Slow, sched.Slow}} {
+		if l.lane.MaxActive > 0 {
+			wants[l.resource] = fleet.Want{Capacity: float64(l.lane.MaxActive), Demand: float64(d.Slots[l.id])}
+		}
+	}
+
+	s.fleetMu.Lock()
+	defer s.fleetMu.Unlock()
+	now := time.Now()
+	elapsed := now.Sub(s.lastWants)
+	if s.lastWants.IsZero() {
+		elapsed = fleet.DefaultInterval
+	}
+	s.lastWants = now
+	if s.known == nil {
+		s.known = map[string]time.Time{}
+	}
+	for _, tenants := range []iter.Seq[string]{maps.Keys(d.Spent), maps.Keys(d.Starved)} {
+		for t := range tenants {
+			if _, listed := cfg.Budgets[t]; !listed && cfg.Default.Rate > 0 {
+				s.known[t] = now
+			}
+		}
+	}
+	maps.DeleteFunc(s.known, func(_ string, seen time.Time) bool { return now.Sub(seen) > forgetTenantAfter })
+	budget := func(tenant string, b sched.Budget) {
+		demand := d.Spent[tenant] / elapsed.Seconds()
+		// A tenant held back by its share would use more, so it asks for twice what it has.
+		if d.Starved[tenant] {
+			demand = max(demand, 2*s.Fleet.Share("rate:"+tenant))
+		}
+		wants["rate:"+tenant] = fleet.Want{Capacity: b.Rate, Demand: demand}
+	}
+	for t, b := range cfg.Budgets {
+		if b.Rate > 0 {
+			budget(t, b)
+		}
+	}
+	for t := range s.known {
+		budget(t, cfg.Default)
+	}
+	return wants
+}
+
+// applyFleet puts the instance's new shares in force.
+func (s *Server) applyFleet() {
+	p := s.ActivePolicy()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sched != nil && p != nil {
+		s.sched.Configure(s.scaled(p.SchedConfig()))
+	}
+}
+
+// scaled returns cfg with each fleet-wide limit cut to this instance's share, and shut where it has none, as before its first lease.
+func (s *Server) scaled(cfg sched.Config) sched.Config {
+	if s.Fleet == nil {
+		return cfg
+	}
+	scale := func(tenant string, b sched.Budget) sched.Budget {
+		if b.Rate <= 0 {
+			return b
+		}
+		share := s.Fleet.Share("rate:" + tenant)
+		if share <= 0 {
+			b.Rate, b.Burst = -1, 0
+			return b
+		}
+		b.Burst, b.Rate = cmp.Or(b.Burst, b.Rate)*share/b.Rate, share
+		return b
+	}
+	budgets := map[string]sched.Budget{}
+	for t, b := range cfg.Budgets {
+		budgets[t] = scale(t, b)
+	}
+	s.fleetMu.Lock()
+	for t := range s.known {
+		if _, listed := budgets[t]; !listed {
+			budgets[t] = scale(t, cfg.Default)
+		}
+	}
+	s.fleetMu.Unlock()
+	cfg.Budgets = budgets
+	// A tenant not yet leased waits for its share, which the next lease brings.
+	if cfg.Default.Rate > 0 {
+		cfg.Default.Rate, cfg.Default.Burst = -1, 0
+	}
+	slots := func(resource string, n int) int {
+		if n <= 0 {
+			return n
+		}
+		if share := int(s.Fleet.Share(resource)); share > 0 {
+			return share
+		}
+		return -1
+	}
+	cfg.Fast.MaxActive = slots("slots:fast", cfg.Fast.MaxActive)
+	cfg.Slow.MaxActive = slots("slots:slow", cfg.Slow.MaxActive)
+	return cfg
 }
 
 // clientAddr returns the client's IP address, or the zero Addr when it has none.

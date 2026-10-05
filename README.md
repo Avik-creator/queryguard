@@ -428,6 +428,41 @@ since putting your own statements behind others' is always allowed.
 "tenants": {"nightly_export": {"priority": "best_effort"}, "payments": {"priority": "critical"}}
 ```
 
+### Several instances
+
+QueryGuard instances in front of the same server can share their limits, so a
+tenant's budget and the slots hold for the whole fleet however a load balancer
+spreads clients. Give each the same config and a database set aside for
+QueryGuard:
+
+```sh
+./bin/queryguard -config queryguard.json -listen 10.0.0.7:6543 \
+  -state-dsn "host=db.internal dbname=queryguard_state user=queryguard" -max-instances 4
+```
+
+Every second each instance tells the store, two UNLOGGED tables in that
+database, how much of each budget and lane it used, and gets a lease of its
+share for 10 seconds, as YouTube's Doorman does: what it asks for plus an even
+part of what is spare, or a part in proportion to what it asks when the
+instances ask for more than there is. The store hands out shares one instance
+at a time under an advisory lock, and only what the others can't be using, so
+the shares never add up to more than the limit. Statements only ever touch the
+instance's own copy of each budget.
+
+When the store can't be reached, an instance keeps going on as much of its last
+share as fits `1/max-instances` of the limit, which the store keeps aside for
+it, for a minute after its last lease; then it stops admitting statements that
+count against a shared limit until the store is back. Losing the store or an
+instance so never admits more than the total. A new instance waits up to two
+seconds for its first lease before it accepts connections. QueryGuard creates
+the tables itself, and a crash of their server empties them, which the fleet
+sees as a lost store. `-max-instances` must be the same everywhere and at
+least the number of instances.
+
+Each instance's cancel keys carry its ID in the fleet, so a cancel request the
+load balancer sends to another instance is passed on to the one that owns the
+key, at its `-advertise-addr` (by default `-listen`).
+
 ### Time limits
 
 - `statement_timeout`: QueryGuard cancels a statement running longer, and

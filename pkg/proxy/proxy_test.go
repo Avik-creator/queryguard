@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Avik-creator/queryguard/internal/testcert"
+	"github.com/Avik-creator/queryguard/pkg/fleet"
 	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/sched"
@@ -891,6 +892,98 @@ func TestLimitsTheTenantHoldingTheOldestSnapshot(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestForwardsCancelToTheInstanceThatOwnsTheKey(t *testing.T) {
+	pg := startFakePostgres(t)
+	store := &fleet.Memory{}
+	var addrs []string
+	var fleets []*fleet.Fleet
+	for range 2 {
+		ln := listen(t)
+		s := newServer(t, pg.addr)
+		s.Fleet = &fleet.Fleet{Store: store, Addr: ln.Addr().String(), Interval: 20 * time.Millisecond}
+		addr, _ := startProxyOn(t, s, ln)
+		addrs, fleets = append(addrs, addr), append(fleets, s.Fleet)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := fleets[0].Peer(fleets[1].ID()); ok && fleets[0].ID() != 0 {
+			if _, ok := fleets[1].Peer(fleets[0].ID()); ok {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the instances never learned of each other")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	key := login(t, dial(t, addrs[0]))
+	mustReceive[*pgproto3.StartupMessage](t, pg.received)
+
+	// The load balancer sent the cancel request to the other instance.
+	send(t, dial(t, addrs[1]), &pgproto3.CancelRequest{ProcessID: key.ProcessID, SecretKey: key.SecretKey})
+
+	expectServerKey(t, mustReceive[*pgproto3.CancelRequest](t, pg.received))
+}
+
+func TestSessionsGetTheInstanceIDFromTheStart(t *testing.T) {
+	pg := startFakePostgres(t)
+	s := newServer(t, pg.addr)
+	s.Fleet = &fleet.Fleet{Store: slowStore{&fleet.Memory{}}}
+	addr, _ := startProxy(t, s)
+
+	key := login(t, dial(t, addr))
+
+	if id := s.Fleet.ID(); id == 0 || owner(key.ProcessID) != id {
+		t.Errorf("first session's key names instance %d; want this instance, %d", owner(key.ProcessID), id)
+	}
+}
+
+// slowStore takes 100ms to answer.
+type slowStore struct{ fleet.Store }
+
+func (s slowStore) Refresh(ctx context.Context, req fleet.Request) (fleet.Reply, error) {
+	time.Sleep(100 * time.Millisecond)
+	return s.Store.Refresh(ctx, req)
+}
+
+func TestScalesLimitsToTheFleetShare(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &fleet.Memory{}
+		config := `{"scheduler": {"max_active": 8, "slow_lane": {"max_active": 2}}, "tenant_defaults": {"budget": {"rate": 10}},
+			"tenants": {"acme": {"budget": {"rate": 100, "burst": 400}}}}`
+		var servers []*Server
+		for range 2 {
+			s := &Server{Upstream: Dialer{Addr: "unused"}, Logger: slog.New(slog.DiscardHandler), Policy: mustPolicy(t, config),
+				Fleet: &fleet.Fleet{Store: store}}
+			servers = append(servers, s)
+		}
+		before := servers[0].scaled(servers[0].Policy.SchedConfig())
+		if before.Fast.MaxActive != -1 || before.Budgets["acme"].Rate != -1 || before.Default.Rate != -1 {
+			t.Errorf("before any lease: %+v; want every leased limit shut", before)
+		}
+		ctx, stop := context.WithCancel(t.Context())
+		var done []chan error
+		for _, s := range servers {
+			ch := make(chan error, 1)
+			go func() { ch <- s.Serve(ctx, newIdleListener()) }()
+			done = append(done, ch)
+		}
+
+		time.Sleep(5 * fleet.DefaultInterval)
+		synctest.Wait()
+
+		// Neither instance has run anything, so each gets half.
+		got := servers[0].scaled(servers[0].Policy.SchedConfig())
+		if got.Fast.MaxActive != 4 || got.Slow.MaxActive != 1 || got.Budgets["acme"].Rate != 50 || got.Budgets["acme"].Burst != 200 {
+			t.Errorf("scaled %+v; want half of every limit", got)
+		}
+		stop()
+		for _, ch := range done {
+			<-ch
+		}
+	})
 }
 
 // fakeMonitor reports the same activity every second.

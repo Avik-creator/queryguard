@@ -440,11 +440,11 @@ func TestOldSnapshotLimitsItsTenantWhileTheQueueBloats(t *testing.T) {
 }
 
 func TestQueuedStatementPastItsDeadlineNeverRuns(t *testing.T) {
+	qg := startPolicyProxy(t, `{"scheduler": {"max_active": 1, "queue_timeout": "10s"}}`)
 	direct := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
 	name := fmt.Sprintf("qg_deadline_%d", time.Now().UnixNano())
 	mustExec(t, direct, "create table "+name+" (id int)")
 	t.Cleanup(func() { direct.Exec(context.Background(), "drop table "+name) })
-	qg := startPolicyProxy(t, `{"scheduler": {"max_active": 1, "queue_timeout": "10s"}}`)
 	busy, late := qg.connect(t, "sslmode=disable"), qg.connect(t, "sslmode=disable statement_timeout=300")
 	slept := make(chan error, 1)
 	go func() {

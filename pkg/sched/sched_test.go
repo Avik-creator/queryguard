@@ -787,6 +787,87 @@ func TestAcquireWithAnEndedContextTakesNoSlot(t *testing.T) {
 	acquire(t, s, "b", Fast)
 }
 
+func TestShutLaneRunsNothingUntilItOpens(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Fast: Lane{MaxActive: -1, QueueTimeout: time.Minute}})
+		got := make(chan error, 1)
+		go func() {
+			_, err := s.Acquire(t.Context(), "a", Fast, Normal)
+			got <- err
+		}()
+		synctest.Wait()
+		select {
+		case err := <-got:
+			t.Fatalf("a shut lane ran a statement: %v", err)
+		default:
+		}
+
+		s.Configure(Config{Fast: Lane{MaxActive: 2, QueueTimeout: time.Minute}})
+
+		if err := <-got; err != nil {
+			t.Errorf("statement once the lane opened = %v", err)
+		}
+	})
+}
+
+func TestAdaptiveLimitStartsOverWhenTheLaneOpens(t *testing.T) {
+	s := New(Config{Fast: Lane{MaxActive: -1}, Controller: AIMD{}})
+	s.Configure(Config{Fast: Lane{MaxActive: 4}, Controller: AIMD{}})
+	if got := s.Limit(); got != 4 {
+		t.Errorf("limit after the lane opened = %d; want 4", got)
+	}
+}
+
+func TestShutBudgetWaitsForCapacity(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		shut := Config{Fast: Lane{QueueTimeout: time.Second}, Budgets: map[string]Budget{"acme": {Rate: -1, WhenOver: Reject}}}
+		s := New(shut)
+		start := time.Now()
+		if _, err := s.Reserve(t.Context(), "acme"); !errors.Is(err, ErrOverBudget) || time.Since(start) != time.Second {
+			t.Errorf("Reserve on a shut budget = %v after %v; want ErrOverBudget after the queue timeout", err, time.Since(start))
+		}
+
+		got := make(chan error, 1)
+		go func() {
+			_, err := s.Reserve(t.Context(), "acme")
+			got <- err
+		}()
+		time.Sleep(300 * time.Millisecond)
+		s.Configure(Config{Fast: Lane{QueueTimeout: time.Second}, Budgets: map[string]Budget{"acme": {Rate: 100, WhenOver: Reject}}})
+
+		if err := <-got; err != nil {
+			t.Errorf("Reserve once the budget opened = %v", err)
+		}
+	})
+}
+
+func TestTakeDemand(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Fast: Lane{MaxActive: 2, QueueTimeout: time.Second}, Budgets: map[string]Budget{"tight": {Rate: 1, Burst: 1, WhenOver: Reject}}})
+		s.Charge("acme", 30)
+		s.Charge("acme", 20)
+		s.Charge("tight", 5)
+		s.Reserve(t.Context(), "tight")
+		acquire(t, s, "a", Fast)
+		acquire(t, s, "a", Fast)
+		go s.Acquire(t.Context(), "a", Fast, Normal)
+		synctest.Wait()
+
+		d := s.TakeDemand()
+
+		if d.Spent["acme"] != 50 || d.Spent["tight"] != 5 || !d.Starved["tight"] || d.Starved["acme"] {
+			t.Errorf("demand %+v; want 50 spent by acme, 5 by tight, which was starved", d)
+		}
+		// Two running and one waiting.
+		if d.Slots[Fast] != 3 {
+			t.Errorf("fast lane demand %d; want 3", d.Slots[Fast])
+		}
+		if again := s.TakeDemand(); len(again.Spent) != 0 || len(again.Starved) != 0 || again.Slots[Fast] != 3 {
+			t.Errorf("second TakeDemand = %+v; want nothing spent and the slots still in use", again)
+		}
+	})
+}
+
 // nextInterval waits until Run has adjusted the limit once more.
 func nextInterval() {
 	time.Sleep(AdjustInterval)

@@ -2,6 +2,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -15,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Avik-creator/queryguard/pkg/fleet"
 	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/proxy"
@@ -38,6 +40,9 @@ type options struct {
 	keepAlive       bool
 	config          string
 	catalogDSN      string
+	stateDSN        string
+	advertiseAddr   string
+	maxInstances    int
 	shutdownTimeout time.Duration
 }
 
@@ -56,6 +61,12 @@ func main() {
 	flag.StringVar(&opts.config, "config", "", "JSON policy file with rules and connection caps; none means no checks")
 	flag.StringVar(&opts.catalogDSN, "catalog-dsn", "",
 		"connection string for a pg_monitor role that reads table sizes (needed by max_scan_rows) and the server's activity; the password can come from PGPASSWORD or a .pgpass file")
+	flag.StringVar(&opts.stateDSN, "state-dsn", "",
+		"connection string for a database set aside for QueryGuard, where instances in front of one server share budgets and slots")
+	flag.StringVar(&opts.advertiseAddr, "advertise-addr", "",
+		"host:port other instances reach this one on, to forward cancel requests; default is -listen")
+	flag.IntVar(&opts.maxInstances, "max-instances", fleet.DefaultMaxInstances,
+		"the most instances sharing -state-dsn; each falls back to this share of a limit while the store is unreachable")
 	flag.BoolVar(&opts.keepAlive, "tcp-keepalive", true,
 		"find silently dead clients and servers in about 30s; false keeps the operating system's timing")
 	flag.DurationVar(&opts.shutdownTimeout, "shutdown-timeout", proxy.DefaultShutdownTimeout,
@@ -92,6 +103,10 @@ func run(opts options, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	fl, err := newFleet(opts.stateDSN, opts.advertiseAddr, opts.listen, opts.maxInstances)
+	if err != nil {
+		return err
+	}
 
 	// Ctrl-C or a SIGTERM from Docker or systemd starts a clean shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -116,8 +131,12 @@ func run(opts options, log *slog.Logger) error {
 		KeepAlive:           keepAlive,
 		Policy:              pol,
 		Catalog:             catalog,
+		Fleet:               fl,
 		ShutdownTimeout:     opts.shutdownTimeout,
 		Logger:              log,
+	}
+	if fl != nil {
+		fl.Log = log
 	}
 	s.Monitor = newMonitor(catalog, s, log)
 	if opts.config != "" {
@@ -150,6 +169,25 @@ func newCatalog(dsn string, pol *policy.Policy, log *slog.Logger) (*plan.Catalog
 		return nil, fmt.Errorf("-catalog-dsn: %w", err)
 	}
 	return &plan.Catalog{DSN: dsn, Log: log}, nil
+}
+
+// newFleet returns the fleet stored at dsn, advertising advertise or else listen to its peers, or nil without a dsn.
+func newFleet(dsn, advertise, listen string, maxInstances int) (*fleet.Fleet, error) {
+	if dsn == "" {
+		return nil, nil
+	}
+	if _, err := pgx.ParseConfig(dsn); err != nil {
+		return nil, fmt.Errorf("-state-dsn: %w", err)
+	}
+	addr := cmp.Or(advertise, listen)
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("-advertise-addr: %w", err)
+	}
+	if ip := net.ParseIP(host); host == "" || ip != nil && ip.IsUnspecified() {
+		return nil, fmt.Errorf("-listen %s names no one address other instances can reach: set -advertise-addr", listen)
+	}
+	return &fleet.Fleet{Store: &fleet.Postgres{DSN: dsn}, Addr: addr, MaxInstances: maxInstances}, nil
 }
 
 // newMonitor returns the reader of the server's activity over the catalog's connection string, watching the tables of s's policy,

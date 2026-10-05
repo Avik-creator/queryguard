@@ -12,7 +12,7 @@ func TestCancelKeyHasServerKeyLength(t *testing.T) {
 		var keys cancelKeys
 		server := &pgproto3.BackendKeyData{ProcessID: 4242, SecretKey: bytes.Repeat([]byte{7}, n)}
 
-		issued, _ := keys.issue(server)
+		issued, _ := keys.issue(server, 0)
 
 		if len(issued.SecretKey) != n {
 			t.Errorf("issued a %d-byte key for a %d-byte server key", len(issued.SecretKey), n)
@@ -26,7 +26,7 @@ func TestCancelKeyHasServerKeyLength(t *testing.T) {
 func TestCancelKeyLeadsToServerKey(t *testing.T) {
 	var keys cancelKeys
 	server := &pgproto3.BackendKeyData{ProcessID: 4242, SecretKey: bytes.Repeat([]byte{7}, 32)}
-	issued, _ := keys.issue(server)
+	issued, _ := keys.issue(server, 0)
 
 	req, ok := keys.lookup(&pgproto3.CancelRequest{ProcessID: issued.ProcessID, SecretKey: issued.SecretKey})
 
@@ -37,7 +37,7 @@ func TestCancelKeyLeadsToServerKey(t *testing.T) {
 
 func TestCancelKeyRejectsWrongSecret(t *testing.T) {
 	var keys cancelKeys
-	issued, _ := keys.issue(&pgproto3.BackendKeyData{ProcessID: 4242, SecretKey: bytes.Repeat([]byte{7}, 32)})
+	issued, _ := keys.issue(&pgproto3.BackendKeyData{ProcessID: 4242, SecretKey: bytes.Repeat([]byte{7}, 32)}, 0)
 	for name, secret := range map[string][]byte{
 		"one byte off": append(bytes.Clone(issued.SecretKey[:31]), issued.SecretKey[31]^1),
 		"truncated":    issued.SecretKey[:4],
@@ -51,11 +51,21 @@ func TestCancelKeyRejectsWrongSecret(t *testing.T) {
 
 func TestCancelKeyForgottenWhenSessionEnds(t *testing.T) {
 	var keys cancelKeys
-	issued, forget := keys.issue(&pgproto3.BackendKeyData{ProcessID: 4242, SecretKey: []byte{1, 2, 3, 4}})
+	issued, forget := keys.issue(&pgproto3.BackendKeyData{ProcessID: 4242, SecretKey: []byte{1, 2, 3, 4}}, 0)
 
 	forget()
 
 	if _, ok := keys.lookup(&pgproto3.CancelRequest{ProcessID: issued.ProcessID, SecretKey: issued.SecretKey}); ok {
 		t.Fatal("lookup succeeded after forget; want it refused")
+	}
+}
+
+func TestCancelKeyCarriesTheInstanceID(t *testing.T) {
+	var keys cancelKeys
+	for range 100 {
+		issued, _ := keys.issue(&pgproto3.BackendKeyData{ProcessID: 4242, SecretKey: bytes.Repeat([]byte{7}, 4)}, 5)
+		if owner(issued.ProcessID) != 5 || issued.ProcessID&(1<<instanceShift-1) == 0 {
+			t.Fatalf("issued process ID %#x; want instance 5 in its top bits and the rest not all zero", issued.ProcessID)
+		}
 	}
 }

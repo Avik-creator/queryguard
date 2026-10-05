@@ -9,6 +9,13 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
+// instanceShift places a fleet instance's ID in the top 10 bits of the process IDs it issues, so any instance can tell whose a
+// cancel request is.
+const instanceShift = 22
+
+// owner returns the ID of the fleet instance that issued pid, or 0.
+func owner(pid uint32) int { return int(pid >> instanceShift) }
+
 // cancelKeys gives each session cancel key data of its own and remembers the server's real key.
 type cancelKeys struct {
 	mu       sync.Mutex
@@ -20,8 +27,9 @@ type cancelKey struct {
 	server *pgproto3.BackendKeyData // what Postgres expects
 }
 
-// issue returns key data for the client, as long as the server's so the negotiated protocol still fits, and a function that forgets it.
-func (k *cancelKeys) issue(server *pgproto3.BackendKeyData) (*pgproto3.BackendKeyData, func()) {
+// issue returns key data for the client, as long as the server's so the negotiated protocol still fits, and a function that forgets it;
+// an instance ID other than 0 goes in the process ID's top bits.
+func (k *cancelKeys) issue(server *pgproto3.BackendKeyData, instance int) (*pgproto3.BackendKeyData, func()) {
 	secret := make([]byte, len(server.SecretKey))
 	rand.Read(secret)
 
@@ -34,7 +42,10 @@ func (k *cancelKeys) issue(server *pgproto3.BackendKeyData) (*pgproto3.BackendKe
 	var pid uint32
 	for {
 		pid = mrand.Uint32()
-		if _, taken := k.sessions[pid]; pid != 0 && !taken {
+		if instance > 0 {
+			pid = uint32(instance)<<instanceShift | pid&(1<<instanceShift-1)
+		}
+		if _, taken := k.sessions[pid]; pid&(1<<instanceShift-1) != 0 && !taken {
 			break
 		}
 	}
