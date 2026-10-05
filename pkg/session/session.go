@@ -29,6 +29,12 @@ import (
 // maxCheckedLen caps the Query and Parse messages read whole for checking; longer ones go to CheckTooLong.
 const maxCheckedLen = 16 << 20
 
+// maxTexts and maxTextBytes bound the statement texts and portals a session keeps for recording; past them it starts over.
+const (
+	maxTexts     = 4096
+	maxTextBytes = 16 << 20
+)
+
 // maxMessageLen is Postgres's own cap on a message, MaxAllocSize - 1; a longer length is a broken or hostile peer.
 const maxMessageLen = 0x3ffffffe
 
@@ -265,6 +271,7 @@ type session struct {
 	text       string               // the statement text of the client message being handled, when recording
 	rejecting  byte                 // while the proxy sends its rejection of text, the type of the message it refused; else 0
 	texts      map[string]string    // every prepared statement's text, by name, when recording
+	textBytes  int                  // the length of the texts
 	portals    map[string]string    // the text of each portal's statement, by portal name, when recording
 	ran        *hooks               // from the last admission, for the message that runs its statement
 	ranOn      byte                 // that message: Q for a simple query, E for a bound statement
@@ -389,11 +396,8 @@ func (s *session) noteText(typ byte, n int) {
 		if !ok || !ok2 {
 			return
 		}
-		if s.portals == nil {
-			s.portals = map[string]string{}
-		}
 		s.text = s.texts[string(name)]
-		s.portals[string(portal)] = s.text
+		s.notePortal(string(portal), s.text)
 	case 'E':
 		portal, _, _ := bytes.Cut(body, []byte{0})
 		s.text = s.portals[string(portal)]
@@ -403,7 +407,7 @@ func (s *session) noteText(typ byte, n int) {
 		}
 		name, _, _ := bytes.Cut(body[1:], []byte{0})
 		if body[0] == 'S' {
-			delete(s.texts, string(name))
+			s.forgetText(string(name))
 		} else {
 			delete(s.portals, string(name))
 		}
@@ -457,6 +461,37 @@ func (s *session) fromClient() error {
 	}
 }
 
+// rememberText keeps a prepared statement's text for recording its runs; past the bounds the texts start over, as DEALLOCATE ALL
+// and DISCARD ALL drop statements the proxy never sees closed.
+func (s *session) rememberText(name, sql string) {
+	s.forgetText(name)
+	if len(s.texts) >= maxTexts || s.textBytes+len(sql) > maxTextBytes {
+		clear(s.texts)
+		s.textBytes = 0
+	}
+	if s.texts == nil {
+		s.texts = map[string]string{}
+	}
+	s.texts[name] = sql
+	s.textBytes += len(sql)
+}
+
+func (s *session) forgetText(name string) {
+	s.textBytes -= len(s.texts[name])
+	delete(s.texts, name)
+}
+
+// notePortal keeps which statement a portal runs; portals ended with their transaction are never closed, so past the bound they start over.
+func (s *session) notePortal(portal, sql string) {
+	if _, ok := s.portals[portal]; !ok && len(s.portals) >= maxTexts {
+		clear(s.portals)
+	}
+	if s.portals == nil {
+		s.portals = map[string]string{}
+	}
+	s.portals[portal] = sql
+}
+
 // checkStatement reads a Query or Parse message whole and forwards or rejects it.
 func (s *session) checkStatement(typ byte, n int) error {
 	if n > maxCheckedLen {
@@ -465,7 +500,7 @@ func (s *session) checkStatement(typ byte, n int) error {
 			if head, err := s.clientIn.Peek(bufSize); err == nil {
 				name, _, _ := bytes.Cut(head, []byte{0})
 				delete(s.statements, string(name))
-				delete(s.texts, string(name))
+				s.forgetText(string(name))
 			}
 		}
 		if s.check == nil {
@@ -489,10 +524,7 @@ func (s *session) checkStatement(typ byte, n int) error {
 		s.text = sql
 		if typ == 'P' {
 			name, _, _ := bytes.Cut(body, []byte{0})
-			if s.texts == nil {
-				s.texts = map[string]string{}
-			}
-			s.texts[string(name)] = sql
+			s.rememberText(string(name), sql)
 		}
 	}
 	if ok && s.check != nil {

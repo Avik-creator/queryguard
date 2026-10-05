@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1539,4 +1540,24 @@ func TestASessionsOwnCancelBreaksNoLimit(t *testing.T) {
 		&pgproto3.ReadyForQuery{TxStatus: 'I'})
 
 	expectNone(t, a.broke, "a limit broken by a client's own cancel")
+}
+
+func TestRemembersNoMoreThanItsMaxOfStatementTexts(t *testing.T) {
+	var s session
+	// Statements dropped by DEALLOCATE ALL or DISCARD ALL, which the proxy doesn't see, are never closed.
+	for i := range maxTexts + 10 {
+		s.rememberText("s"+strconv.Itoa(i), "select 1")
+		s.notePortal("p"+strconv.Itoa(i), "select 1")
+	}
+	big := strings.Repeat("x", maxTextBytes/2+1)
+	s.rememberText("big1", big)
+	s.rememberText("big2", big)
+
+	if len(s.texts) > maxTexts || len(s.portals) > maxTexts || s.textBytes > maxTextBytes {
+		t.Errorf("remembers %d texts of %d bytes and %d portals; want at most %d texts of %d bytes", len(s.texts), s.textBytes, len(s.portals),
+			maxTexts, maxTextBytes)
+	}
+	if s.texts["big2"] != big {
+		t.Error("the latest statement's text was forgotten")
+	}
 }
