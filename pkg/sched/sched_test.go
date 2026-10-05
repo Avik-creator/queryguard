@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -188,7 +189,7 @@ func TestSlotsWaitAndTimeOut(t *testing.T) {
 		release := acquire(t, s, "a", Fast)
 
 		start := time.Now()
-		if _, err := s.Acquire(t.Context(), "b", Fast); !errors.Is(err, ErrBusy) || time.Since(start) != time.Second {
+		if _, err := s.Acquire(t.Context(), "b", Fast, Normal); !errors.Is(err, ErrBusy) || time.Since(start) != time.Second {
 			t.Fatalf("Acquire with no slot = %v after %v; want ErrBusy after 1s", err, time.Since(start))
 		}
 
@@ -196,7 +197,7 @@ func TestSlotsWaitAndTimeOut(t *testing.T) {
 		release()
 		// Releasing twice frees one slot, not two.
 		acquire(t, s, "b", Fast)
-		if _, err := s.Acquire(t.Context(), "c", Fast); !errors.Is(err, ErrBusy) {
+		if _, err := s.Acquire(t.Context(), "c", Fast, Normal); !errors.Is(err, ErrBusy) {
 			t.Errorf("a second slot came free after a double release: %v", err)
 		}
 	})
@@ -270,7 +271,7 @@ func TestWaitEndsWithContext(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		time.AfterFunc(time.Second, cancel)
 
-		if _, err := s.Acquire(ctx, "b", Fast); !errors.Is(err, context.Canceled) {
+		if _, err := s.Acquire(ctx, "b", Fast, Normal); !errors.Is(err, context.Canceled) {
 			t.Errorf("Acquire = %v; want the context's error", err)
 		}
 		// The cancelled waiter left the queue, so it can't take the next free slot.
@@ -326,6 +327,243 @@ func TestConfigureResizesLanes(t *testing.T) {
 	})
 }
 
+func TestAIMD(t *testing.T) {
+	a := AIMD{Floor: 2}
+	for name, tc := range map[string]struct {
+		limit int
+		sig   Signal
+		want  int
+	}{
+		"slow statements back off":         {10, Signal{Slowdown: 3, Saturated: true}, 9},
+		"lock waits back off":              {20, Signal{Slowdown: 1, LockWaits: 6, Saturated: true}, 18},
+		"a few lock waits are normal":      {20, Signal{Slowdown: 1, LockWaits: 5, Saturated: true}, 21},
+		"never below the floor":            {2, Signal{Slowdown: 3}, 2},
+		"calm and full grows by one":       {10, Signal{Slowdown: 1.5, Saturated: true}, 11},
+		"calm with room to spare holds":    {10, Signal{Slowdown: 1}, 10},
+		"nothing finished holds":           {10, Signal{Saturated: true}, 10},
+		"backing off always takes one off": {3, Signal{Slowdown: 3}, 2},
+	} {
+		if got := a.Adjust(tc.limit, tc.sig); got != tc.want {
+			t.Errorf("%s: Adjust(%d, %+v) = %d; want %d", name, tc.limit, tc.sig, got, tc.want)
+		}
+	}
+}
+
+func TestAdaptiveLimitFollowsLoad(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Fast: Lane{MaxActive: 8, QueueTimeout: time.Hour}, Controller: AIMD{Floor: 2}})
+		go s.Run(t.Context())
+		for range 8 {
+			acquire(t, s, "a", Fast)
+		}
+		highest := 0
+		ramp := func(slowdown float64) {
+			for range 30 {
+				s.Finished(slowdown)
+				nextInterval()
+				highest = max(highest, s.Limit())
+			}
+		}
+
+		ramp(4)
+		if got := s.Limit(); got != 2 {
+			t.Errorf("limit after 30s of statements running 4 times slower = %d; want the floor, 2", got)
+		}
+		ramp(1)
+		if got := s.Limit(); got != 8 {
+			t.Errorf("limit after 30s of calm = %d; want back at max_active, 8", got)
+		}
+		if highest > 8 {
+			t.Errorf("limit reached %d; want never above max_active, 8", highest)
+		}
+	})
+}
+
+func TestLoweredLimitHoldsNewStatements(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		limit := newLimit(4)
+		s := New(Config{Fast: Lane{MaxActive: 4, QueueTimeout: time.Hour}, Controller: limit})
+		go s.Run(t.Context())
+		release := acquire(t, s, "a", Fast)
+		acquire(t, s, "a", Fast)
+		limit.Store(2)
+		nextInterval()
+
+		got := make(chan struct{})
+		go func() {
+			acquire(t, s, "b", Fast)
+			close(got)
+		}()
+		synctest.Wait()
+		select {
+		case <-got:
+			t.Fatal("a third statement ran under a limit of 2")
+		default:
+		}
+		release()
+		synctest.Wait()
+		select {
+		case <-got:
+		default:
+			t.Error("the waiter did not get the slot freed under the limit")
+		}
+	})
+}
+
+func TestLimitNeverPassesMaxActive(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		limit := newLimit(100)
+		s := New(Config{Fast: Lane{MaxActive: 4}, Controller: limit})
+		go s.Run(t.Context())
+		nextInterval()
+		if got := s.Limit(); got != 4 {
+			t.Errorf("limit = %d; want max_active, 4", got)
+		}
+		limit.Store(0)
+		nextInterval()
+		if got := s.Limit(); got != 1 {
+			t.Errorf("limit = %d; want 1, the least that runs anything", got)
+		}
+	})
+}
+
+func TestHigherPriorityGetsSlotsFirst(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Fast: Lane{MaxActive: 1, QueueTimeout: time.Minute}})
+		// light has used least, so only priority puts the others ahead of it.
+		s.Charge("best", 100)
+		s.Charge("crit", 100)
+		release := acquire(t, s, "x", Fast)
+
+		var mu sync.Mutex
+		var order []string
+		var wg sync.WaitGroup
+		for tenant, prio := range map[string]Priority{"best": BestEffort, "light": Normal, "crit": Critical} {
+			wg.Go(func() {
+				done, err := s.Acquire(t.Context(), tenant, Fast, prio)
+				if err != nil {
+					t.Errorf("Acquire(%s) = %v", tenant, err)
+					return
+				}
+				mu.Lock()
+				order = append(order, tenant)
+				mu.Unlock()
+				done()
+			})
+			synctest.Wait()
+		}
+		release()
+		wg.Wait()
+
+		if !slices.Equal(order, []string{"crit", "light", "best"}) {
+			t.Errorf("slots went to %v; want crit, light, best", order)
+		}
+	})
+}
+
+func TestBestEffortIsShedUnderOverload(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		limit := newLimit(2)
+		s := New(Config{Fast: Lane{MaxActive: 2, QueueTimeout: time.Hour}, Controller: limit})
+		go s.Run(t.Context())
+		release := acquire(t, s, "a", Fast)
+		acquire(t, s, "a", Fast)
+		queued := make(chan error, 1)
+		go func() {
+			_, err := s.Acquire(t.Context(), "batch", Fast, BestEffort)
+			queued <- err
+		}()
+		normal := make(chan error, 1)
+		go func() {
+			_, err := s.Acquire(t.Context(), "app", Fast, Normal)
+			normal <- err
+		}()
+		synctest.Wait()
+
+		limit.Store(1)
+		nextInterval()
+
+		// A lowered limit means overload: waiting best-effort statements are shed, and new ones that would wait too.
+		if err := <-queued; !errors.Is(err, ErrShed) {
+			t.Errorf("queued best-effort statement = %v; want ErrShed", err)
+		}
+		if _, err := s.Acquire(t.Context(), "batch", Fast, BestEffort); !errors.Is(err, ErrShed) {
+			t.Errorf("new best-effort statement = %v; want ErrShed", err)
+		}
+		release()
+		synctest.Wait()
+		select {
+		case err := <-normal:
+			t.Errorf("normal statement ran under a limit of 1 with 1 running: %v", err)
+		default:
+		}
+
+		// Once the limit grows again, best-effort statements wait their turn as before.
+		limit.Store(2)
+		nextInterval()
+		if err := <-normal; err != nil {
+			t.Errorf("normal statement = %v; want it to keep waiting until a slot came free", err)
+		}
+	})
+}
+
+func TestRemovingTheControllerEndsShedding(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		limit := newLimit(1)
+		s := New(Config{Fast: Lane{MaxActive: 2, QueueTimeout: time.Second}, Controller: limit})
+		go s.Run(t.Context())
+		nextInterval()
+
+		s.Configure(Config{Fast: Lane{MaxActive: 2, QueueTimeout: time.Second}})
+		acquire(t, s, "a", Fast)
+		acquire(t, s, "a", Fast)
+
+		if _, err := s.Acquire(t.Context(), "batch", Fast, BestEffort); !errors.Is(err, ErrBusy) {
+			t.Errorf("best-effort statement = %v; want it to wait its turn and time out, as with no controller", err)
+		}
+	})
+}
+
+func TestShedAsTheWaitEndsFreesNoSlot(t *testing.T) {
+	// The shed and the timeout land at the same instant, and select picks either, so this runs often enough to see both.
+	for range 50 {
+		synctest.Test(t, func(t *testing.T) {
+			limit := newLimit(2)
+			s := New(Config{Fast: Lane{MaxActive: 2, QueueTimeout: AdjustInterval}, Controller: limit})
+			go s.Run(t.Context())
+			release := acquire(t, s, "a", Fast)
+			acquire(t, s, "a", Fast)
+			limit.Store(1)
+
+			if _, err := s.Acquire(t.Context(), "batch", Fast, BestEffort); err == nil {
+				t.Fatal("best-effort statement got a slot under overload")
+			}
+			synctest.Wait()
+			release()
+			if _, err := s.Acquire(t.Context(), "app", Fast, Normal); !errors.Is(err, ErrBusy) {
+				t.Fatalf("normal statement with 1 running under a limit of 1 = %v; want ErrBusy", err)
+			}
+		})
+	}
+}
+
+// nextInterval waits until Run has adjusted the limit once more.
+func nextInterval() {
+	time.Sleep(AdjustInterval)
+	synctest.Wait()
+}
+
+// setLimit is a Controller that sets the limit to the number it holds.
+type setLimit struct{ atomic.Int64 }
+
+func (n *setLimit) Adjust(int, Signal) int { return int(n.Load()) }
+
+func newLimit(n int) *setLimit {
+	l := &setLimit{}
+	l.Store(int64(n))
+	return l
+}
+
 func reserve(t *testing.T, s *Scheduler, tenant string, want LaneID) {
 	t.Helper()
 	got, err := s.Reserve(t.Context(), tenant)
@@ -336,7 +574,7 @@ func reserve(t *testing.T, s *Scheduler, tenant string, want LaneID) {
 
 func acquire(t *testing.T, s *Scheduler, tenant string, lane LaneID) func() {
 	t.Helper()
-	release, err := s.Acquire(t.Context(), tenant, lane)
+	release, err := s.Acquire(t.Context(), tenant, lane, Normal)
 	if err != nil {
 		t.Errorf("Acquire(%s) = %v", tenant, err)
 		return func() {}

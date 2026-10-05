@@ -577,7 +577,7 @@ func (c *Checker) gate(p *Policy, sql string, q sqlparse.Query, who subject) ses
 			lane = sched.Slow
 		}
 		if !running {
-			release, err := s.Acquire(ctx, who.tenant, lane)
+			release, err := s.Acquire(ctx, who.tenant, lane, sched.Normal)
 			switch {
 			case err != nil && warn:
 				c.log.Warn("would reject statement", "rule", "busy", "tenant", who.tenant, "lane", lane)

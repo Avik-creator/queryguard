@@ -67,19 +67,73 @@ type Config struct {
 	Fast, Slow Lane
 	Budgets    map[string]Budget // by tenant
 	Default    Budget            // for tenants not in Budgets
+	Controller Controller        // moves the fast lane's limit under Fast.MaxActive; nil keeps it at Fast.MaxActive
 }
+
+// AdjustInterval is how often Run asks the Controller for a new limit.
+const AdjustInterval = time.Second
+
+// Signal is what the scheduler saw over one AdjustInterval.
+type Signal struct {
+	Slowdown  float64 // geometric mean of finished statements' time over their usual time; 0 when none finished
+	LockWaits int     // sessions waiting on a lock, as last reported
+	Saturated bool    // every slot under the limit was taken at some point, so the limit held statements back
+}
+
+// Controller sets the fast lane's limit; AIMD is the default, and a PID controller can take its place.
+type Controller interface {
+	Adjust(limit int, s Signal) int
+}
+
+// AIMD grows the limit by one each calm interval in which it held statements back and shrinks it by a fraction when overloaded, as TCP does.
+type AIMD struct {
+	Floor         int     // the lowest limit; 0 means 1
+	Backoff       float64 // what the limit is multiplied by when overloaded; 0 means 0.9
+	MaxSlowdown   float64 // the slowdown that counts as overload; 0 means 2
+	LockWaitShare float64 // the share of the limit waiting on locks that counts as overload; 0 means 0.25
+}
+
+// Adjust returns the next limit: smaller when statements slow down or wait on locks, one larger when calm and full, else the same.
+func (a AIMD) Adjust(limit int, s Signal) int {
+	floor := max(a.Floor, 1)
+	overloaded := s.Slowdown > cmp.Or(a.MaxSlowdown, 2) || float64(s.LockWaits) > cmp.Or(a.LockWaitShare, 0.25)*float64(limit)
+	switch {
+	case overloaded:
+		// Rounding down alone could leave a small limit where it is.
+		return max(floor, min(limit-1, int(float64(limit)*cmp.Or(a.Backoff, 0.9))))
+	case s.Slowdown > 0 && s.Saturated:
+		return limit + 1
+	}
+	return max(floor, limit)
+}
+
+// Priority orders statements waiting for a slot; under overload, best-effort ones are shed.
+type Priority int
+
+const (
+	BestEffort Priority = iota - 1
+	Normal
+	Critical
+)
 
 var (
 	ErrOverBudget = errors.New("the tenant's cost budget is spent")
 	ErrBusy       = errors.New("no slot came free in time")
+	ErrShed       = errors.New("best-effort statements are shed while the server is overloaded")
 )
 
 // Scheduler is safe for concurrent use.
 type Scheduler struct {
-	mu      sync.Mutex
-	cfg     Config
-	tenants map[string]*tenant
-	lanes   [2]lane
+	mu         sync.Mutex
+	cfg        Config
+	tenants    map[string]*tenant
+	lanes      [2]lane
+	limit      int     // the fast lane's limit now; 0 means none
+	overloaded bool    // the limit last moved down, so best-effort statements don't wait
+	slowdowns  float64 // the sum of ln(slowdown) this interval
+	finished   int     // statements finished this interval
+	lockWaits  int     // sessions waiting on a lock, as last reported
+	saturated  bool    // every fast slot was taken at some point this interval
 }
 
 // tenant is one tenant's state, brought up to date by refresh before each use.
@@ -96,6 +150,8 @@ type lane struct {
 
 type waiter struct {
 	tenant  string
+	prio    Priority
+	shed    bool          // set before granted is closed when the waiter is shed instead
 	granted chan struct{} // closed when the waiter is given a slot
 }
 
@@ -115,6 +171,10 @@ func (s *Scheduler) Configure(cfg Config) {
 		s.refresh(name)
 	}
 	s.cfg = cfg
+	if cfg.Controller == nil || s.limit == 0 {
+		s.limit, s.overloaded = cfg.Fast.MaxActive, false
+	}
+	s.limit = min(s.limit, cfg.Fast.MaxActive)
 	s.grant(Fast)
 	s.grant(Slow)
 }
@@ -205,16 +265,23 @@ func (s *Scheduler) Refund(tenant string, cost float64) {
 	t.usage = max(0, t.usage-cost)
 }
 
-// Acquire waits for a slot in lane, handed to the least-served tenant first, and returns the func that frees it.
-func (s *Scheduler) Acquire(ctx context.Context, tenant string, id LaneID) (release func(), err error) {
+// Acquire waits for a slot in lane, handed to the highest priority and then the least-served tenant first, and returns the func that frees it.
+func (s *Scheduler) Acquire(ctx context.Context, tenant string, id LaneID, prio Priority) (release func(), err error) {
 	s.mu.Lock()
-	l, limit := &s.lanes[id], s.lane(id).MaxActive
+	l, limit := &s.lanes[id], s.max(id)
 	if limit == 0 || (l.active < limit && len(l.waiters) == 0) {
-		l.active++
+		s.take(id)
 		s.mu.Unlock()
 		return s.releaser(id), nil
 	}
-	w := &waiter{tenant: tenant, granted: make(chan struct{})}
+	if id == Fast {
+		s.saturated = true
+		if prio == BestEffort && s.overloaded {
+			s.mu.Unlock()
+			return nil, ErrShed
+		}
+	}
+	w := &waiter{tenant: tenant, prio: prio, granted: make(chan struct{})}
 	l.waiters = append(l.waiters, w)
 	s.mu.Unlock()
 
@@ -222,6 +289,9 @@ func (s *Scheduler) Acquire(ctx context.Context, tenant string, id LaneID) (rele
 	defer timer.Stop()
 	select {
 	case <-w.granted:
+		if w.shed {
+			return nil, ErrShed
+		}
 		return s.releaser(id), nil
 	case <-ctx.Done():
 		err = ctx.Err()
@@ -233,6 +303,9 @@ func (s *Scheduler) Acquire(ctx context.Context, tenant string, id LaneID) (rele
 	if i := slices.Index(l.waiters, w); i >= 0 {
 		l.waiters = slices.Delete(l.waiters, i, i+1)
 		return nil, err
+	}
+	if w.shed {
+		return nil, ErrShed
 	}
 	// The slot came just as the wait ended, so it goes to the next waiter.
 	s.release(id)
@@ -254,18 +327,34 @@ func (s *Scheduler) release(id LaneID) {
 	s.grant(id)
 }
 
-// grant gives free slots in lane id to waiters, the tenant with the least use for its share first; the caller holds mu.
+// grant gives free slots in lane id to waiters, by priority and then the tenant with the least use for its share; the caller holds mu.
 func (s *Scheduler) grant(id LaneID) {
-	l, limit := &s.lanes[id], s.lane(id).MaxActive
+	l, limit := &s.lanes[id], s.max(id)
 	for len(l.waiters) > 0 && (limit == 0 || l.active < limit) {
 		// Ties go to the earliest waiter, since MinFunc returns the first minimum.
 		next := slices.MinFunc(l.waiters, func(a, b *waiter) int {
-			return cmp.Compare(s.served(a.tenant), s.served(b.tenant))
+			return cmp.Or(cmp.Compare(b.prio, a.prio), cmp.Compare(s.served(a.tenant), s.served(b.tenant)))
 		})
 		l.waiters = slices.DeleteFunc(l.waiters, func(w *waiter) bool { return w == next })
-		l.active++
+		s.take(id)
 		close(next.granted)
 	}
+}
+
+// take counts a slot in lane id as taken; the caller holds mu.
+func (s *Scheduler) take(id LaneID) {
+	s.lanes[id].active++
+	if id == Fast && s.limit > 0 && s.lanes[id].active >= s.limit {
+		s.saturated = true
+	}
+}
+
+// max returns how many statements lane id runs at once, 0 meaning no limit; the caller holds mu.
+func (s *Scheduler) max(id LaneID) int {
+	if id == Slow {
+		return s.cfg.Slow.MaxActive
+	}
+	return s.limit
 }
 
 // served is tenant's recent use for its share; the caller holds mu.
@@ -316,13 +405,6 @@ func (s *Scheduler) forgetIdle() {
 	}
 }
 
-func (s *Scheduler) lane(id LaneID) Lane {
-	if id == Slow {
-		return s.cfg.Slow
-	}
-	return s.cfg.Fast
-}
-
 func (s *Scheduler) queueTimeout(id LaneID) time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -330,6 +412,82 @@ func (s *Scheduler) queueTimeout(id LaneID) time.Duration {
 		return cmp.Or(s.cfg.Slow.QueueTimeout, DefaultSlowQueueTimeout)
 	}
 	return cmp.Or(s.cfg.Fast.QueueTimeout, DefaultQueueTimeout)
+}
+
+// Run adjusts the fast lane's limit every AdjustInterval until ctx ends.
+func (s *Scheduler) Run(ctx context.Context) {
+	tick := time.Tick(AdjustInterval)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick:
+			s.adjust()
+		}
+	}
+}
+
+// adjust asks the Controller for a new limit from what this interval saw, and starts the next interval.
+func (s *Scheduler) adjust() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cfg.Controller == nil || s.limit == 0 {
+		return
+	}
+	sig := Signal{LockWaits: s.lockWaits, Saturated: s.saturated}
+	if s.finished > 0 {
+		sig.Slowdown = math.Exp(s.slowdowns / float64(s.finished))
+	}
+	// A limit of 0 means none, so the least a Controller can set is 1.
+	limit := min(max(s.cfg.Controller.Adjust(s.limit, sig), 1), s.cfg.Fast.MaxActive)
+	if limit != s.limit {
+		s.overloaded = limit < s.limit
+	}
+	s.limit = limit
+	s.slowdowns, s.finished = 0, 0
+	s.saturated = s.lanes[Fast].active >= limit || len(s.lanes[Fast].waiters) > 0
+	if s.overloaded {
+		s.shed()
+	}
+	s.grant(Fast)
+}
+
+// shed turns away the best-effort statements waiting for a fast slot; the caller holds mu.
+func (s *Scheduler) shed() {
+	l := &s.lanes[Fast]
+	l.waiters = slices.DeleteFunc(l.waiters, func(w *waiter) bool {
+		if w.prio != BestEffort {
+			return false
+		}
+		w.shed = true
+		close(w.granted)
+		return true
+	})
+}
+
+// Finished reports that a statement ran slowdown times as long as it usually does.
+func (s *Scheduler) Finished(slowdown float64) {
+	if slowdown <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.slowdowns += math.Log(slowdown)
+	s.finished++
+}
+
+// LockWaits reports how many sessions wait on a lock now.
+func (s *Scheduler) LockWaits(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lockWaits = n
+}
+
+// Limit returns how many statements the fast lane runs at once now; 0 means no limit.
+func (s *Scheduler) Limit() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.limit
 }
 
 // waiting counts the statements waiting for a slot in lane id.
