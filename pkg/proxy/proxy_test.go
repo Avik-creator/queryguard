@@ -138,6 +138,17 @@ func TestCapsConnectionsPerTenant(t *testing.T) {
 	waitForSessionSlot(t, addr)
 }
 
+func TestCutsNamesAsPostgresDoes(t *testing.T) {
+	s := newServer(t, startFakePostgres(t).addr)
+	s.Policy = mustPolicy(t, `{"tenant_max_connections": 1}`)
+	addr, _ := startProxy(t, s)
+	role := strings.Repeat("a", 63)
+	loginAs(t, dial(t, addr), role)
+
+	// Postgres cuts the names in a startup packet to 63 bytes, so this logs in as the same role and shares its cap.
+	expectOverCap(t, sendStartupAs(t, dial(t, addr), role+"bbbbbbb"))
+}
+
 func TestCapsConnectionsInTotal(t *testing.T) {
 	s := newServer(t, startFakePostgres(t).addr)
 	s.Policy = mustPolicy(t, `{"max_connections": 1}`)

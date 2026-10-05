@@ -201,7 +201,7 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 
 // relay connects client to an upstream connection and relays messages both ways until either side closes.
 func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, startup *pgproto3.StartupMessage) {
-	role := startup.Parameters["user"]
+	role := pgName(startup.Parameters["user"])
 	var (
 		check         session.Checker
 		authenticated func() *wire.Error
@@ -210,7 +210,7 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	if p := s.ActivePolicy(); p != nil {
 		c := s.policies.Checker(role, log.With("client", client.RemoteAddr()))
 		// Postgres connects a client that names no database to the one named after its role.
-		c.Env = policy.Env{Database: cmp.Or(startup.Parameters["database"], role), Client: clientAddr(client), Plans: &s.Plans, History: &s.History, Scheduler: s.scheduler()}
+		c.Env = policy.Env{Database: pgName(cmp.Or(startup.Parameters["database"], role)), Client: clientAddr(client), Plans: &s.Plans, History: &s.History, Scheduler: s.scheduler()}
 		if s.Catalog != nil {
 			c.Env.Tables = s.Catalog
 		}
@@ -294,6 +294,12 @@ func temporary(err error) bool {
 	errno, ok := errors.AsType[syscall.Errno](err)
 	return ok && errno.Temporary()
 }
+
+// maxNameLen is NAMEDATALEN-1, the longest role or database name in a default Postgres build.
+const maxNameLen = 63
+
+// pgName cuts a name from a startup packet to maxNameLen bytes, as Postgres does before looking it up, even mid-character.
+func pgName(name string) string { return name[:min(len(name), maxNameLen)] }
 
 // hungUp reports whether err only says that one side closed the connection, which is how every session ends.
 func hungUp(err error) bool {
