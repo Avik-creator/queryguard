@@ -573,6 +573,31 @@ func TestSendsFatalErrorWhenUpstreamUnreachable(t *testing.T) {
 	expectFatal(t, conn, "08006")
 }
 
+func TestGivesUpOnAnUpstreamThatNeverFinishesTLS(t *testing.T) {
+	_, clientTLS := testcert.Pair(t)
+	// The upstream takes the connection and never answers the SSLRequest.
+	ln := listen(t)
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { conn.Close() })
+		}
+	}()
+	s := newServer(t, ln.Addr().String())
+	s.Upstream = Dialer{Addr: ln.Addr().String(), TLSConfig: clientTLS}
+	s.StartupTimeout = 100 * time.Millisecond
+	addr, _ := startProxy(t, s)
+	conn := dial(t, addr)
+
+	sendStartup(t, conn)
+
+	expectFatal(t, conn, "08006")
+}
+
 func TestClosesClientWhenUpstreamCloses(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

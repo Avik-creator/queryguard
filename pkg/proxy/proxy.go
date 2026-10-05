@@ -62,7 +62,7 @@ type Server struct {
 	TLSConfig *tls.Config // nil means clients are told TLS is unavailable
 	// RequireClientTLS refuses a login without TLS, which hostssl in pg_hba.conf can't do since Postgres sees only the proxy.
 	RequireClientTLS bool
-	StartupTimeout   time.Duration // how long a new client has to send its startup message
+	StartupTimeout   time.Duration // how long a new client has to send its startup message, and the upstream to take the connection
 	ShutdownTimeout  time.Duration // how long sessions may drain after Serve stops
 	MaxStartups      int           // connections at once that have yet to send their startup message; 0 means DefaultMaxStartups
 	Logger           *slog.Logger  // nil means slog.Default()
@@ -304,7 +304,10 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	defer func() { release() }()
 
 	s.addSettings(startup)
-	server, err := s.Upstream.Acquire(ctx, startup)
+	// A server that takes the connection and never answers would otherwise hold the session forever.
+	actx, connected := context.WithTimeout(ctx, cmp.Or(s.StartupTimeout, DefaultStartupTimeout))
+	server, err := s.Upstream.Acquire(actx, startup)
+	connected()
 	if err != nil {
 		log.Error("connect to upstream", "client", client.RemoteAddr(), "err", err)
 		wire.SendFatal(client, "08006", "queryguard: cannot connect to the database server")
