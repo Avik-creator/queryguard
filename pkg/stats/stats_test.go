@@ -3,10 +3,13 @@ package stats
 import (
 	"math"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
+	"unsafe"
 
 	"github.com/Avik-creator/queryguard/pkg/sqlparse"
 )
@@ -371,4 +374,26 @@ func TestTrafficIsLoggedOnePerLineAndRotatedDaily(t *testing.T) {
 		t.Errorf("new file has %d records, %v; want 1", len(recent), err)
 	}
 	log.Close()
+}
+
+func TestKeepsNoStatementTextOnceAdded(t *testing.T) {
+	table := &Table{}
+	sql := "insert into notes values ('" + strings.Repeat("x", 100_000) + "')"
+	freed := make(chan struct{})
+	runtime.AddCleanup(unsafe.StringData(sql), func(chan struct{}) { close(freed) }, freed)
+
+	table.add(Statement{Database: "shop", Role: "app", SQL: sql, Took: time.Millisecond, Rows: 1})
+	sql = ""
+
+	// A big batch insert's text, kept for each statement seen, would hold gigabytes.
+	defer runtime.KeepAlive(table)
+	for range 10 {
+		runtime.GC()
+		select {
+		case <-freed:
+			return
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	t.Error("the statement's text is still held after it was added")
 }

@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json/v2"
 	"fmt"
+	"hash/maphash"
 	"log/slog"
 	"maps"
 	"math"
@@ -111,7 +112,8 @@ type Table struct {
 	mu           sync.Mutex
 	rows         map[key]*row
 	evicted      int64
-	fingerprints map[string]string // statement text to fingerprint, so a repeated text is parsed once
+	fingerprints map[uint64]string // statement text's hash to fingerprint, so a repeated text is parsed once without being kept
+	seed         maphash.Seed
 	buffers      map[owner]Buffers // from pg_stat_statements
 	last         map[counterKey]Counters
 	queryPrints  map[int64]string // pg_stat_statements query ID to fingerprint
@@ -229,16 +231,20 @@ func (t *Table) addToRow(k key, query string, st Statement) string {
 // fingerprint returns sql's fingerprint, and its text for a new row when that is known without parsing; the caller doesn't hold mu.
 func (t *Table) fingerprint(sql string) (fingerprint, query string) {
 	t.mu.Lock()
-	fp, ok := t.fingerprints[sql]
+	if t.fingerprints == nil {
+		t.fingerprints, t.seed = map[uint64]string{}, maphash.MakeSeed()
+	}
+	h := maphash.String(t.seed, sql)
+	fp, ok := t.fingerprints[h]
 	t.mu.Unlock()
 	if !ok {
 		fp = sqlparse.Fingerprint(sql)
 		t.mu.Lock()
 		// The cache only saves parsing, so it starts over once full rather than tracking use.
-		if t.fingerprints == nil || len(t.fingerprints) >= 4*t.max() {
-			t.fingerprints = map[string]string{}
+		if len(t.fingerprints) >= 4*t.max() {
+			clear(t.fingerprints)
 		}
-		t.fingerprints[sql] = fp
+		t.fingerprints[h] = fp
 		t.mu.Unlock()
 	}
 	if fp == "" {
