@@ -277,6 +277,20 @@ func (s *session) loggedIn() {
 	s.status = 'I'
 }
 
+// awaitLogin waits for the login to end, first sending Postgres a password that came in the same write as the statement.
+func (s *session) awaitLogin() error {
+	select {
+	case <-s.ready:
+		return nil
+	default:
+	}
+	if err := s.serverOut.Flush(); err != nil {
+		return err
+	}
+	<-s.ready
+	return nil
+}
+
 // fromClient relays client messages to the server, checking each Query and Parse.
 func (s *session) fromClient() error {
 	for {
@@ -296,7 +310,10 @@ func (s *session) fromClient() error {
 			err = s.dropUntilSync(typ, n)
 		case (typ == 'Q' || typ == 'P') && s.check != nil:
 			// The client gets ReadyForQuery before loggedIn runs; waiting keeps a quick first query from seeing status 0.
-			if <-s.ready; s.loginErr != nil {
+			if err := s.awaitLogin(); err != nil {
+				return err
+			}
+			if s.loginErr != nil {
 				return s.loginErr
 			}
 			err = s.checkStatement(typ, n)

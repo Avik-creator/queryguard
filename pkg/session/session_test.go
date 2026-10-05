@@ -715,6 +715,30 @@ func TestChecksNothingAfterRefusedLogin(t *testing.T) {
 	expectNone(t, seen, "statement checked for a client that never logged in")
 }
 
+func TestSendsThePasswordAQueryArrivedWith(t *testing.T) {
+	answered := make(chan struct{})
+	answer := sync.OnceFunc(func() { close(answered) })
+	h := startWithLogin(t, fakeChecker{}, func(io.Writer, io.Reader, func(string, string)) error {
+		<-answered
+		return nil
+	})
+	// Registered after start's cleanup, so it runs first and lets Relay return.
+	t.Cleanup(answer)
+	password := &pgproto3.PasswordMessage{Password: "secret"}
+
+	// One write: the query waits for the login, which waits on Postgres getting the password.
+	h.send(password, &pgproto3.Query{String: "select 1"})
+
+	want, _ := password.Encode(nil)
+	got := make([]byte, len(want))
+	h.pg.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(h.pg, got); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("Postgres got %q, %v; want the password message", got, err)
+	}
+	answer()
+	h.serverGets(&pgproto3.Query{String: "select 1"})
+}
+
 func TestEndsWhenClientLeaves(t *testing.T) {
 	h := start(t, fakeChecker{})
 
