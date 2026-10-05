@@ -13,7 +13,6 @@ import (
 	"maps"
 	"net"
 	"net/netip"
-	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Avik-creator/queryguard/internal/safe"
 	"github.com/Avik-creator/queryguard/pkg/fleet"
 	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
@@ -131,19 +131,21 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	s.mu.Lock()
 	s.serving = ctx
 	if s.sched != nil {
-		go s.sched.Run(ctx)
+		go safe.Loop(ctx, log, "scheduler", s.sched.Run)
 	}
 	s.mu.Unlock()
 	if s.Monitor != nil {
-		go s.Monitor.Run(ctx, s.observe)
+		go safe.Loop(ctx, log, "monitor", func(ctx context.Context) { s.Monitor.Run(ctx, s.observe) })
 	}
 	if s.Fleet != nil {
 		// Sessions get the instance's ID in their cancel keys, which it has only once the store answered, so accepting waits a little.
 		first := make(chan struct{})
 		renewed := sync.OnceFunc(func() { close(first) })
-		go s.Fleet.Run(ctx, s.fleetWants, func() {
-			s.applyFleet()
-			renewed()
+		go safe.Loop(ctx, log, "fleet", func(ctx context.Context) {
+			s.Fleet.Run(ctx, s.fleetWants, func() {
+				s.applyFleet()
+				renewed()
+			})
 		})
 		select {
 		case <-first:
@@ -160,7 +162,8 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		}()
 	}
 	if s.ActivePolicy() != nil {
-		go s.logPlanStats(ctx, log, time.Tick(planStatsInterval))
+		tick := time.Tick(planStatsInterval)
+		go safe.Loop(ctx, log, "plan stats", func(ctx context.Context) { s.logPlanStats(ctx, log, tick) })
 	}
 
 	var sessions sync.WaitGroup
@@ -216,11 +219,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 // handle reads the client's startup packet and either forwards a cancel or starts a session.
 func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) {
 	// A bug in one session ends that session, not every client's; the other defers still give back its slots and keys.
-	defer func() {
-		if r := recover(); r != nil {
-			log.Error("session panicked", "client", client.RemoteAddr(), "panic", r, "stack", string(debug.Stack()))
-		}
-	}()
+	defer safe.Recover(func(err error) { logPanic(log, client, err) })
 	defer client.Close()
 	stop := context.AfterFunc(ctx, func() { client.Close() })
 	defer stop()
@@ -371,9 +370,24 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	forget()
 	unfile()
 	// A login refused over the cap was logged when it was refused, and Postgres logs the logins it refuses.
-	if _, refused := errors.AsType[*wire.Error](err); !refused && !errors.Is(err, wire.ErrLoginRefused) && !hungUp(err) {
+	switch _, refused := errors.AsType[*wire.Error](err); {
+	case isPanic(err):
+		logPanic(log, client, err)
+	case !refused && !errors.Is(err, wire.ErrLoginRefused) && !hungUp(err):
 		log.Warn("session ended", "client", client.RemoteAddr(), "err", err)
 	}
+}
+
+// isPanic reports whether err is a recovered panic.
+func isPanic(err error) bool {
+	_, ok := errors.AsType[*safe.Panic](err)
+	return ok
+}
+
+// logPanic logs the panic that ended client's session, with its stack.
+func logPanic(log *slog.Logger, client net.Conn, err error) {
+	p, _ := errors.AsType[*safe.Panic](err)
+	log.Error("session panicked", "client", client.RemoteAddr(), "panic", p.Value, "stack", string(p.Stack))
 }
 
 // temporary reports whether a failed Accept may work if tried again, as after running out of file descriptors.
@@ -613,7 +627,7 @@ func (s *Server) SetPolicy(p *policy.Policy) {
 	if s.sched == nil {
 		s.sched = sched.New(s.scaled(p.SchedConfig()))
 		if s.serving != nil {
-			go s.sched.Run(s.serving)
+			go safe.Loop(s.serving, cmp.Or(s.Logger, slog.Default()), "scheduler", s.sched.Run)
 		}
 	} else {
 		s.sched.Configure(s.scaled(p.SchedConfig()))

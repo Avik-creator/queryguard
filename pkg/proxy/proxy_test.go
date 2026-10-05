@@ -675,6 +675,46 @@ func TestOneSessionsPanicLeavesTheOthersRunning(t *testing.T) {
 	startSession(t, addr)
 }
 
+func TestMonitorThatPanicsRunsAgain(t *testing.T) {
+	var logs lockedBuffer
+	s := newServer(t, startFakePostgres(t).addr)
+	s.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	m := &panickyMonitor{runs: make(chan int, 10)}
+	s.Monitor = m
+	addr, _ := startProxy(t, s)
+
+	// The first run panics; the server goes on and runs the monitor again a second later.
+	for want := 1; want <= 2; want++ {
+		select {
+		case n := <-m.runs:
+			if n != want {
+				t.Fatalf("run %d; want %d", n, want)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("monitor not run a %dth time", want)
+		}
+	}
+	startSession(t, addr)
+	if !strings.Contains(logs.String(), "loop=monitor") {
+		t.Errorf("log %q; want the panic logged", logs.String())
+	}
+}
+
+// panickyMonitor panics in its first Run and then waits for its context.
+type panickyMonitor struct {
+	n    atomic.Int32
+	runs chan int
+}
+
+func (m *panickyMonitor) Run(ctx context.Context, _ func(plan.Activity)) {
+	n := m.n.Add(1)
+	m.runs <- int(n)
+	if n == 1 {
+		panic("bug")
+	}
+	<-ctx.Done()
+}
+
 // panicOnce panics in its first Acquire, as a bug in a session would.
 type panicOnce struct {
 	Upstream
@@ -1547,4 +1587,22 @@ func expectClosed(t *testing.T, conn net.Conn) {
 	case errors.Is(err, os.ErrDeadlineExceeded):
 		t.Fatal("connection still open after 2s; want the proxy to close it")
 	}
+}
+
+// lockedBuffer is a bytes.Buffer several goroutines can log to at once.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
