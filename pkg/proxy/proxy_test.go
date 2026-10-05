@@ -824,6 +824,75 @@ func TestBlockerPaysCanBeTurnedOff(t *testing.T) {
 	})
 }
 
+func TestHoldsBestEffortWhileAStandbyLags(t *testing.T) {
+	s := &Server{Logger: slog.New(slog.DiscardHandler)}
+	s.SetPolicy(mustPolicy(t, `{"replication_lag": {"max": "10s"}, "scheduler": {"max_active": 4, "queue_timeout": "10ms"}}`))
+	bestEffort := func() error {
+		release, err := s.scheduler().Acquire(t.Context(), "batch", sched.Fast, sched.BestEffort)
+		if release != nil {
+			release()
+		}
+		return err
+	}
+
+	s.observe(plan.Activity{ReplicationLag: 20 * time.Second})
+	if err := bestEffort(); !errors.Is(err, sched.ErrHeld) {
+		t.Errorf("best-effort statement while a standby lags 20s = %v; want ErrHeld", err)
+	}
+	s.observe(plan.Activity{ReplicationLag: time.Second})
+	if err := bestEffort(); err != nil {
+		t.Errorf("best-effort statement once the standby caught up = %v", err)
+	}
+}
+
+func TestLimitsTheTenantHoldingTheOldestSnapshot(t *testing.T) {
+	jobs := plan.Table{Schema: "public", Name: "jobs"}
+	old := plan.Snapshot{PID: 7, Age: 2 * time.Minute}
+	for name, tc := range map[string]struct {
+		config   string
+		readings []plan.Activity
+		capped   bool
+	}{
+		"old snapshot, nothing watched": {`{"mvcc_horizon": {"max_age": "1m"}}`,
+			[]plan.Activity{{Horizon: old}}, true},
+		"young snapshot": {`{"mvcc_horizon": {"max_age": "1m"}}`,
+			[]plan.Activity{{Horizon: plan.Snapshot{PID: 7, Age: 30 * time.Second}}}, false},
+		"watched queue's dead tuples grow": {`{"mvcc_horizon": {"max_age": "1m", "watch": ["public.jobs"], "max_dead_tuples": 1000}}`,
+			[]plan.Activity{{Horizon: old, DeadTuples: map[plan.Table]float64{jobs: 100}}, {Horizon: old, DeadTuples: map[plan.Table]float64{jobs: 5000}}}, true},
+		"watched queue stays clean": {`{"mvcc_horizon": {"max_age": "1m", "watch": ["public.jobs"], "max_dead_tuples": 1000}}`,
+			[]plan.Activity{{Horizon: old, DeadTuples: map[plan.Table]float64{jobs: 100}}, {Horizon: old, DeadTuples: map[plan.Table]float64{jobs: 200}}}, false},
+		"snapshot released": {`{"mvcc_horizon": {"max_age": "1m"}}`,
+			[]plan.Activity{{Horizon: old}, {}}, false},
+		"tenant in warn mode": {`{"mvcc_horizon": {"max_age": "1m"}, "tenants": {"analytics": {"mode": "warn"}}}`,
+			[]plan.Activity{{Horizon: old}}, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := &Server{Logger: slog.New(slog.DiscardHandler)}
+			s.SetPolicy(mustPolicy(t, strings.Replace(tc.config, "{", `{"scheduler": {"max_active": 4, "queue_timeout": "10ms"}, `, 1)))
+			holder := &backend{}
+			defer s.backends.add(7, holder)()
+			holder.Running("analytics", false)
+
+			for _, a := range tc.readings {
+				s.observe(a)
+			}
+
+			first, err := s.scheduler().Acquire(t.Context(), "analytics", sched.Fast, sched.Normal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer first()
+			second, err := s.scheduler().Acquire(t.Context(), "analytics", sched.Fast, sched.Normal)
+			if second != nil {
+				second()
+			}
+			if capped := errors.Is(err, sched.ErrBusy); capped != tc.capped {
+				t.Errorf("second statement = %v; want capped to one at a time: %v", err, tc.capped)
+			}
+		})
+	}
+}
+
 // fakeMonitor reports the same activity every second.
 type fakeMonitor struct{ a plan.Activity }
 

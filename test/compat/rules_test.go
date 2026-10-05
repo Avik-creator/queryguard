@@ -390,6 +390,55 @@ func TestDDLStuckBehindALongTransactionIsCancelled(t *testing.T) {
 	expectSelectOne(t, migrator)
 }
 
+func TestOldSnapshotLimitsItsTenantWhileTheQueueBloats(t *testing.T) {
+	dsn := catalogDSN(t) + " dbname=queryguard"
+	direct := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
+	jobs := fmt.Sprintf("qg_jobs_%d", time.Now().UnixNano())
+	mustExec(t, direct, "create table "+jobs+" (id int, state text) with (autovacuum_enabled = false)")
+	t.Cleanup(func() { direct.Exec(context.Background(), "drop table "+jobs) })
+	mustExec(t, direct, "insert into "+jobs+" select g, 'new' from generate_series(1, 1000) g")
+
+	var logs lockedBuffer
+	qg := startProxyWith(t, func(s *proxy.Server) {
+		s.Policy = mustPolicy(t, `{"trusted_roles": ["postgres"], "scheduler": {"max_active": 10},
+			"mvcc_horizon": {"max_age": "1s", "watch": ["public.`+jobs+`"], "max_dead_tuples": 500}}`)
+		s.Monitor = &plan.Monitor{DSN: dsn, Interval: 100 * time.Millisecond, Watch: s.ActivePolicy().Watched}
+		s.Logger = slog.New(slog.NewTextHandler(io.MultiWriter(&logs, t.Output()), nil))
+	})
+	holder, first, second := qg.connect(t, "sslmode=disable"), qg.connect(t, "sslmode=disable"), qg.connect(t, "sslmode=disable")
+	// An analytics report holds its snapshot open.
+	mustExec(t, holder, "begin isolation level repeatable read")
+	mustExec(t, holder, "select count(*) from orders where id < 10 /*tenant='analytics'*/")
+	t.Cleanup(func() { holder.Exec(context.Background(), "rollback") })
+	time.Sleep(1500 * time.Millisecond)
+	// The job queue churns, and vacuum could clean none of it up while the snapshot stays.
+	for range 3 {
+		mustExec(t, direct, "update "+jobs+" set state = 'done'")
+	}
+	mustExec(t, direct, "select pg_stat_force_next_flush()")
+	waitFor(t, 5*time.Second, func() bool { return strings.Contains(logs.String(), "limiting tenant holding back the MVCC horizon") })
+
+	// Two analytics statements now run one after the other.
+	slept := make(chan error, 1)
+	go func() {
+		_, err := first.Exec(context.Background(), "select pg_sleep(1) /*tenant='analytics'*/")
+		slept <- err
+	}()
+	time.Sleep(200 * time.Millisecond)
+	start := time.Now()
+	mustExec(t, second, "select 1 /*tenant='analytics'*/")
+	if took := time.Since(start); took < 500*time.Millisecond {
+		t.Errorf("a second analytics statement ran after %v, beside the first; want it to wait for the first", took)
+	}
+	if err := <-slept; err != nil {
+		t.Fatal(err)
+	}
+
+	// Once the snapshot is gone, the tenant runs freely again.
+	mustExec(t, holder, "rollback")
+	waitFor(t, 5*time.Second, func() bool { return strings.Contains(logs.String(), "MVCC horizon moved on") })
+}
+
 // pidOf returns conn's backend process ID.
 func pidOf(t testing.TB, conn *pgx.Conn) int32 {
 	t.Helper()

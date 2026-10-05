@@ -86,7 +86,12 @@ type Server struct {
 	policies policy.Holder
 	starting atomic.Int64 // connections that have yet to send their startup message
 
-	observed time.Time // when the Monitor last reported; only its goroutine uses it
+	// Only the Monitor's goroutine uses these.
+	observed   time.Time              // when it last reported
+	lagging    bool                   // a standby lags, so best-effort statements are held
+	horizonPID int32                  // the backend whose snapshot is past max_age, or 0
+	deadBase   map[plan.Table]float64 // the watched tables' dead tuples when that snapshot passed max_age
+	capped     string                 // the tenant limited to one statement at a time for holding that snapshot, or ""
 
 	mu      sync.Mutex
 	sched   *sched.Scheduler // made with the first policy and reconfigured by each one after
@@ -419,9 +424,75 @@ func (s *Server) observe(a plan.Activity) {
 		return
 	}
 	s.guardDDL(p, a)
-	if sc != nil && p.BlockerPays() && elapsed > 0 {
+	if sc == nil {
+		return
+	}
+	if p.BlockerPays() && elapsed > 0 {
 		s.chargeBlockers(sc, a, elapsed)
 	}
+	s.watchLag(sc, p, a)
+	s.watchHorizon(sc, p, a)
+}
+
+// watchLag holds best-effort statements while a standby lags more than the policy allows.
+func (s *Server) watchLag(sc *sched.Scheduler, p *policy.Policy, a plan.Activity) {
+	limit := p.ReplicationLag()
+	lagging := limit > 0 && a.ReplicationLag > limit
+	if lagging == s.lagging {
+		return
+	}
+	s.lagging = lagging
+	sc.HoldBestEffort(lagging)
+	log := cmp.Or(s.Logger, slog.Default())
+	if lagging {
+		log.Warn("holding best-effort statements while a standby lags", "rule", "replication_lag", "lag", a.ReplicationLag, "max", limit)
+	} else {
+		log.Info("standbys caught up; best-effort statements run again", "rule", "replication_lag", "lag", a.ReplicationLag)
+	}
+}
+
+// watchHorizon limits to one statement at a time the tenant whose old snapshot holds back the MVCC horizon while the watched tables bloat.
+func (s *Server) watchHorizon(sc *sched.Scheduler, p *policy.Policy, a plan.Activity) {
+	h := p.Horizon()
+	var tenant string
+	if h.MaxAge > 0 && a.Horizon.PID != 0 && a.Horizon.Age > time.Duration(h.MaxAge) {
+		if a.Horizon.PID != s.horizonPID {
+			s.horizonPID, s.deadBase = a.Horizon.PID, maps.Clone(a.DeadTuples)
+		}
+		if b := s.backends.get(a.Horizon.PID); b != nil && (len(h.Watch) == 0 || grown(s.deadBase, a.DeadTuples) > h.MaxDeadTuples) {
+			tenant, _ = b.state()
+		}
+	} else {
+		s.horizonPID, s.deadBase = 0, nil
+	}
+	if tenant == s.capped {
+		return
+	}
+	log := cmp.Or(s.Logger, slog.Default())
+	if s.capped != "" {
+		sc.CapTenant(s.capped, 0)
+		log.Info("MVCC horizon moved on; tenant runs freely again", "rule", "mvcc_horizon", "tenant", s.capped)
+	}
+	s.capped = tenant
+	if tenant == "" {
+		return
+	}
+	attrs := []any{"rule", "mvcc_horizon", "tenant", tenant, "pid", a.Horizon.PID, "snapshot_age", a.Horizon.Age}
+	if p.TenantMode(tenant) == policy.Warn {
+		log.Warn("would limit tenant holding back the MVCC horizon to one statement at a time", attrs...)
+		return
+	}
+	sc.CapTenant(tenant, 1)
+	log.Warn("limiting tenant holding back the MVCC horizon to one statement at a time", attrs...)
+}
+
+// grown returns the most any table's dead tuples grew from base to now.
+func grown(base, now map[plan.Table]float64) float64 {
+	var most float64
+	for t, n := range now {
+		most = max(most, n-base[t])
+	}
+	return most
 }
 
 // guardDDL cancels this proxy's DDL that waits on a lock while others queue behind it, or past the guard's lock_timeout.

@@ -564,6 +564,141 @@ func TestShedAsTheWaitEndsFreesNoSlot(t *testing.T) {
 	}
 }
 
+func TestHeldBestEffortWaitsUntilReleased(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Fast: Lane{MaxActive: 4, QueueTimeout: time.Minute}})
+		s.HoldBestEffort(true)
+		got := make(chan error, 1)
+		go func() {
+			_, err := s.Acquire(t.Context(), "batch", Fast, BestEffort)
+			got <- err
+		}()
+		synctest.Wait()
+		select {
+		case err := <-got:
+			t.Fatalf("held best-effort statement ran at once: %v", err)
+		default:
+		}
+		// Others run as usual.
+		acquire(t, s, "app", Fast)
+
+		s.HoldBestEffort(false)
+
+		if err := <-got; err != nil {
+			t.Errorf("best-effort statement after the hold = %v", err)
+		}
+	})
+}
+
+func TestHeldBestEffortGivesUpWithErrHeld(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Fast: Lane{MaxActive: 4, QueueTimeout: time.Second}})
+		s.HoldBestEffort(true)
+
+		if _, err := s.Acquire(t.Context(), "batch", Fast, BestEffort); !errors.Is(err, ErrHeld) {
+			t.Errorf("held best-effort statement = %v; want ErrHeld after the queue timeout", err)
+		}
+	})
+}
+
+func TestCappedTenantRunsOneAtATime(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Fast: Lane{MaxActive: 3, QueueTimeout: time.Minute}})
+		s.CapTenant("analytics", 1)
+		release := acquire(t, s, "analytics", Fast)
+		got := make(chan struct{})
+		go func() {
+			acquire(t, s, "analytics", Fast)
+			close(got)
+		}()
+		synctest.Wait()
+		select {
+		case <-got:
+			t.Fatal("a capped tenant ran two statements at once")
+		default:
+		}
+		// The capped tenant's waiting statement holds no one else up.
+		acquire(t, s, "app", Fast)
+
+		release()
+		synctest.Wait()
+		select {
+		case <-got:
+		default:
+			t.Error("the capped tenant's next statement did not run once its first ended")
+		}
+	})
+}
+
+func TestUncappingLetsWaitersRun(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Fast: Lane{MaxActive: 3, QueueTimeout: time.Minute}})
+		s.CapTenant("analytics", 1)
+		acquire(t, s, "analytics", Fast)
+		got := make(chan struct{})
+		go func() {
+			acquire(t, s, "analytics", Fast)
+			close(got)
+		}()
+		synctest.Wait()
+
+		s.CapTenant("analytics", 0)
+
+		synctest.Wait()
+		select {
+		case <-got:
+		default:
+			t.Error("lifting the cap left a statement waiting with slots free")
+		}
+	})
+}
+
+func TestLongStatementMovesToTheSlowLane(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Fast: Lane{MaxActive: 1, QueueTimeout: time.Minute}, Slow: Lane{MaxActive: 1, QueueTimeout: time.Minute}, DemoteAfter: 5 * time.Second})
+		long := acquire(t, s, "a", Fast)
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+
+		// The long statement now counts in the slow lane, so the fast lane has its slot back and the slow lane is full.
+		acquire(t, s, "b", Fast)
+		got := make(chan struct{})
+		go func() {
+			acquire(t, s, "c", Slow)
+			close(got)
+		}()
+		synctest.Wait()
+		select {
+		case <-got:
+			t.Fatal("the slow lane ran a second statement beside the demoted one")
+		default:
+		}
+		long()
+		synctest.Wait()
+		select {
+		case <-got:
+		default:
+			t.Error("ending the demoted statement freed no slow slot")
+		}
+	})
+}
+
+func TestTrueUpChargesTheDifference(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Budgets: map[string]Budget{"acme": {Rate: 1, Burst: 100, WhenOver: Reject}}})
+		s.Charge("acme", 50)
+
+		s.TrueUp("acme", 50, 150)
+		if !s.Spent("acme") {
+			t.Error("a statement that cost 150, not the 50 charged, left the budget unspent")
+		}
+		s.TrueUp("acme", 150, 10)
+		if s.Spent("acme") {
+			t.Error("a statement that cost 10, not 150, left the budget spent")
+		}
+	})
+}
+
 // nextInterval waits until Run has adjusted the limit once more.
 func nextInterval() {
 	time.Sleep(AdjustInterval)

@@ -250,6 +250,36 @@ only logs what would be cancelled, as does a tenant in warn mode; `off` turns
 the guard off. Readings come once a second, so a statement may wait up to
 about a second behind the DDL before it is cancelled.
 
+### Standbys that lag
+
+```json
+"replication_lag": {"max": "10s"}
+```
+
+While any standby's `replay_lag` is over `max`, best-effort statements wait
+for a slot however many are free, as Vitess's throttler holds back backfills,
+and fail with `53000` after their queue timeout. Other statements run as
+before. Logical replication slots and standbys that only stream WAL to an
+archive count too, since they show up in `pg_stat_replication`.
+
+### Old snapshots
+
+A snapshot held open, by a long report or a transaction left idle, stops
+vacuum from cleaning up any row that changed since, on every table. A busy
+job queue then fills with dead rows, and every poll for the next job reads
+through them. With `mvcc_horizon`, once the backend holding the oldest
+snapshot has held it longer than `max_age`, and the dead rows of the tables in
+`watch` have grown by more than `max_dead_tuples` (1000) since, its tenant
+runs one statement at a time until it lets go:
+
+```json
+"mvcc_horizon": {"max_age": "1m", "watch": ["public.jobs"], "max_dead_tuples": 10000}
+```
+
+Its statements then can't overlap and keep the horizon pinned between them.
+Without `watch`, age alone is enough. The watched tables are read in
+`-catalog-dsn`'s database. A tenant in warn mode is only logged.
+
 ### Blocker pays
 
 Time a tenant's statements spend waiting on another tenant's locks is
@@ -343,6 +373,14 @@ analytics query but statements taking longer than they themselves usually
 do. Lock waits come from `pg_stat_activity` over `-catalog-dsn`. A good
 ceiling is about four times the database's CPU cores.
 
+### Long statements and the slow lane
+
+With `"demote_after": "10s"` under `scheduler`, a fast-lane statement that
+runs longer is counted in the slow lane from then on, as Oracle's Resource
+Manager switches consumer groups: its fast slot goes to the next statement
+waiting, and the slow lane is that much fuller until it ends. By default
+statements stay in the lane they started in.
+
 ### Priorities
 
 Each tenant has a `priority`: `critical`, `normal` (the default) or
@@ -407,7 +445,12 @@ planner's own cost, the number `EXPLAIN` shows.
 {"calibration": {"mode": "on", "credibility": 10}}
 ```
 
-`"mode": "off"` charges the planner's cost. The time measured includes the
+When a timed statement ends, its charge is trued up to what it took: the
+time, at the server's average time per cost unit, replaces the estimate, and
+the tenant pays the difference or gets it back. A statement that failed or
+was cancelled pays for the time it ran too.
+
+`"mode": "off"` charges the planner's cost, with no true-up. The time measured includes the
 network round trip and the time the client takes to read the rows. Statements
 that share a `Sync`, as in a pipeline or a batch, aren't timed, because
 PostgreSQL sends their answers together at the `Sync`. Nor is `DECLARE`, since

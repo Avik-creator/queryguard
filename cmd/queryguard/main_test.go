@@ -122,12 +122,21 @@ func TestNewCatalog(t *testing.T) {
 }
 
 func TestNewMonitor(t *testing.T) {
-	if m := newMonitor(nil, nil); m != nil {
+	s := &proxy.Server{}
+	if m := newMonitor(nil, s, nil); m != nil {
 		t.Errorf("no -catalog-dsn gave monitor %v; want none", m)
 	}
-	m, ok := newMonitor(&plan.Catalog{DSN: "host=db user=qg_monitor"}, nil).(*plan.Monitor)
+	m, ok := newMonitor(&plan.Catalog{DSN: "host=db user=qg_monitor"}, s, nil).(*plan.Monitor)
 	if !ok || m.DSN != "host=db user=qg_monitor" {
-		t.Errorf("monitor %+v; want one reading over -catalog-dsn", m)
+		t.Fatalf("monitor %+v; want one reading over -catalog-dsn", m)
+	}
+	if got := m.Watch(); got != nil {
+		t.Errorf("watched %v with no policy; want nothing", got)
+	}
+	p, _ := policy.Parse([]byte(`{"mvcc_horizon": {"max_age": "1m", "watch": ["public.jobs"]}}`))
+	s.SetPolicy(p)
+	if got := m.Watch(); len(got) != 1 || got[0] != (plan.Table{Schema: "public", Name: "jobs"}) {
+		t.Errorf("watched %v; want the policy's public.jobs", got)
 	}
 }
 

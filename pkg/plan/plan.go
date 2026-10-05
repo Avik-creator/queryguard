@@ -677,9 +677,11 @@ func (r *activityReader) query(ctx context.Context, watch []Table) (Activity, er
 		a.ReplicationLag = time.Duration(lag * float64(time.Second))
 		return err
 	})
-	// Its own query's snapshot would always be the newest, but it is left out all the same.
+	// Its own query's snapshot would always be the newest, but it is left out all the same; of backends with the same xmin,
+	// the one whose transaction started first holds it longest.
 	b.Queue(`select pid, extract(epoch from clock_timestamp() - coalesce(xact_start, query_start, backend_start))::float8
-		from pg_stat_activity where backend_xmin is not null and pid <> pg_backend_pid() order by age(backend_xmin) desc limit 1`).
+		from pg_stat_activity where backend_xmin is not null and pid <> pg_backend_pid()
+		order by age(backend_xmin) desc, coalesce(xact_start, query_start, backend_start) limit 1`).
 		Query(func(rows pgx.Rows) error {
 			var age float64
 			_, err := pgx.ForEachRow(rows, []any{&a.Horizon.PID, &age}, func() error {

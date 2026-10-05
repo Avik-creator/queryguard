@@ -68,6 +68,8 @@ type Config struct {
 	Budgets    map[string]Budget // by tenant
 	Default    Budget            // for tenants not in Budgets
 	Controller Controller        // moves the fast lane's limit under Fast.MaxActive; nil keeps it at Fast.MaxActive
+	// DemoteAfter moves a fast-lane statement running longer into the slow lane's count; 0 never does.
+	DemoteAfter time.Duration
 }
 
 // AdjustInterval is how often Run asks the Controller for a new limit.
@@ -120,6 +122,7 @@ var (
 	ErrOverBudget = errors.New("the tenant's cost budget is spent")
 	ErrBusy       = errors.New("no slot came free in time")
 	ErrShed       = errors.New("best-effort statements are shed while the server is overloaded")
+	ErrHeld       = errors.New("best-effort statements are held back")
 )
 
 // Scheduler is safe for concurrent use.
@@ -128,12 +131,15 @@ type Scheduler struct {
 	cfg        Config
 	tenants    map[string]*tenant
 	lanes      [2]lane
-	limit      int     // the fast lane's limit now; 0 means none
-	overloaded bool    // the limit last moved down, so best-effort statements don't wait
-	slowdowns  float64 // the sum of ln(slowdown) this interval
-	finished   int     // statements finished this interval
-	lockWaits  int     // sessions waiting on a lock, as last reported
-	saturated  bool    // every fast slot was taken at some point this interval
+	limit      int            // the fast lane's limit now; 0 means none
+	overloaded bool           // the limit last moved down, so best-effort statements don't wait
+	slowdowns  float64        // the sum of ln(slowdown) this interval
+	finished   int            // statements finished this interval
+	lockWaits  int            // sessions waiting on a lock, as last reported
+	saturated  bool           // every fast slot was taken at some point this interval
+	held       bool           // best-effort statements wait, however many slots are free
+	caps       map[string]int // the most statements a tenant may run at once, for tenants capped
+	running    map[string]int // statements each tenant runs now, in both lanes
 }
 
 // tenant is one tenant's state, brought up to date by refresh before each use.
@@ -152,12 +158,13 @@ type waiter struct {
 	tenant  string
 	prio    Priority
 	shed    bool          // set before granted is closed when the waiter is shed instead
-	granted chan struct{} // closed when the waiter is given a slot
+	slot    *slot         // set before granted is closed when the waiter is given a slot
+	granted chan struct{} // closed when the waiter is given a slot or shed
 }
 
 // New returns a Scheduler with cfg.
 func New(cfg Config) *Scheduler {
-	s := &Scheduler{tenants: map[string]*tenant{}}
+	s := &Scheduler{tenants: map[string]*tenant{}, caps: map[string]int{}, running: map[string]int{}}
 	s.Configure(cfg)
 	return s
 }
@@ -269,19 +276,20 @@ func (s *Scheduler) Refund(tenant string, cost float64) {
 func (s *Scheduler) Acquire(ctx context.Context, tenant string, id LaneID, prio Priority) (release func(), err error) {
 	s.mu.Lock()
 	l, limit := &s.lanes[id], s.max(id)
-	if limit == 0 || (l.active < limit && len(l.waiters) == 0) {
-		s.take(id)
+	w := &waiter{tenant: tenant, prio: prio, granted: make(chan struct{})}
+	full := limit > 0 && l.active >= limit
+	if !full && s.eligible(w) && !slices.ContainsFunc(l.waiters, s.eligible) {
+		sl := s.take(id, tenant)
 		s.mu.Unlock()
-		return s.releaser(id), nil
+		return s.releaser(sl), nil
 	}
-	if id == Fast {
+	if id == Fast && full {
 		s.saturated = true
 		if prio == BestEffort && s.overloaded {
 			s.mu.Unlock()
 			return nil, ErrShed
 		}
 	}
-	w := &waiter{tenant: tenant, prio: prio, granted: make(chan struct{})}
 	l.waiters = append(l.waiters, w)
 	s.mu.Unlock()
 
@@ -292,7 +300,7 @@ func (s *Scheduler) Acquire(ctx context.Context, tenant string, id LaneID, prio 
 		if w.shed {
 			return nil, ErrShed
 		}
-		return s.releaser(id), nil
+		return s.releaser(w.slot), nil
 	case <-ctx.Done():
 		err = ctx.Err()
 	case <-timer.C:
@@ -302,51 +310,115 @@ func (s *Scheduler) Acquire(ctx context.Context, tenant string, id LaneID, prio 
 	defer s.mu.Unlock()
 	if i := slices.Index(l.waiters, w); i >= 0 {
 		l.waiters = slices.Delete(l.waiters, i, i+1)
+		if errors.Is(err, ErrBusy) && prio == BestEffort && s.held {
+			err = ErrHeld
+		}
 		return nil, err
 	}
 	if w.shed {
 		return nil, ErrShed
 	}
 	// The slot came just as the wait ended, so it goes to the next waiter.
-	s.release(id)
+	s.release(w.slot)
 	return nil, err
 }
 
-// releaser frees a slot in lane id once, however often it is called.
-func (s *Scheduler) releaser(id LaneID) func() {
+// slot is one statement's place in a lane.
+type slot struct {
+	lane   LaneID
+	tenant string
+	demote *time.Timer // moves it to the slow lane's count; nil when it never moves
+	freed  bool
+}
+
+// releaser frees sl once, however often it is called.
+func (s *Scheduler) releaser(sl *slot) func() {
 	return sync.OnceFunc(func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		s.release(id)
+		s.release(sl)
 	})
 }
 
-// release frees a slot and hands it on; the caller holds mu.
-func (s *Scheduler) release(id LaneID) {
-	s.lanes[id].active--
-	s.grant(id)
+// release frees sl and hands slots on; the caller holds mu.
+func (s *Scheduler) release(sl *slot) {
+	if sl.freed {
+		return
+	}
+	sl.freed = true
+	if sl.demote != nil {
+		sl.demote.Stop()
+	}
+	s.lanes[sl.lane].active--
+	if s.running[sl.tenant]--; s.running[sl.tenant] <= 0 {
+		delete(s.running, sl.tenant)
+	}
+	// The tenant's cap may have held up a waiter in either lane.
+	s.grant(Fast)
+	s.grant(Slow)
 }
 
-// grant gives free slots in lane id to waiters, by priority and then the tenant with the least use for its share; the caller holds mu.
+// demote counts sl, which has run in the fast lane past DemoteAfter, in the slow lane instead; the caller holds mu.
+func (s *Scheduler) demote(sl *slot) {
+	if sl.freed || sl.lane != Fast {
+		return
+	}
+	s.lanes[Fast].active--
+	s.lanes[Slow].active++
+	sl.lane = Slow
+	s.grant(Fast)
+}
+
+// eligible reports whether w may take a slot once one is free: a hold or its tenant's cap may keep it waiting; the caller holds mu.
+func (s *Scheduler) eligible(w *waiter) bool {
+	if s.held && w.prio == BestEffort {
+		return false
+	}
+	n := s.caps[w.tenant]
+	return n == 0 || s.running[w.tenant] < n
+}
+
+// grant gives free slots in lane id to eligible waiters, by priority and then the tenant with the least use for its share; the caller holds mu.
 func (s *Scheduler) grant(id LaneID) {
 	l, limit := &s.lanes[id], s.max(id)
-	for len(l.waiters) > 0 && (limit == 0 || l.active < limit) {
+	for limit == 0 || l.active < limit {
 		// Ties go to the earliest waiter, since MinFunc returns the first minimum.
-		next := slices.MinFunc(l.waiters, func(a, b *waiter) int {
-			return cmp.Or(cmp.Compare(b.prio, a.prio), cmp.Compare(s.served(a.tenant), s.served(b.tenant)))
-		})
+		var next *waiter
+		for _, w := range l.waiters {
+			if s.eligible(w) && (next == nil || s.before(w, next)) {
+				next = w
+			}
+		}
+		if next == nil {
+			return
+		}
 		l.waiters = slices.DeleteFunc(l.waiters, func(w *waiter) bool { return w == next })
-		s.take(id)
+		next.slot = s.take(id, next.tenant)
 		close(next.granted)
 	}
 }
 
-// take counts a slot in lane id as taken; the caller holds mu.
-func (s *Scheduler) take(id LaneID) {
+// before reports whether a goes ahead of b: by priority, then by use for share; the caller holds mu.
+func (s *Scheduler) before(a, b *waiter) bool {
+	return cmp.Or(cmp.Compare(b.prio, a.prio), cmp.Compare(s.served(a.tenant), s.served(b.tenant))) < 0
+}
+
+// take gives tenant a slot in lane id; the caller holds mu.
+func (s *Scheduler) take(id LaneID, tenant string) *slot {
 	s.lanes[id].active++
+	s.running[tenant]++
 	if id == Fast && s.limit > 0 && s.lanes[id].active >= s.limit {
 		s.saturated = true
 	}
+	sl := &slot{lane: id, tenant: tenant}
+	if d := s.cfg.DemoteAfter; id == Fast && d > 0 {
+		sl.demote = time.AfterFunc(d, func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.demote(sl)
+		})
+	}
+	return sl
 }
 
 // max returns how many statements lane id runs at once, 0 meaning no limit; the caller holds mu.
@@ -517,4 +589,38 @@ func (s *Scheduler) Transfer(from, to string, cost float64) {
 	if len(s.tenants) > maxTenants {
 		s.forgetIdle()
 	}
+}
+
+// HoldBestEffort keeps best-effort statements waiting for a slot while on, as while a standby lags.
+func (s *Scheduler) HoldBestEffort(on bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.held = on
+	s.grant(Fast)
+	s.grant(Slow)
+}
+
+// CapTenant lets tenant run at most n statements at once across both lanes; 0 lifts the cap.
+func (s *Scheduler) CapTenant(tenant string, n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n > 0 {
+		s.caps[tenant] = n
+	} else {
+		delete(s.caps, tenant)
+	}
+	s.grant(Fast)
+	s.grant(Slow)
+}
+
+// TrueUp charges tenant the difference between a statement's cost when it ran, actual, and what it was charged; less is paid back.
+func (s *Scheduler) TrueUp(tenant string, charged, actual float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, t := s.budget(tenant), s.refresh(tenant)
+	diff := max(actual, b.MinCharge) - max(charged, b.MinCharge)
+	if b.Rate > 0 {
+		t.tokens = min(b.Burst, t.tokens-diff)
+	}
+	t.usage = max(0, t.usage+diff)
 }

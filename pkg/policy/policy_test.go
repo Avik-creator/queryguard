@@ -769,6 +769,54 @@ func TestDDLGuard(t *testing.T) {
 	}
 }
 
+func TestServerSignals(t *testing.T) {
+	p := mustParse(t, `{"replication_lag": {"max": "10s"}, "mvcc_horizon": {"max_age": "1m", "watch": ["public.jobs"], "max_dead_tuples": 5000}}`)
+	if got := p.ReplicationLag(); got != 10*time.Second {
+		t.Errorf("ReplicationLag() = %v; want 10s", got)
+	}
+	want := Horizon{MaxAge: Duration(time.Minute), Watch: []string{"public.jobs"}, MaxDeadTuples: 5000}
+	if got := p.Horizon(); got.MaxAge != want.MaxAge || got.MaxDeadTuples != want.MaxDeadTuples || !slices.Equal(got.Watch, want.Watch) {
+		t.Errorf("Horizon() = %+v; want %+v", got, want)
+	}
+	if got := p.Watched(); !slices.Equal(got, []plan.Table{{Schema: "public", Name: "jobs"}}) {
+		t.Errorf("Watched() = %v; want public.jobs", got)
+	}
+	if empty := mustParse(t, `{}`); empty.ReplicationLag() != 0 || empty.Horizon().MaxAge != 0 || empty.Watched() != nil {
+		t.Error("an empty config watches replication lag or the MVCC horizon")
+	}
+}
+
+func TestHeldStatementIsRejectedAsHeldBack(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := gateChecker(t, `{"scheduler": {"max_active": 2, "queue_timeout": "1s"}, "tenants": {"batch": {"priority": "best_effort"}}}`, "batch", discard)
+		c.Env.Scheduler.HoldBestEffort(true)
+
+		a := pass(t, c, "select 1", costing(1), false)
+
+		if codeOf(a.Reject) != "53000" || !strings.Contains(a.Reject.Message, "held back") {
+			t.Errorf("held best-effort statement got %v; want 53000 saying it was held back", a.Reject)
+		}
+	})
+}
+
+func TestGateTruesUpToMeasuredTime(t *testing.T) {
+	history := &plan.History{}
+	trainer := gateChecker(t, `{"scheduler": {"max_active": 100}}`, "alice", discard)
+	trainer.Env.History = history
+	// 100 cost units take 10ms here, so a second is worth 10000.
+	train(t, trainer, "select 1", costing(100), 10, 10*time.Millisecond)
+	c := gateChecker(t, `{"tenants": {"alice": {"budget": {"rate": 1, "burst": 1000, "when_over": "reject"}}}}`, "alice", discard)
+	c.Env.History = history
+
+	// The plan said 100, which the budget pays easily, but the statement ran for a second.
+	a := pass(t, c, lookupSQL, costing(100), false)
+	a.Ran(time.Second, true)
+
+	if next := pass(t, c, lookupSQL, costing(100), false); codeOf(next.Reject) != "53000" {
+		t.Errorf("next statement got %v; want 53000 once the first was charged for its second", next.Reject)
+	}
+}
+
 func TestTenantMode(t *testing.T) {
 	p := mustParse(t, `{"tenants": {"bob": {"mode": "warn"}}}`)
 	if p.TenantMode("bob") != Warn || p.TenantMode("alice") != Enforce {
@@ -930,7 +978,7 @@ func (s *signals) last() [2]sched.Signal {
 }
 
 func TestSchedConfig(t *testing.T) {
-	p := mustParse(t, `{"scheduler": {"max_active": 8, "queue_timeout": "2s", "slow_lane": {"max_active": 1, "queue_timeout": "30s"},
+	p := mustParse(t, `{"scheduler": {"max_active": 8, "queue_timeout": "2s", "slow_lane": {"max_active": 1, "queue_timeout": "30s"}, "demote_after": "5s",
 			"adaptive": {"floor": 2, "backoff": 0.5, "max_slowdown": 3, "lock_wait_share": 0.1}},
 		"tenant_defaults": {"budget": {"rate": 10}},
 		"tenants": {"acme": {"budget": {"rate": 100, "burst": 1000, "share": 2, "min_charge": 5, "when_over": "slow"}}, "bob": {"mode": "warn"}}}`)
@@ -938,14 +986,15 @@ func TestSchedConfig(t *testing.T) {
 	got := p.SchedConfig()
 
 	want := sched.Config{
-		Fast:       sched.Lane{MaxActive: 8, QueueTimeout: 2 * time.Second},
-		Slow:       sched.Lane{MaxActive: 1, QueueTimeout: 30 * time.Second},
-		Budgets:    map[string]sched.Budget{"acme": {Rate: 100, Burst: 1000, Share: 2, MinCharge: 5, WhenOver: sched.SlowLane}},
-		Default:    sched.Budget{Rate: 10},
-		Controller: sched.AIMD{Floor: 2, Backoff: 0.5, MaxSlowdown: 3, LockWaitShare: 0.1},
+		Fast:        sched.Lane{MaxActive: 8, QueueTimeout: 2 * time.Second},
+		Slow:        sched.Lane{MaxActive: 1, QueueTimeout: 30 * time.Second},
+		Budgets:     map[string]sched.Budget{"acme": {Rate: 100, Burst: 1000, Share: 2, MinCharge: 5, WhenOver: sched.SlowLane}},
+		Default:     sched.Budget{Rate: 10},
+		Controller:  sched.AIMD{Floor: 2, Backoff: 0.5, MaxSlowdown: 3, LockWaitShare: 0.1},
+		DemoteAfter: 5 * time.Second,
 	}
 	if got.Fast != want.Fast || got.Slow != want.Slow || got.Default != want.Default || !maps.Equal(got.Budgets, want.Budgets) ||
-		got.Controller != want.Controller {
+		got.Controller != want.Controller || got.DemoteAfter != want.DemoteAfter {
 		t.Errorf("SchedConfig = %+v; want %+v", got, want)
 	}
 }
@@ -1000,6 +1049,12 @@ func TestParseRejectsBadConfig(t *testing.T) {
 		`{"ddl_guard": {"mode": "loud"}}`:                                            "loud",
 		`{"ddl_guard": {"lock_timeout": "-1s"}}`:                                     "lock_timeout",
 		`{"scheduler": {"blocker_pays": "maybe"}}`:                                   "maybe",
+		`{"scheduler": {"demote_after": "-1s"}}`:                                     "demote_after",
+		`{"replication_lag": {"max": "-1s"}}`:                                        "replication_lag",
+		`{"mvcc_horizon": {"max_age": "-1s"}}`:                                       "max_age",
+		`{"mvcc_horizon": {"max_age": "1m", "watch": ["jobs"]}}`:                     "schema.table",
+		`{"mvcc_horizon": {"max_age": "1m", "max_dead_tuples": -1}}`:                 "max_dead_tuples",
+		`{"mvcc_horizon": {"watch": ["public.jobs"]}}`:                               "max_age",
 	} {
 		if _, err := Parse([]byte(config)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("Parse(%s) = %v; want an error mentioning %q", config, err, want)

@@ -47,6 +47,8 @@ type Config struct {
 	Calibration          Calibration       `json:"calibration"`
 	PlanFlips            PlanFlips         `json:"plan_flips"`
 	DDLGuard             DDLGuard          `json:"ddl_guard"`
+	ReplicationLag       ReplicationLag    `json:"replication_lag"`
+	MVCCHorizon          Horizon           `json:"mvcc_horizon"`
 	TenantDefaults       Tenant            `json:"tenant_defaults"` // the budget and timeouts of tenants that set none
 	Rules                []Rule            `json:"rules"`
 	Tenants              map[string]Tenant `json:"tenants"` // keyed by tenant: a role, or a tag from a trusted role
@@ -97,6 +99,22 @@ type Scheduler struct {
 	SlowLane     Lane      `json:"slow_lane"`
 	Adaptive     *Adaptive `json:"adaptive"`     // moves the limit between a floor and max_active by how the server copes; nil keeps max_active
 	BlockerPays  string    `json:"blocker_pays"` // "on" (the default) charges a tenant for the time others wait on its locks; "off" doesn't
+	DemoteAfter  Duration  `json:"demote_after"` // a fast-lane statement running longer counts in the slow lane; 0 means never
+}
+
+// ReplicationLag holds best-effort statements back while a standby lags.
+type ReplicationLag struct {
+	Max Duration `json:"max"` // the most any standby may lag in replaying; 0 means lag isn't watched
+}
+
+// DefaultMaxDeadTuples is how far the watched tables' dead tuples may grow under an old snapshot when max_dead_tuples is zero.
+const DefaultMaxDeadTuples = 1000
+
+// Horizon limits the tenant whose old snapshot holds back the MVCC horizon, so vacuum can't clean up after anyone.
+type Horizon struct {
+	MaxAge        Duration `json:"max_age"`         // a snapshot older than this limits its tenant to one statement at a time; 0 means not watched
+	Watch         []string `json:"watch"`           // schema.table names, such as a job queue, whose dead tuples must also grow; none means age alone
+	MaxDeadTuples float64  `json:"max_dead_tuples"` // how far they may grow while the snapshot is old; 0 means 1000
 }
 
 // DefaultDDLLockTimeout is how long DDL may wait on a lock when the DDL guard sets no lock_timeout.
@@ -346,6 +364,22 @@ func (p *Policy) compile() error {
 	if c.DDLGuard.LockTimeout < 0 {
 		errs = append(errs, errors.New("ddl_guard lock_timeout must not be negative"))
 	}
+	if s.DemoteAfter < 0 {
+		errs = append(errs, errors.New("scheduler demote_after must not be negative"))
+	}
+	if c.ReplicationLag.Max < 0 {
+		errs = append(errs, errors.New("replication_lag max must not be negative"))
+	}
+	if h := c.MVCCHorizon; h.MaxAge < 0 || h.MaxDeadTuples < 0 {
+		errs = append(errs, errors.New("mvcc_horizon max_age and max_dead_tuples must not be negative"))
+	} else if h.MaxAge == 0 && (len(h.Watch) > 0 || h.MaxDeadTuples > 0) {
+		errs = append(errs, errors.New("mvcc_horizon: watch and max_dead_tuples need max_age"))
+	}
+	for _, name := range c.MVCCHorizon.Watch {
+		if schema, table, ok := strings.Cut(name, "."); !ok || schema == "" || table == "" {
+			errs = append(errs, fmt.Errorf("mvcc_horizon watch %q: want schema.table", name))
+		}
+	}
 	if b := s.BlockerPays; b != "" && b != "on" && b != "off" {
 		errs = append(errs, fmt.Errorf("scheduler blocker_pays %q: want on or off", b))
 	}
@@ -413,6 +447,26 @@ func (p *Policy) DDLGuard() DDLGuard {
 	return g
 }
 
+// ReplicationLag returns the most a standby may lag before best-effort statements are held back; 0 means lag isn't watched.
+func (p *Policy) ReplicationLag() time.Duration { return time.Duration(p.cfg.ReplicationLag.Max) }
+
+// Horizon returns how the MVCC horizon is watched, with its defaults filled in; a MaxAge of 0 means it isn't.
+func (p *Policy) Horizon() Horizon {
+	h := p.cfg.MVCCHorizon
+	h.MaxDeadTuples = cmp.Or(h.MaxDeadTuples, DefaultMaxDeadTuples)
+	return h
+}
+
+// Watched returns the tables whose dead tuples the MVCC horizon check reads, or nil.
+func (p *Policy) Watched() []plan.Table {
+	var tables []plan.Table
+	for _, name := range p.cfg.MVCCHorizon.Watch {
+		schema, table, _ := strings.Cut(name, ".")
+		tables = append(tables, plan.Table{Schema: schema, Name: table})
+	}
+	return tables
+}
+
 // BlockerPays reports whether tenants are charged for the time others wait on their locks.
 func (p *Policy) BlockerPays() bool { return p.cfg.Scheduler.BlockerPays != "off" }
 
@@ -443,6 +497,7 @@ func (p *Policy) SchedConfig() sched.Config {
 			cfg.Budgets[name] = t.Budget.sched()
 		}
 	}
+	cfg.DemoteAfter = time.Duration(s.DemoteAfter)
 	if a := s.Adaptive; a != nil {
 		cfg.Controller = sched.AIMD{Floor: a.Floor, Backoff: a.Backoff, MaxSlowdown: a.MaxSlowdown, LockWaitShare: a.LockWaitShare}
 	}
@@ -699,6 +754,10 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 				s.Refund(who.tenant, cost)
 				c.log.Warn("rejected statement", "rule", "overload", "tenant", who.tenant, "err", err)
 				return session.Admission{Reject: shed()}
+			case errors.Is(err, sched.ErrHeld):
+				s.Refund(who.tenant, cost)
+				c.log.Warn("rejected statement", "rule", "held", "tenant", who.tenant, "err", err)
+				return session.Admission{Reject: heldBack()}
 			case err != nil:
 				s.Refund(who.tenant, cost)
 				c.log.Warn("rejected statement", "rule", "busy", "tenant", who.tenant, "lane", lane, "err", err)
@@ -785,8 +844,14 @@ func (c *Checker) learn(p *Policy, sql, fingerprint string, who subject, warn bo
 		}
 	}
 	return cost, slow, func(took time.Duration, finished bool) {
-		if s := c.Env.Scheduler; s != nil && finished && took > 0 && v.Usual > 0 {
-			s.Finished(float64(took) / float64(v.Usual))
+		if s := c.Env.Scheduler; s != nil && took > 0 {
+			if finished && v.Usual > 0 {
+				s.Finished(float64(took) / float64(v.Usual))
+			}
+			// The plan's cost was a guess; what the statement took, failed or not, is what it cost.
+			if actual, ok := history.CostOf(took); ok && p.cfg.Calibration.Mode != "off" {
+				s.TrueUp(who.tenant, cost, actual)
+			}
 		}
 		if !history.Ran(key, pl, took, finished, tune) {
 			return
@@ -937,6 +1002,12 @@ func busy(p *Policy, lane sched.LaneID) *pgproto3.ErrorResponse {
 func shed() *pgproto3.ErrorResponse {
 	return rejection("53000", "queryguard: server overloaded; best-effort statements are shed",
 		"The server is overloaded, so statements of best_effort priority run only when a slot is free.", "Retry later.")
+}
+
+// heldBack is the error for a best-effort statement held back past its queue timeout, as while a standby lags.
+func heldBack() *pgproto3.ErrorResponse {
+	return rejection("53000", "queryguard: best-effort statements are held back",
+		"Statements of best_effort priority wait while a standby lags too far behind.", "Retry later.")
 }
 
 // sameBytes are the client encodings Postgres reads without converting, so its parser sees the bytes QueryGuard's does.

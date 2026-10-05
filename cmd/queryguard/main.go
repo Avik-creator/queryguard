@@ -116,10 +116,10 @@ func run(opts options, log *slog.Logger) error {
 		KeepAlive:           keepAlive,
 		Policy:              pol,
 		Catalog:             catalog,
-		Monitor:             newMonitor(catalog, log),
 		ShutdownTimeout:     opts.shutdownTimeout,
 		Logger:              log,
 	}
+	s.Monitor = newMonitor(catalog, s, log)
 	if opts.config != "" {
 		go reloadOnHangup(ctx, s, opts.config, catalog, log)
 	}
@@ -152,12 +152,18 @@ func newCatalog(dsn string, pol *policy.Policy, log *slog.Logger) (*plan.Catalog
 	return &plan.Catalog{DSN: dsn, Log: log}, nil
 }
 
-// newMonitor returns the reader of the server's activity over the catalog's connection string, or nil without one.
-func newMonitor(catalog *plan.Catalog, log *slog.Logger) proxy.Monitor {
+// newMonitor returns the reader of the server's activity over the catalog's connection string, watching the tables of s's policy,
+// or nil without a catalog.
+func newMonitor(catalog *plan.Catalog, s *proxy.Server, log *slog.Logger) proxy.Monitor {
 	if catalog == nil {
 		return nil
 	}
-	return &plan.Monitor{DSN: catalog.DSN, Log: log}
+	return &plan.Monitor{DSN: catalog.DSN, Log: log, Watch: func() []plan.Table {
+		if p := s.ActivePolicy(); p != nil {
+			return p.Watched()
+		}
+		return nil
+	}}
 }
 
 // loadTLS returns the client TLS config, or nil when neither file is given, which require forbids.
