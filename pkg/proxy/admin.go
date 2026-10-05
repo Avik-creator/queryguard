@@ -136,9 +136,14 @@ type result struct {
 	columns []string
 	rows    [][]string
 	tag     string
+	empty   bool // the query had no command
 }
 
 func (r result) send(b *pgproto3.Backend) {
+	if r.empty {
+		b.Send(&pgproto3.EmptyQueryResponse{})
+		return
+	}
 	if r.columns != nil {
 		fields := make([]pgproto3.FieldDescription, len(r.columns))
 		for i, c := range r.columns {
@@ -177,7 +182,7 @@ var adminHelp = [][]string{
 func (s *Server) adminCommand(sql, role string, log *slog.Logger) (result, error) {
 	words := adminWords(sql)
 	if len(words) == 0 {
-		return result{tag: "EMPTY"}, nil
+		return result{empty: true}, nil
 	}
 	verb := strings.ToLower(words[0])
 	arg := func(i int) string {
@@ -196,7 +201,9 @@ func (s *Server) adminCommand(sql, role string, log *slog.Logger) (result, error
 		if kind == "statement" {
 			kind = policy.KillFingerprint
 		}
-		if (kind != policy.KillTenant && kind != policy.KillFingerprint) || name == "" {
+		// Only KILL takes FOR and a duration; any other word after the name is a mistake, not something to ignore.
+		forDuration := verb == "kill" && len(words) == 5 && strings.EqualFold(words[3], "for")
+		if (kind != policy.KillTenant && kind != policy.KillFingerprint) || name == "" || (len(words) != 3 && !forDuration) {
 			return result{}, syntaxError("%s takes TENANT name or STATEMENT fingerprint", strings.ToUpper(verb))
 		}
 		if verb == "unkill" {
@@ -207,7 +214,7 @@ func (s *Server) adminCommand(sql, role string, log *slog.Logger) (result, error
 			return result{tag: "UNKILL"}, nil
 		}
 		d := defaultKill
-		if strings.EqualFold(arg(3), "for") {
+		if forDuration {
 			var err error
 			if d, err = time.ParseDuration(arg(4)); err != nil || d <= 0 {
 				return result{}, syntaxError("FOR takes a duration such as '10m'")
@@ -217,7 +224,7 @@ func (s *Server) adminCommand(sql, role string, log *slog.Logger) (result, error
 		log.Warn("kill switch on", "by", role, "kind", kind, "name", name, "for", d)
 		return result{tag: "KILL"}, nil
 	case "unwatch":
-		if arg(2) == "" {
+		if len(words) != 3 {
 			return result{}, syntaxError("UNWATCH takes a database and a fingerprint")
 		}
 		if !s.Runaways.Remove(arg(1), arg(2)) {
@@ -327,8 +334,20 @@ func adminWords(sql string) []string {
 			break
 		}
 		if sql[0] == '\'' {
-			word, rest, _ := strings.Cut(sql[1:], "'")
-			words, sql = append(words, word), rest
+			// A quote inside a quoted word is doubled, as in SQL.
+			var word strings.Builder
+			sql = sql[1:]
+			for {
+				part, rest, found := strings.Cut(sql, "'")
+				word.WriteString(part)
+				sql = rest
+				if !found || !strings.HasPrefix(sql, "'") {
+					break
+				}
+				word.WriteByte('\'')
+				sql = sql[1:]
+			}
+			words = append(words, word.String())
 			continue
 		}
 		end := strings.IndexAny(sql, " \t\r\n")

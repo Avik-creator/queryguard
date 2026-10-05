@@ -1952,6 +1952,41 @@ func TestAdminConsoleRefusesWhatItDoesNotKnow(t *testing.T) {
 	adminQuery(t, conn, "show kills")
 }
 
+func TestAdminConsoleRefusesExtraWords(t *testing.T) {
+	s, _, addr := adminServer(t, "on", "")
+	conn := adminLogin(t, addr, "alice")
+
+	// Without FOR the duration would be taken for nothing and acme killed for the default hour.
+	for _, sql := range []string{"kill tenant acme 10m", "kill tenant acme corp", "kill tenant acme for 10m now", "unkill tenant acme corp",
+		"unwatch shop abc def"} {
+		send(t, conn, &pgproto3.Query{String: sql})
+		if e, ok := receive(t, conn).(*pgproto3.ErrorResponse); !ok || e.Code != "42601" {
+			t.Errorf("%s: got %#v; want a syntax error", sql, e)
+		}
+		mustBeReady(t, conn)
+	}
+	if k := s.Kills.List(time.Now()); len(k) != 0 {
+		t.Errorf("kills %+v; want none from the refused commands", k)
+	}
+
+	// Quotes are doubled inside a quoted name, as in SQL.
+	adminQuery(t, conn, "kill tenant 'it''s' for '1m'")
+	if k := s.Kills.List(time.Now()); len(k) != 1 || k[0].Name != "it's" {
+		t.Errorf("kills %+v; want it's", k)
+	}
+}
+
+func TestAdminConsoleAnswersAnEmptyQueryAsPostgresDoes(t *testing.T) {
+	_, _, addr := adminServer(t, "on", "")
+	conn := adminLogin(t, addr, "alice")
+
+	send(t, conn, &pgproto3.Query{String: " ; "})
+	if msg := receive(t, conn); !isType[*pgproto3.EmptyQueryResponse](msg) {
+		t.Fatalf("got %#v; want EmptyQueryResponse", msg)
+	}
+	mustBeReady(t, conn)
+}
+
 func TestAdminConsoleIsForSuperusersAndAdminRoles(t *testing.T) {
 	_, _, addr := adminServer(t, "off", "")
 	conn := adminLogin(t, addr, "alice")
