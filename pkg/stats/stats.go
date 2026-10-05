@@ -65,7 +65,7 @@ type Row struct {
 	Database, Role, Tenant, Fingerprint string
 	Query                               string           // the first text seen, with its constants as $1, $2…
 	Calls                               int64            // statements Postgres ran, failed or not
-	Timed                               int64            // the calls that had a time of their own
+	Timed                               int64            // the calls that finished without an error and had a time of their own
 	Rows                                int64            // returned or changed
 	Total                               time.Duration    // over the timed calls
 	P50, P95, P99                       time.Duration    // of the timed calls
@@ -220,7 +220,8 @@ func (t *Table) addToRow(k key, query string, st Statement) string {
 	t.count(k, r, st)
 	r.calls++
 	r.n += st.Rows
-	if st.Took > 0 {
+	// A run cut short by an error, such as a timeout, says nothing of how long the statement takes.
+	if st.Took > 0 && st.Code == "" {
 		r.timed++
 		r.total += st.Took
 		r.took.add(st.Took)

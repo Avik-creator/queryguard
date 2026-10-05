@@ -236,6 +236,22 @@ func TestP99OfARowFollowsItsTimedCalls(t *testing.T) {
 	}
 }
 
+func TestP99LeavesOutRunsThatFailed(t *testing.T) {
+	var tb Table
+	const sql = "select * from orders where id = 1"
+	for range 100 {
+		tb.add(Statement{Database: "shop", Role: "app", SQL: sql, Took: 10 * time.Millisecond})
+	}
+	// Runs cancelled at a learned timeout would otherwise raise the p99 the next timeout is learned from.
+	for range 5 {
+		tb.add(Statement{Database: "shop", Role: "app", SQL: sql, Took: 10 * time.Second, Code: "57014"})
+	}
+
+	if d, n := tb.P99("shop", "app", "app", sqlparse.Fingerprint(sql)); n != 100 || d > 11*time.Millisecond {
+		t.Errorf("P99 = %v over %d calls; want about 10ms over the 100 that finished", d, n)
+	}
+}
+
 // minuteOf adds n statements to tb as one minute's traffic: fast ones, then slow ones of slowSQL, and errors of errSQL.
 func minuteOf(tb *Table, fast, slow, errs int, took time.Duration) {
 	for range fast {
