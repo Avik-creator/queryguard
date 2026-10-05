@@ -103,6 +103,8 @@ func TestAnalyze(t *testing.T) {
 			t.Errorf("Analyze(%q): %v", tc.sql, err)
 			continue
 		}
+		// The functions called and whether it only reads have tests of their own.
+		got.Functions, got.ReadOnly = nil, false
 		if !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("Analyze(%q) = %+v; want %+v", tc.sql, got, tc.want)
 		}
@@ -258,5 +260,48 @@ func TestFingerprintIgnoresConstants(t *testing.T) {
 	a, b := Fingerprint("select * from orders where id = 1"), Fingerprint("select * from orders where id = 2")
 	if a == "" || a != b {
 		t.Errorf("fingerprints %q and %q; want the same non-empty value", a, b)
+	}
+}
+
+func TestAnalyzeFindsEveryFunctionCalled(t *testing.T) {
+	for sql, want := range map[string][]string{
+		"select pg_terminate_backend(pid) from pg_stat_activity":                 {"pg_terminate_backend"},
+		"select pg_catalog.pg_terminate_backend(1)":                              {"pg_catalog.pg_terminate_backend"},
+		"select * from dblink('host=x', 'select 1') as t(a int)":                 {"dblink"},
+		"select count(*), lo_export(oid, '/tmp/x') from pg_largeobject_metadata": {"count", "lo_export"},
+		`select "Upper"(1), upper('a')`:                                          {"Upper", "upper"},
+		"select 1":                                                               nil,
+	} {
+		q, err := Analyze(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(q.Functions, want) {
+			t.Errorf("Analyze(%q).Functions = %q; want %q", sql, q.Functions, want)
+		}
+	}
+}
+
+func TestAnalyzeKnowsWhichStatementsOnlyRead(t *testing.T) {
+	for sql, want := range map[string]bool{
+		"select * from orders": true,
+		"select 1; select 2":   true,
+		"with recent as (select * from orders) select count(*) from recent": true,
+		"values (1), (2)":                                                   true,
+		"select * from orders for update":                                   false,
+		"select * into orders_copy from orders":                             false,
+		"with gone as (delete from orders returning id) select * from gone": false,
+		"update orders set total = 0 where id = 1":                          false,
+		"select 1; delete from orders where id = 1":                         false,
+		"explain select * from orders":                                      false,
+		"fetch 10 from c":                                                   false,
+	} {
+		q, err := Analyze(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if q.ReadOnly != want {
+			t.Errorf("Analyze(%q).ReadOnly = %v; want %v", sql, q.ReadOnly, want)
+		}
 	}
 }

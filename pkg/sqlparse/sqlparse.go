@@ -26,6 +26,8 @@ type Query struct {
 	TransactionControl  bool     // only BEGIN, COMMIT, ROLLBACK, SAVEPOINT and the like, which do no work of their own
 	ChangesTimeout      bool     // may change statement_timeout: SET or RESET of it, or set_config of it or of a name known only when it runs
 	ChangesRole         bool     // may change the role statements run as: SET ROLE, SET SESSION AUTHORIZATION, or set_config of them or of an unknown name
+	Functions           []string // functions called by name, as schema.name when qualified, sorted, without duplicates
+	ReadOnly            bool     // only SELECTs or VALUES, without INTO, FOR UPDATE and the like, or a CTE that changes rows
 }
 
 // notDDL lists the statement types Postgres's GetCommandLogLevel does not log as DDL; every other *Stmt is DDL.
@@ -64,7 +66,8 @@ func Analyze(sql string) (Query, error) {
 		_, ok := s.GetStmt().GetNode().(*pg_query.Node_TransactionStmt)
 		return !ok
 	})
-	schemas := map[string]bool{}
+	schemas, functions := map[string]bool{}, map[string]bool{}
+	writes := false
 	add := func(schema string) {
 		if schema != "" {
 			schemas[schema] = true
@@ -75,16 +78,21 @@ func Analyze(sql string) (Query, error) {
 			q.DDL = true
 		}
 		switch n := m.Interface().(type) {
+		case *pg_query.InsertStmt, *pg_query.MergeStmt, *pg_query.LockingClause:
+			writes = true
 		case *pg_query.SelectStmt:
 			// SELECT INTO creates a table.
 			q.DDL = q.DDL || n.IntoClause != nil
+			writes = writes || n.IntoClause != nil
 		case *pg_query.UpdateStmt:
+			writes = true
 			q.ChangesEveryRow = q.ChangesEveryRow || n.WhereClause == nil
 			// Updating the pg_settings view calls set_config for each row, with names and values known only when it runs.
 			if r := n.GetRelation(); r.GetRelname() == "pg_settings" && (r.GetSchemaname() == "" || r.GetSchemaname() == "pg_catalog") {
 				q.UnknownSearchPath, q.ChangesTimeout, q.ChangesRole = true, true, true
 			}
 		case *pg_query.DeleteStmt:
+			writes = true
 			q.ChangesEveryRow = q.ChangesEveryRow || n.WhereClause == nil
 		case *pg_query.TruncateStmt:
 			q.ChangesEveryRow = true
@@ -115,6 +123,7 @@ func Analyze(sql string) (Query, error) {
 			add(n.Schemaname)
 		case *pg_query.FuncCall:
 			add(schemaOf(n.Funcname))
+			functions[funcName(n.Funcname)] = true
 			if setting, ok := settingSet(n); ok {
 				q.ChangesTimeout = q.ChangesTimeout || setting == nil || strings.EqualFold(*setting, statementTimeout)
 				q.ChangesRole = q.ChangesRole || setting == nil || roleSetting(*setting)
@@ -156,7 +165,23 @@ func Analyze(sql string) (Query, error) {
 		}
 	})
 	q.Schemas = slices.Sorted(maps.Keys(schemas))
+	q.ReadOnly = !writes && len(tree.Stmts) > 0 && !slices.ContainsFunc(tree.Stmts, func(s *pg_query.RawStmt) bool {
+		_, ok := s.GetStmt().GetNode().(*pg_query.Node_SelectStmt)
+		return !ok
+	})
+	if len(functions) > 0 {
+		q.Functions = slices.Sorted(maps.Keys(functions))
+	}
 	return q, nil
+}
+
+// funcName joins a function's qualified name of String nodes with dots.
+func funcName(names []*pg_query.Node) string {
+	parts := make([]string, len(names))
+	for i, n := range names {
+		parts[i] = n.GetString_().GetSval()
+	}
+	return strings.Join(parts, ".")
 }
 
 // schemaOf returns the schema in a qualified name of String nodes ([catalog.]schema.name), or "" for a bare name.
