@@ -817,6 +817,89 @@ func TestGateTruesUpToMeasuredTime(t *testing.T) {
 	}
 }
 
+func TestOverloadQueue(t *testing.T) {
+	for config, want := range map[string][2]time.Duration{
+		`{}`: {DefaultStandingAfter, DefaultStandingTimeout},
+		`{"scheduler": {"overload_queue": {"standing_after": "2s", "timeout": "1s"}}}`: {2 * time.Second, time.Second},
+		`{"scheduler": {"overload_queue": {"mode": "off"}}}`:                           {0, 0},
+	} {
+		cfg := mustParse(t, config).SchedConfig()
+		if got := [2]time.Duration{cfg.Fast.StandingAfter, cfg.Fast.StandingTimeout}; got != want {
+			t.Errorf("%s: fast lane stands after %v and drops after %v; want %v", config, got[0], got[1], want)
+		}
+		// The slow lane is for statements that may wait long.
+		if cfg.Slow.StandingAfter != 0 {
+			t.Errorf("%s: the slow lane can stand", config)
+		}
+	}
+}
+
+func TestStatementPastItsDeadlineIsAnsweredAtOnce(t *testing.T) {
+	for name, tc := range map[string]struct {
+		startup map[string]string
+		sql     string
+		usual   time.Duration // how long the statement usually runs, 0 for unknown
+		lane    bool          // the only slot is taken
+		want    time.Duration // when the gate gives up; 0 is at once
+	}{
+		"deadline tag":                           {nil, lookupSQL + " /*deadline='200ms'*/", 0, true, 200 * time.Millisecond},
+		"statement_timeout at login":             {map[string]string{"statement_timeout": "300"}, lookupSQL, 0, true, 300 * time.Millisecond},
+		"the earlier of the two":                 {map[string]string{"statement_timeout": "1min"}, lookupSQL + " /*deadline='0.5s'*/", 0, true, 500 * time.Millisecond},
+		"waits only as long as it can still end": {nil, lookupSQL + " /*deadline='150ms'*/", 100 * time.Millisecond, true, 50 * time.Millisecond},
+		"would not end in time even unqueued":    {nil, lookupSQL + " /*deadline='500ms'*/", time.Second, false, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c := gateChecker(t, `{"scheduler": {"max_active": 1, "queue_timeout": "1m"}}`, "alice", discard)
+				if tc.usual > 0 {
+					train(t, c, lookupSQL, explained(orderLookup, nil), 5, tc.usual)
+				}
+				if tc.lane {
+					pass(t, c, "select 0", costing(1), false)
+				}
+				if rej := c.CheckStartup(maps.All(tc.startup)); rej != nil {
+					t.Fatal(rej)
+				}
+
+				start := time.Now()
+				a := pass(t, c, tc.sql, explained(orderLookup, nil), false)
+
+				// A usual time learned from runs can be off by a nanosecond.
+				if took := time.Since(start); codeOf(a.Reject) != "57014" || !strings.Contains(a.Reject.Message, "deadline") || (took-tc.want).Abs() > time.Microsecond {
+					t.Errorf("got %v after %v; want 57014 about the deadline after %v", a.Reject, time.Since(start), tc.want)
+				}
+			})
+		})
+	}
+}
+
+func TestStatementWithinItsDeadlineRuns(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := gateChecker(t, `{"scheduler": {"max_active": 1, "queue_timeout": "1m"}}`, "alice", discard)
+		hold := pass(t, c, "select 0", costing(1), false)
+		time.AfterFunc(100*time.Millisecond, hold.Release)
+
+		if a := pass(t, c, lookupSQL+" /*deadline='1s'*/", explained(orderLookup, nil), false); a.Reject != nil {
+			t.Errorf("statement whose slot came free in time got %v", a.Reject)
+		}
+	})
+}
+
+func TestBudgetWaitPastTheDeadlineIsAnsweredAtOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := gateChecker(t, `{"tenants": {"alice": {"budget": {"rate": 100, "burst": 100}}}}`, "alice", discard)
+		c.Env.Scheduler.Charge("alice", 300)
+
+		start := time.Now()
+		a := pass(t, c, lookupSQL+" /*deadline='1s'*/", costing(1), false)
+
+		// The budget refills in 2s, after the deadline, so there is no point waiting.
+		if codeOf(a.Reject) != "57014" || time.Since(start) != 0 {
+			t.Errorf("got %v after %v; want 57014 at once", a.Reject, time.Since(start))
+		}
+	})
+}
+
 func TestTenantMode(t *testing.T) {
 	p := mustParse(t, `{"tenants": {"bob": {"mode": "warn"}}}`)
 	if p.TenantMode("bob") != Warn || p.TenantMode("alice") != Enforce {
@@ -986,7 +1069,7 @@ func TestSchedConfig(t *testing.T) {
 	got := p.SchedConfig()
 
 	want := sched.Config{
-		Fast:        sched.Lane{MaxActive: 8, QueueTimeout: 2 * time.Second},
+		Fast:        sched.Lane{MaxActive: 8, QueueTimeout: 2 * time.Second, StandingAfter: DefaultStandingAfter, StandingTimeout: DefaultStandingTimeout},
 		Slow:        sched.Lane{MaxActive: 1, QueueTimeout: 30 * time.Second},
 		Budgets:     map[string]sched.Budget{"acme": {Rate: 100, Burst: 1000, Share: 2, MinCharge: 5, WhenOver: sched.SlowLane}},
 		Default:     sched.Budget{Rate: 10},
@@ -1055,6 +1138,8 @@ func TestParseRejectsBadConfig(t *testing.T) {
 		`{"mvcc_horizon": {"max_age": "1m", "watch": ["jobs"]}}`:                     "schema.table",
 		`{"mvcc_horizon": {"max_age": "1m", "max_dead_tuples": -1}}`:                 "max_dead_tuples",
 		`{"mvcc_horizon": {"watch": ["public.jobs"]}}`:                               "max_age",
+		`{"scheduler": {"overload_queue": {"mode": "sometimes"}}}`:                   "sometimes",
+		`{"scheduler": {"overload_queue": {"timeout": "-1s"}}}`:                      "overload_queue",
 	} {
 		if _, err := Parse([]byte(config)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("Parse(%s) = %v; want an error mentioning %q", config, err, want)

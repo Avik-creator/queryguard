@@ -100,6 +100,22 @@ type Scheduler struct {
 	Adaptive     *Adaptive `json:"adaptive"`     // moves the limit between a floor and max_active by how the server copes; nil keeps max_active
 	BlockerPays  string    `json:"blocker_pays"` // "on" (the default) charges a tenant for the time others wait on its locks; "off" doesn't
 	DemoteAfter  Duration  `json:"demote_after"` // a fast-lane statement running longer counts in the slow lane; 0 means never
+	// OverloadQueue sets how the fast lane's queue behaves once it stands, as under overload.
+	OverloadQueue OverloadQueue `json:"overload_queue"`
+}
+
+// Defaults for the fast lane's overload queue.
+const (
+	DefaultStandingAfter   = time.Second
+	DefaultStandingTimeout = 500 * time.Millisecond
+)
+
+// OverloadQueue makes a queue that has not been empty for StandingAfter serve its newest statements first and turn away those
+// that waited longer than Timeout, as in Facebook's adaptive LIFO with CoDel.
+type OverloadQueue struct {
+	Mode          string   `json:"mode"`           // "on" (the default) or "off", which keeps every queue first in, first out
+	StandingAfter Duration `json:"standing_after"` // 0 means 1s
+	Timeout       Duration `json:"timeout"`        // 0 means 500ms
 }
 
 // ReplicationLag holds best-effort statements back while a standby lags.
@@ -364,6 +380,12 @@ func (p *Policy) compile() error {
 	if c.DDLGuard.LockTimeout < 0 {
 		errs = append(errs, errors.New("ddl_guard lock_timeout must not be negative"))
 	}
+	if q := s.OverloadQueue; q.StandingAfter < 0 || q.Timeout < 0 {
+		errs = append(errs, errors.New("scheduler overload_queue: standing_after and timeout must not be negative"))
+	}
+	if m := s.OverloadQueue.Mode; m != "" && m != "on" && m != "off" {
+		errs = append(errs, fmt.Errorf("scheduler overload_queue mode %q: want on or off", m))
+	}
 	if s.DemoteAfter < 0 {
 		errs = append(errs, errors.New("scheduler demote_after must not be negative"))
 	}
@@ -498,6 +520,10 @@ func (p *Policy) SchedConfig() sched.Config {
 		}
 	}
 	cfg.DemoteAfter = time.Duration(s.DemoteAfter)
+	if q := s.OverloadQueue; q.Mode != "off" {
+		cfg.Fast.StandingAfter = cmp.Or(time.Duration(q.StandingAfter), DefaultStandingAfter)
+		cfg.Fast.StandingTimeout = cmp.Or(time.Duration(q.Timeout), DefaultStandingTimeout)
+	}
 	if a := s.Adaptive; a != nil {
 		cfg.Controller = sched.AIMD{Floor: a.Floor, Backoff: a.Backoff, MaxSlowdown: a.MaxSlowdown, LockWaitShare: a.LockWaitShare}
 	}
@@ -573,10 +599,11 @@ type Backend interface {
 type Checker struct {
 	Env Env
 
-	policy    func() *Policy
-	role      string
-	log       *slog.Logger
-	warnedTag bool // the role sent a tenant tag it isn't trusted to send, which was logged once
+	policy        func() *Policy
+	role          string
+	log           *slog.Logger
+	warnedTag     bool          // the role sent a tenant tag it isn't trusted to send, which was logged once
+	clientTimeout time.Duration // statement_timeout as the client set it at login; 0 when it set none
 }
 
 // subject is who a statement runs for and where it comes from, as rules match it.
@@ -584,7 +611,8 @@ type subject struct {
 	role, tenant, app string
 	client            netip.Addr
 	tags              map[string]string
-	trusted           bool // the role is trusted to tag its statements
+	trusted           bool      // the role is trusted to tag its statements
+	deadline          time.Time // when the client gives up on the statement; zero when unknown
 }
 
 // priority returns the priority of who's statement: its tenant's, or its tag's when the role is trusted or the tag lowers it.
@@ -609,7 +637,8 @@ func (c *Checker) Check(sql string, set session.Settings) (*pgproto3.ErrorRespon
 		return nil, nil
 	}
 	tags := sqlparse.Tags(sql)
-	who := subject{role: c.role, tenant: c.tenant(p, tags), app: set.ApplicationName, client: c.Env.Client, tags: tags, trusted: p.trusted(c.role)}
+	who := subject{role: c.role, tenant: c.tenant(p, tags), app: set.ApplicationName, client: c.Env.Client, tags: tags, trusted: p.trusted(c.role),
+		deadline: c.deadline(tags)}
 	warn := p.cfg.Tenants[who.tenant].Mode == Warn
 
 	reason := misread(sql, set)
@@ -645,6 +674,41 @@ func (c *Checker) Check(sql string, set session.Settings) (*pgproto3.ErrorRespon
 		return nil, nil
 	}
 	return nil, c.gate(p, sql, q, who)
+}
+
+// deadlineTag is the sqlcommenter key giving how long, from when QueryGuard reads a statement, its client waits for it.
+const deadlineTag = "deadline"
+
+// deadline returns when the client gives up on a statement read now with tags: the sooner of its login's statement_timeout and
+// its deadline tag, counted from now as the time the client waits, queue included; zero when it gave neither.
+func (c *Checker) deadline(tags map[string]string) time.Time {
+	wait := c.clientTimeout
+	if d, ok := pgDuration(tags[deadlineTag]); ok && d > 0 && (wait == 0 || d < wait) {
+		wait = d
+	}
+	if wait == 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(wait)
+}
+
+// pgUnits are the units Postgres takes for time settings; a number alone is in milliseconds.
+var pgUnits = map[string]time.Duration{"": time.Millisecond, "us": time.Microsecond, "ms": time.Millisecond, "s": time.Second,
+	"min": time.Minute, "h": time.Hour, "d": 24 * time.Hour}
+
+// pgDuration reads a time setting such as statement_timeout as Postgres does: "500", "1.5s" or "2 min".
+func pgDuration(v string) (time.Duration, bool) {
+	v = strings.TrimSpace(v)
+	i := strings.IndexFunc(v, func(r rune) bool { return (r < '0' || r > '9') && r != '.' })
+	if i < 0 {
+		i = len(v)
+	}
+	n, err := strconv.ParseFloat(v[:i], 64)
+	unit, ok := pgUnits[strings.TrimSpace(v[i:])]
+	if err != nil || !ok || n < 0 {
+		return 0, false
+	}
+	return time.Duration(n * float64(unit)), true
 }
 
 // tenant returns who a statement runs for: the tenant its tag names when the role is trusted to name one, else the role.
@@ -689,17 +753,22 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 		warn := t.Mode == Warn
 		a := session.Admission{Timeout: time.Duration(t.StatementTimeout), IdleInTransaction: time.Duration(t.IdleInTransactionTimeout)}
 		s := c.Env.Scheduler
+		if !who.deadline.IsZero() && !warn {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithDeadline(ctx, who.deadline)
+			defer cancel()
+		}
 
 		// The budget is looked at before EXPLAIN, the dearest step, and spent once the cost is known.
 		if s != nil && !warn {
 			if _, err := s.Reserve(ctx, who.tenant); err != nil {
-				c.log.Warn("rejected statement", "rule", "budget", "tenant", who.tenant, "err", err)
-				return session.Admission{Reject: overBudget(t.Budget)}
+				return c.refuse(err, who, "budget", overBudget(t.Budget))
 			}
 		}
 
 		var cost float64
 		var flipped bool
+		var usual time.Duration
 		// A session that can't explain the statement here passes no Run, and it is judged without a plan.
 		if q.Explainable && e.Run != nil && (p.costRules || (s != nil && p.needsCost)) {
 			fingerprint := sqlparse.Fingerprint(sql)
@@ -715,8 +784,18 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 			// A generic plan standing in for one with values too large to send twice says nothing of how the statement runs,
 			// and nor does opening a cursor, whose query runs in later FETCHes.
 			if !e.Generic && !q.Cursor {
-				cost, flipped, a.Ran = c.learn(p, sql, fingerprint, who, warn, pl)
+				cost, flipped, usual, a.Ran = c.learn(p, sql, fingerprint, who, warn, pl)
 			}
+		}
+		if !who.deadline.IsZero() && !warn && usual > 0 {
+			// It must start by when it can still end in its usual time.
+			start := who.deadline.Add(-usual)
+			if !time.Now().Before(start) {
+				return c.refuse(context.DeadlineExceeded, who, "deadline", pastDeadline())
+			}
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithDeadline(ctx, start)
+			defer cancel()
 		}
 		if q.DDL || q.Analyzes {
 			// Plans may change once the statement is committed, so they are explained again; forgetting them sooner would let
@@ -737,8 +816,7 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 		} else {
 			l, err := s.Spend(ctx, who.tenant, cost)
 			if err != nil {
-				c.log.Warn("rejected statement", "rule", "budget", "tenant", who.tenant, "cost", cost, "err", err)
-				return session.Admission{Reject: overBudget(t.Budget)}
+				return c.refuse(err, who, "budget", overBudget(t.Budget))
 			}
 			lane = l
 		}
@@ -760,14 +838,23 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 				return session.Admission{Reject: heldBack()}
 			case err != nil:
 				s.Refund(who.tenant, cost)
-				c.log.Warn("rejected statement", "rule", "busy", "tenant", who.tenant, "lane", lane, "err", err)
-				return session.Admission{Reject: busy(p, lane)}
+				return c.refuse(err, who, "busy", busy(p, lane))
 			default:
 				a.Release = release
 			}
 		}
 		return a
 	}
+}
+
+// refuse logs and returns the rejection for a statement whose wait ended with err: rej, unless it was its deadline that ended it.
+func (c *Checker) refuse(err error, who subject, rule string, rej *pgproto3.ErrorResponse) session.Admission {
+	// Only a statement's own deadline puts one on the context a gate waits with.
+	if errors.Is(err, context.DeadlineExceeded) {
+		rule, rej = "deadline", pastDeadline()
+	}
+	c.log.Warn("rejected statement", "rule", rule, "tenant", who.tenant, "err", err)
+	return session.Admission{Reject: rej}
 }
 
 // plan gets sql's plan, cached or explained by the session, and judges it by the cost rules; ok is false when Postgres refused sql.
@@ -826,7 +913,7 @@ func (p *Policy) enforcesCost(who subject, warn bool) bool {
 }
 
 // learn looks pl up in its statement's history; it returns the cost to charge, whether to run it in the slow lane, and what to record once it ran.
-func (c *Checker) learn(p *Policy, sql, fingerprint string, who subject, warn bool, pl plan.Plan) (cost float64, slow bool, ran func(time.Duration, bool)) {
+func (c *Checker) learn(p *Policy, sql, fingerprint string, who subject, warn bool, pl plan.Plan) (cost float64, slow bool, usual time.Duration, ran func(time.Duration, bool)) {
 	if c.Env.History == nil {
 		c.Env.History = &plan.History{}
 	}
@@ -843,7 +930,7 @@ func (c *Checker) learn(p *Policy, sql, fingerprint string, who subject, warn bo
 				"query", sqlparse.Normalize(sql), "why", v.Flip, "cost", pl.Cost, "slow_lane", slow}, c.stale(pl)...)...)
 		}
 	}
-	return cost, slow, func(took time.Duration, finished bool) {
+	return cost, slow, v.Usual, func(took time.Duration, finished bool) {
 		if s := c.Env.Scheduler; s != nil && took > 0 {
 			if finished && v.Usual > 0 {
 				s.Finished(float64(took) / float64(v.Usual))
@@ -900,6 +987,9 @@ func (c *Checker) CheckStartup(settings iter.Seq2[string, string]) *pgproto3.Err
 	warn := p.cfg.Tenants[c.role].Mode == Warn
 	all := maps.Collect(settings)
 	who.app = all["application_name"]
+	if d, ok := pgDuration(all["statement_timeout"]); ok {
+		c.clientTimeout = d
+	}
 	for name, value := range all {
 		if name != "search_path" {
 			continue
@@ -1002,6 +1092,13 @@ func busy(p *Policy, lane sched.LaneID) *pgproto3.ErrorResponse {
 func shed() *pgproto3.ErrorResponse {
 	return rejection("53000", "queryguard: server overloaded; best-effort statements are shed",
 		"The server is overloaded, so statements of best_effort priority run only when a slot is free.", "Retry later.")
+}
+
+// pastDeadline is the error for a statement that can no longer end before its client's statement_timeout or deadline tag.
+func pastDeadline() *pgproto3.ErrorResponse {
+	return rejection("57014", "queryguard: canceling statement that can't end before its deadline",
+		"Waiting for its turn, then running for as long as it usually does, would take it past the client's statement_timeout or deadline tag.",
+		"Retry later, or allow it more time.")
 }
 
 // heldBack is the error for a best-effort statement held back past its queue timeout, as while a standby lags.

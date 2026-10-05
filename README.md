@@ -347,6 +347,36 @@ that finds no slot within its lane's `queue_timeout` fails with `53000`. A
 session holds one slot until PostgreSQL has answered everything it sent, so
 a pipeline needs just one.
 
+### Queues under overload
+
+Normally the fast lane's queue is first in, first out among equals. Once it
+has not been empty for `standing_after` (1s), the server is overloaded rather
+than busy for a moment, and the queue changes, as in Facebook's adaptive LIFO
+with CoDel: the newest statement goes first, since its client is the likeliest
+to still be waiting, and statements that have waited longer than `timeout`
+(500ms) are turned away with `53000` when a slot comes free, as is a new
+statement that can't get one within `timeout`. Priority and fair share still
+come first. The slow lane is meant for long waits and always stays first in,
+first out.
+
+```json
+"scheduler": {"overload_queue": {"standing_after": "1s", "timeout": "500ms"}}
+```
+
+`"mode": "off"` keeps the fast lane first in, first out under any load.
+
+### Deadlines
+
+A statement whose client will have given up before it could end is answered
+at once with `57014` instead of being run. Its deadline is the sooner of the
+`statement_timeout` the client set at login (in its connection string or
+`options`) and a `/*deadline='250ms'*/` tag, counted from when QueryGuard
+reads the statement, since a client's time limit covers the time it queues
+too. Once its plan has run five times, it must also start early enough to
+end in its usual time, so a statement that usually takes a second and has
+half a second left fails before it is run. Waits for a slot and for a budget
+both stop at the deadline. A `SET statement_timeout` after login isn't seen.
+
 ### Adaptive limit
 
 With `adaptive`, `max_active` becomes a ceiling, and QueryGuard moves the

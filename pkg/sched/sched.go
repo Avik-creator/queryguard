@@ -45,6 +45,9 @@ type Budget struct {
 type Lane struct {
 	MaxActive    int           // statements running at once; 0 means no limit
 	QueueTimeout time.Duration // the longest a statement waits for its slot or budget; 0 means the lane's default
+	// A queue that has not been empty for StandingAfter stands: it serves the newest waiter first and drops those that waited
+	// longer than StandingTimeout, as CoDel does; 0 for either turns this off.
+	StandingAfter, StandingTimeout time.Duration
 }
 
 // LaneID picks a lane.
@@ -150,14 +153,17 @@ type tenant struct {
 }
 
 type lane struct {
-	active  int
-	waiters []*waiter // in arrival order
+	active    int
+	waiters   []*waiter // in arrival order
+	lastEmpty time.Time // when the queue was last empty, to tell a standing queue
 }
 
 type waiter struct {
 	tenant  string
 	prio    Priority
+	since   time.Time     // when it began to wait
 	shed    bool          // set before granted is closed when the waiter is shed instead
+	dropped bool          // set before granted is closed when a standing queue drops the waiter
 	slot    *slot         // set before granted is closed when the waiter is given a slot
 	granted chan struct{} // closed when the waiter is given a slot or shed
 }
@@ -212,6 +218,9 @@ func (s *Scheduler) wait(ctx context.Context, tenant string, cost float64, charg
 			default:
 				wait := time.Duration(math.Ceil(-t.tokens / b.Rate * float64(time.Second)))
 				s.mu.Unlock()
+				if dl, ok := ctx.Deadline(); ok && time.Now().Add(wait).After(dl) {
+					return 0, context.DeadlineExceeded
+				}
 				// The wait is known in advance, so there is no point starting one that can't end in time.
 				if time.Now().Add(wait).After(deadline) {
 					return 0, ErrOverBudget
@@ -274,9 +283,12 @@ func (s *Scheduler) Refund(tenant string, cost float64) {
 
 // Acquire waits for a slot in lane, handed to the highest priority and then the least-served tenant first, and returns the func that frees it.
 func (s *Scheduler) Acquire(ctx context.Context, tenant string, id LaneID, prio Priority) (release func(), err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	l, limit := &s.lanes[id], s.max(id)
-	w := &waiter{tenant: tenant, prio: prio, granted: make(chan struct{})}
+	w := &waiter{tenant: tenant, prio: prio, since: time.Now(), granted: make(chan struct{})}
 	full := limit > 0 && l.active >= limit
 	if !full && s.eligible(w) && !slices.ContainsFunc(l.waiters, s.eligible) {
 		sl := s.take(id, tenant)
@@ -290,15 +302,26 @@ func (s *Scheduler) Acquire(ctx context.Context, tenant string, id LaneID, prio 
 			return nil, ErrShed
 		}
 	}
+	timeout := s.laneTimeout(id)
+	if s.standing(id, w.since) {
+		// A statement that finds the queue standing gets only the short wait it would be dropped after.
+		timeout = min(timeout, s.lane(id).StandingTimeout)
+	}
+	if len(l.waiters) == 0 {
+		l.lastEmpty = w.since
+	}
 	l.waiters = append(l.waiters, w)
 	s.mu.Unlock()
 
-	timer := time.NewTimer(s.queueTimeout(id))
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case <-w.granted:
-		if w.shed {
+		switch {
+		case w.shed:
 			return nil, ErrShed
+		case w.dropped:
+			return nil, ErrBusy
 		}
 		return s.releaser(w.slot), nil
 	case <-ctx.Done():
@@ -310,13 +333,17 @@ func (s *Scheduler) Acquire(ctx context.Context, tenant string, id LaneID, prio 
 	defer s.mu.Unlock()
 	if i := slices.Index(l.waiters, w); i >= 0 {
 		l.waiters = slices.Delete(l.waiters, i, i+1)
+		s.dequeued(id)
 		if errors.Is(err, ErrBusy) && prio == BestEffort && s.held {
 			err = ErrHeld
 		}
 		return nil, err
 	}
-	if w.shed {
+	switch {
+	case w.shed:
 		return nil, ErrShed
+	case w.dropped:
+		return nil, ErrBusy
 	}
 	// The slot came just as the wait ended, so it goes to the next waiter.
 	s.release(w.slot)
@@ -382,25 +409,65 @@ func (s *Scheduler) eligible(w *waiter) bool {
 func (s *Scheduler) grant(id LaneID) {
 	l, limit := &s.lanes[id], s.max(id)
 	for limit == 0 || l.active < limit {
-		// Ties go to the earliest waiter, since MinFunc returns the first minimum.
+		now := time.Now()
+		standing := s.standing(id, now)
+		if standing {
+			// The clients of statements that waited this long are likely gone, and serving them first keeps everyone waiting.
+			l.waiters = slices.DeleteFunc(l.waiters, func(w *waiter) bool {
+				if now.Sub(w.since) <= s.lane(id).StandingTimeout {
+					return false
+				}
+				w.dropped = true
+				close(w.granted)
+				return true
+			})
+		}
 		var next *waiter
 		for _, w := range l.waiters {
-			if s.eligible(w) && (next == nil || s.before(w, next)) {
+			if s.eligible(w) && (next == nil || s.before(w, next, standing)) {
 				next = w
 			}
 		}
 		if next == nil {
+			s.dequeued(id)
 			return
 		}
 		l.waiters = slices.DeleteFunc(l.waiters, func(w *waiter) bool { return w == next })
+		s.dequeued(id)
 		next.slot = s.take(id, next.tenant)
 		close(next.granted)
 	}
 }
 
-// before reports whether a goes ahead of b: by priority, then by use for share; the caller holds mu.
-func (s *Scheduler) before(a, b *waiter) bool {
-	return cmp.Or(cmp.Compare(b.prio, a.prio), cmp.Compare(s.served(a.tenant), s.served(b.tenant))) < 0
+// before reports whether a goes ahead of b: by priority, then by use for share, then by arrival, the newest first in a standing
+// queue and the oldest first otherwise; the caller holds mu.
+func (s *Scheduler) before(a, b *waiter, standing bool) bool {
+	arrival := a.since.Compare(b.since)
+	if standing {
+		arrival = -arrival
+	}
+	return cmp.Or(cmp.Compare(b.prio, a.prio), cmp.Compare(s.served(a.tenant), s.served(b.tenant)), arrival) < 0
+}
+
+// standing reports whether lane id's queue has not been empty for StandingAfter at now; the caller holds mu.
+func (s *Scheduler) standing(id LaneID, now time.Time) bool {
+	l, cfg := &s.lanes[id], s.lane(id)
+	return cfg.StandingAfter > 0 && cfg.StandingTimeout > 0 && len(l.waiters) > 0 && now.Sub(l.lastEmpty) >= cfg.StandingAfter
+}
+
+// dequeued notes when lane id's queue empties, after waiters left it; the caller holds mu.
+func (s *Scheduler) dequeued(id LaneID) {
+	if l := &s.lanes[id]; len(l.waiters) == 0 {
+		l.lastEmpty = time.Now()
+	}
+}
+
+// lane returns lane id's settings; the caller holds mu.
+func (s *Scheduler) lane(id LaneID) Lane {
+	if id == Slow {
+		return s.cfg.Slow
+	}
+	return s.cfg.Fast
 }
 
 // take gives tenant a slot in lane id; the caller holds mu.
@@ -480,6 +547,11 @@ func (s *Scheduler) forgetIdle() {
 func (s *Scheduler) queueTimeout(id LaneID) time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.laneTimeout(id)
+}
+
+// laneTimeout returns lane id's queue timeout; the caller holds mu.
+func (s *Scheduler) laneTimeout(id LaneID) time.Duration {
 	if id == Slow {
 		return cmp.Or(s.cfg.Slow.QueueTimeout, DefaultSlowQueueTimeout)
 	}
@@ -535,6 +607,7 @@ func (s *Scheduler) shed() {
 		close(w.granted)
 		return true
 	})
+	s.dequeued(Fast)
 }
 
 // Finished reports that a statement ran slowdown times as long as it usually does.

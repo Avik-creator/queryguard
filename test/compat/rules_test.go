@@ -439,6 +439,36 @@ func TestOldSnapshotLimitsItsTenantWhileTheQueueBloats(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return strings.Contains(logs.String(), "MVCC horizon moved on") })
 }
 
+func TestQueuedStatementPastItsDeadlineNeverRuns(t *testing.T) {
+	direct := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
+	name := fmt.Sprintf("qg_deadline_%d", time.Now().UnixNano())
+	mustExec(t, direct, "create table "+name+" (id int)")
+	t.Cleanup(func() { direct.Exec(context.Background(), "drop table "+name) })
+	qg := startPolicyProxy(t, `{"scheduler": {"max_active": 1, "queue_timeout": "10s"}}`)
+	busy, late := qg.connect(t, "sslmode=disable"), qg.connect(t, "sslmode=disable statement_timeout=300")
+	slept := make(chan error, 1)
+	go func() {
+		_, err := busy.Exec(context.Background(), "select pg_sleep(1)")
+		slept <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+
+	start := time.Now()
+	_, err := late.Exec(t.Context(), "insert into "+name+" values (1)")
+
+	if sqlState(err) != "57014" || time.Since(start) > 600*time.Millisecond {
+		t.Errorf("queued insert got %v after %v; want 57014 at its 300ms statement_timeout", err, time.Since(start))
+	}
+	if err := <-slept; err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	if err := direct.QueryRow(t.Context(), "select count(*) from "+name).Scan(&rows); err != nil || rows != 0 {
+		t.Errorf("table has %d rows, %v; want the insert never run", rows, err)
+	}
+	expectSelectOne(t, late)
+}
+
 // pidOf returns conn's backend process ID.
 func pidOf(t testing.TB, conn *pgx.Conn) int32 {
 	t.Helper()

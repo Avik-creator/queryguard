@@ -699,6 +699,94 @@ func TestTrueUpChargesTheDifference(t *testing.T) {
 	})
 }
 
+func TestStandingQueueServesNewestFirst(t *testing.T) {
+	for wait, want := range map[time.Duration]string{500 * time.Millisecond: "first", 2 * time.Second: "second"} {
+		synctest.Test(t, func(t *testing.T) {
+			s := New(Config{Fast: Lane{MaxActive: 1, QueueTimeout: time.Minute, StandingAfter: time.Second, StandingTimeout: time.Minute}})
+			release := acquire(t, s, "x", Fast)
+			got := make(chan string, 2)
+			for _, name := range []string{"first", "second"} {
+				go func() {
+					done := acquire(t, s, "a", Fast)
+					got <- name
+					done()
+				}()
+				synctest.Wait()
+				time.Sleep(wait / 2)
+			}
+
+			release()
+
+			// A queue that hasn't emptied for a second stands, and then the newest waiter, whose client is likeliest still there, goes first.
+			if first := <-got; first != want {
+				t.Errorf("after the queue stood %v, %s went first; want %s", wait, first, want)
+			}
+			<-got
+		})
+	}
+}
+
+func TestStandingQueueDropsWaitersPastItsTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Fast: Lane{MaxActive: 1, QueueTimeout: time.Minute, StandingAfter: time.Second, StandingTimeout: 500 * time.Millisecond}})
+		release := acquire(t, s, "x", Fast)
+		old := make(chan error, 1)
+		go func() {
+			_, err := s.Acquire(t.Context(), "a", Fast, Normal)
+			old <- err
+		}()
+		synctest.Wait()
+		time.Sleep(1900 * time.Millisecond)
+		recent := make(chan error, 1)
+		go func() {
+			done, err := s.Acquire(t.Context(), "b", Fast, Normal)
+			if done != nil {
+				done()
+			}
+			recent <- err
+		}()
+		synctest.Wait()
+		time.Sleep(100 * time.Millisecond)
+
+		release()
+
+		if err := <-old; !errors.Is(err, ErrBusy) {
+			t.Errorf("waiter queued 2s in a standing queue = %v; want ErrBusy", err)
+		}
+		if err := <-recent; err != nil {
+			t.Errorf("waiter queued 100ms = %v; want the slot", err)
+		}
+	})
+}
+
+func TestNewArrivalAtAStandingQueueWaitsBriefly(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Fast: Lane{MaxActive: 1, QueueTimeout: time.Minute, StandingAfter: time.Second, StandingTimeout: 500 * time.Millisecond}})
+		acquire(t, s, "x", Fast)
+		go s.Acquire(t.Context(), "a", Fast, Normal)
+		synctest.Wait()
+		time.Sleep(2 * time.Second)
+
+		start := time.Now()
+		_, err := s.Acquire(t.Context(), "b", Fast, Normal)
+
+		if !errors.Is(err, ErrBusy) || time.Since(start) != 500*time.Millisecond {
+			t.Errorf("arrival at a standing queue = %v after %v; want ErrBusy after 500ms", err, time.Since(start))
+		}
+	})
+}
+
+func TestAcquireWithAnEndedContextTakesNoSlot(t *testing.T) {
+	s := New(Config{Fast: Lane{MaxActive: 1}})
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if _, err := s.Acquire(ctx, "a", Fast, Normal); !errors.Is(err, context.Canceled) {
+		t.Errorf("Acquire with an ended context = %v; want its error", err)
+	}
+	acquire(t, s, "b", Fast)
+}
+
 // nextInterval waits until Run has adjusted the limit once more.
 func nextInterval() {
 	time.Sleep(AdjustInterval)
