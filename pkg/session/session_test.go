@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Avik-creator/queryguard/internal/safe"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
@@ -1048,5 +1049,53 @@ func TestRefusesAMessageLongerThanPostgresTakes(t *testing.T) {
 
 	if _, n, err := readHeader(bufio.NewReader(bytes.NewReader(head))); err == nil {
 		t.Fatalf("readHeader read a body of %d bytes; want an error", n)
+	}
+}
+
+func TestPanicInTheClientLoopEndsOnlyThatSession(t *testing.T) {
+	client, _, done := relayWith(t, Options{Check: panicChecker{}})
+
+	write(t, client, []encoder{&pgproto3.Query{String: "select 1"}})
+
+	expectPanic(t, done)
+}
+
+func TestPanicInAStatementTimerEndsOnlyThatSession(t *testing.T) {
+	a := newAdmitter()
+	a.timeout = 50 * time.Millisecond
+	client, _, done := relayWith(t, Options{Check: fakeChecker{admit: a}, Cancel: func() { panic("bug") }})
+
+	write(t, client, []encoder{&pgproto3.Query{String: "select slot, pg_sleep(60)"}})
+
+	expectPanic(t, done)
+}
+
+// panicChecker panics on every statement, as a bug in a rule would.
+type panicChecker struct{}
+
+func (panicChecker) Check(string, Settings) (*pgproto3.ErrorResponse, Gate) { panic("bug") }
+func (panicChecker) CheckTooLong(int) *pgproto3.ErrorResponse               { panic("bug") }
+
+// relayWith runs Relay with opts and a login that succeeds at once; done gets what it returns.
+func relayWith(t *testing.T, opts Options) (client, pg net.Conn, done <-chan error) {
+	t.Helper()
+	client, proxyClient := tcpPair(t)
+	pg, proxyServer := tcpPair(t)
+	opts.Login = func(io.Writer, io.Reader, func(string, string)) error { return nil }
+	ch := make(chan error, 1)
+	go func() { ch <- Relay(proxyClient, proxyServer, opts) }()
+	return client, pg, ch
+}
+
+// expectPanic waits for Relay to return a recovered panic.
+func expectPanic(t *testing.T, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if _, ok := errors.AsType[*safe.Panic](err); !ok {
+			t.Fatalf("Relay returned %v; want the recovered panic", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Relay did not return")
 	}
 }

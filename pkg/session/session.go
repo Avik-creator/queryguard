@@ -21,6 +21,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Avik-creator/queryguard/internal/safe"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
@@ -152,7 +153,9 @@ func Relay(client, server net.Conn, opts Options) error {
 		opts.Interrupt(s.interrupt)
 	}
 	var loops sync.WaitGroup
+	// A panic in either loop, or in anything they call, ends this session alone.
 	loops.Go(func() {
+		defer safe.Recover(stop)
 		err := s.fromClient()
 		// A client that leaves mid-statement leaves Postgres working for no one.
 		if !s.stopped.Load() && s.busy() && s.cancel != nil {
@@ -162,6 +165,7 @@ func Relay(client, server net.Conn, opts Options) error {
 	})
 	loops.Go(func() {
 		defer close(s.serverGone)
+		defer safe.Recover(stop)
 		err := login(client, s.serverIn, func(name, value string) {
 			s.mu.Lock()
 			defer s.mu.Unlock()
@@ -585,7 +589,10 @@ func (s *session) admit(gate Gate, on byte, e Explain) *pgproto3.ErrorResponse {
 	}
 	if a.Timeout > 0 {
 		if s.stmtTimer == nil {
-			s.stmtTimer = time.AfterFunc(a.Timeout, s.statementTimedOut)
+			s.stmtTimer = time.AfterFunc(a.Timeout, func() {
+				defer safe.Recover(s.stop)
+				s.statementTimedOut()
+			})
 		} else {
 			s.stmtTimer.Reset(a.Timeout)
 		}
@@ -599,6 +606,10 @@ func (s *session) waitContext() (context.Context, func()) {
 	watched := make(chan struct{})
 	go func() {
 		defer close(watched)
+		defer safe.Recover(func(err error) {
+			cancel()
+			s.stop(err)
+		})
 		// Most gates return at once, and only a statement that waits needs its client watched.
 		select {
 		case <-ctx.Done():
@@ -687,7 +698,10 @@ func (s *session) becameIdle() {
 	}
 	if (s.status == 'T' || s.status == 'E') && s.idleLimit > 0 {
 		gen := s.idleGen
-		s.idleTimer = time.AfterFunc(s.idleLimit, func() { s.idleTimedOut(gen) })
+		s.idleTimer = time.AfterFunc(s.idleLimit, func() {
+			defer safe.Recover(s.stop)
+			s.idleTimedOut(gen)
+		})
 	}
 }
 
