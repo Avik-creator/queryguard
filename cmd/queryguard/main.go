@@ -67,6 +67,7 @@ type options struct {
 	trafficLog      string
 	metricsListen   string
 	decisionLog     string
+	reusePort       bool
 }
 
 func main() {
@@ -118,8 +119,10 @@ func main() {
 		"address to serve Prometheus metrics on at /metrics, such as 127.0.0.1:9187; empty serves none")
 	flag.StringVar(&opts.decisionLog, "decision-log", "",
 		"JSON-lines file of every decision a rule made, such as a rejected statement; reopened on SIGHUP for log rotation")
+	flag.BoolVar(&opts.reusePort, "reuse-port", false,
+		"let other QueryGuard processes listen on -listen too (SO_REUSEPORT), so a new one takes connections while this one drains")
 	flag.DurationVar(&opts.shutdownTimeout, "shutdown-timeout", proxy.DefaultShutdownTimeout,
-		"how long open sessions may continue after a shutdown signal")
+		"after a shutdown signal, how long a session busy in a statement or transaction may go on; idle ones end at once")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -196,7 +199,7 @@ func run(opts options, log *slog.Logger, metrics *telemetry.Registry, decisions 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	ln, err := net.Listen("tcp", opts.listen)
+	ln, err := proxy.Listen(ctx, opts.listen, opts.reusePort)
 	if err != nil {
 		return err
 	}

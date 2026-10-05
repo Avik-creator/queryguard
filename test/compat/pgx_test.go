@@ -14,6 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -206,19 +208,27 @@ func startProxy(t testing.TB) *queryGuard {
 // startProxyWith starts a proxy as startProxy does, letting configure change the server first.
 func startProxyWith(t testing.TB, configure func(*proxy.Server)) *queryGuard {
 	t.Helper()
+	if os.Getenv("QG_TEST_UPSTREAM") == "" {
+		t.Skip("set QG_TEST_UPSTREAM to a Postgres host:port, for example 127.0.0.1:5418 after make up")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	qg, _ := startProxyOn(t, ln, configure)
+	return qg
+}
+
+// startProxyOn starts a proxy as startProxyWith does, on ln; stop starts its shutdown and waits for Serve to return.
+func startProxyOn(t testing.TB, ln net.Listener, configure func(*proxy.Server)) (_ *queryGuard, stop func()) {
+	t.Helper()
 	upstream := os.Getenv("QG_TEST_UPSTREAM")
 	if upstream == "" {
 		t.Skip("set QG_TEST_UPSTREAM to a Postgres host:port, for example 127.0.0.1:5418 after make up")
 	}
-
 	cert, _ := testcert.Pair(t)
 	caFile := filepath.Join(t.TempDir(), "ca.crt")
 	if err := os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
 		t.Fatal(err)
 	}
 	s := &proxy.Server{
@@ -232,13 +242,14 @@ func startProxyWith(t testing.TB, configure func(*proxy.Server)) *queryGuard {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- s.Serve(ctx, ln) }()
-	t.Cleanup(func() {
+	stop = sync.OnceFunc(func() {
 		cancel()
 		if err := <-done; err != nil {
 			t.Errorf("Serve: %v", err)
 		}
 	})
-	return &queryGuard{addr: ln.Addr().String(), caFile: caFile}
+	t.Cleanup(stop)
+	return &queryGuard{addr: ln.Addr().String(), caFile: caFile}, stop
 }
 
 // connect opens a pgx connection through the proxy as the docker compose superuser, with extra connection options.
@@ -265,3 +276,74 @@ func connectTo(t testing.TB, addr, opts string) *pgx.Conn {
 
 // password is the docker compose superuser's password.
 func password() string { return cmp.Or(os.Getenv("PGPASSWORD"), "queryguard") }
+
+func TestRollingRestartDropsNoBusySession(t *testing.T) {
+	ln, err := proxy.Listen(t.Context(), "127.0.0.1:0", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, stopOld := startProxyOn(t, ln, func(s *proxy.Server) { s.ShutdownTimeout = 10 * time.Second })
+
+	var committed, dropped, reconnects atomic.Int64
+	ctx, stopLoad := context.WithCancel(t.Context())
+	var load sync.WaitGroup
+	for range 8 {
+		load.Go(func() {
+			var conn *pgx.Conn
+			for ctx.Err() == nil {
+				if conn == nil {
+					c, err := pgx.Connect(ctx, fmt.Sprintf("host=127.0.0.1 port=%s user=postgres password=%s dbname=queryguard", port(old), password()))
+					if err != nil {
+						continue
+					}
+					conn = c
+				}
+				// A drained session is closed only between transactions, so only BEGIN may fail.
+				if _, err := conn.Exec(ctx, "begin"); err != nil {
+					conn.Close(context.Background())
+					conn = nil
+					reconnects.Add(1)
+					continue
+				}
+				_, err1 := conn.Exec(ctx, "select pg_sleep(0.05)")
+				_, err2 := conn.Exec(ctx, "select count(*) from customers where id < 100")
+				_, err3 := conn.Exec(ctx, "commit")
+				if err := cmp.Or(err1, err2, err3); err != nil {
+					if ctx.Err() == nil {
+						dropped.Add(1)
+						t.Errorf("a transaction failed midway: %v", err)
+					}
+					conn.Close(context.Background())
+					conn = nil
+					continue
+				}
+				committed.Add(1)
+			}
+			if conn != nil {
+				conn.Close(context.Background())
+			}
+		})
+	}
+
+	time.Sleep(time.Second)
+	newLn, err := proxy.Listen(t.Context(), old.addr, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startProxyOn(t, newLn, func(*proxy.Server) {})
+	before := committed.Load()
+	start := time.Now()
+	stopOld()
+	drained := time.Since(start)
+	time.Sleep(2 * time.Second)
+	stopLoad()
+	load.Wait()
+
+	if drained > 5*time.Second {
+		t.Errorf("the old process took %v to drain; want its sessions ended as each transaction did", drained)
+	}
+	if after := committed.Load() - before; after == 0 {
+		t.Error("no transaction committed through the new process")
+	}
+	t.Logf("committed %d, reconnected %d, dropped mid-transaction %d; old process drained in %v", committed.Load(), reconnects.Load(), dropped.Load(), drained)
+}
