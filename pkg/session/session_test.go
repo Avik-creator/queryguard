@@ -259,6 +259,27 @@ func TestExplainsBindWithItsValues(t *testing.T) {
 	h.clientGets(&pgproto3.ParseComplete{})
 }
 
+func TestExplainLeavesAClientStatementOfAnyNameAlone(t *testing.T) {
+	h := start(t, fakeChecker{})
+	// The name the proxy once used for its own EXPLAIN statement.
+	parse := &pgproto3.Parse{Name: "queryguard_explain", Query: "select plan"}
+
+	h.send(parse, &pgproto3.Bind{PreparedStatement: parse.Name}, &pgproto3.Execute{}, &pgproto3.Sync{})
+
+	// The client's Parse, then the proxy's EXPLAIN messages.
+	backend := pgproto3.NewBackend(h.pg, h.pg)
+	for range 1 + len(explainBind("", nil, nil, nil)) {
+		h.pg.SetReadDeadline(time.Now().Add(2 * time.Second))
+		msg, err := backend.Receive()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c, ok := msg.(*pgproto3.Close); ok && c.Name == parse.Name {
+			t.Fatalf("proxy closed the client's statement %q for its EXPLAIN", c.Name)
+		}
+	}
+}
+
 func TestTellsCheckerWhichValuesWereBound(t *testing.T) {
 	values := make(chan string, 10)
 	h := start(t, fakeChecker{values: values})

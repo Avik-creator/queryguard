@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -35,8 +36,8 @@ const bufSize = 8 << 10
 // maxReplayed caps a Bind sent a second time to explain its statement; larger ones get a generic plan instead.
 const maxReplayed = 1 << 20
 
-// explainName names the proxy's own statement and portal for EXPLAIN.
-const explainName = "queryguard_explain"
+// explainName names the proxy's own statement and portal for EXPLAIN; the random part keeps it off any name a client picks.
+var explainName = "queryguard_explain_" + strings.ToLower(rand.Text())
 
 // EXPLAIN prefixes; positions in Postgres's errors count from the start of the prefixed text.
 const (
