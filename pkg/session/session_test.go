@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -941,7 +942,7 @@ func startWithLogin(t *testing.T, check Checker, login func(io.Writer, io.Reader
 	return startWith(t, Options{Check: check, Login: login})
 }
 
-// startWith is start with opts; the harness fills in Cancel and Interrupt, and a login that succeeds at once when opts has none.
+// startWith is start with opts; the harness fills in Interrupt, a Cancel it hears of before opts's runs, and a login that succeeds at once when opts has none.
 func startWith(t *testing.T, opts Options) *harness {
 	t.Helper()
 	client, proxyClient := tcpPair(t)
@@ -950,7 +951,13 @@ func startWith(t *testing.T, opts Options) *harness {
 	if opts.Login == nil {
 		opts.Login = func(io.Writer, io.Reader, func(string, string)) error { return nil }
 	}
-	opts.Cancel = func() { h.cancels <- struct{}{} }
+	cancel := opts.Cancel
+	opts.Cancel = func() {
+		h.cancels <- struct{}{}
+		if cancel != nil {
+			cancel()
+		}
+	}
 	opts.Interrupt = func(f func(Interruption) bool) { h.interrupts <- f }
 	go func() {
 		defer close(h.done)
@@ -1391,6 +1398,31 @@ func TestLeavesAReadAfterAnotherInTheSameSyncUncut(t *testing.T) {
 	h.reply(&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, row, row, row)
 
 	expectNone(t, h.cancels, "cancel of a read sharing its implicit transaction with an update")
+}
+
+func TestHoldsTheNextStatementUntilACapsCancelIsDone(t *testing.T) {
+	a := newAdmitter()
+	a.maxRows = 2
+	release := make(chan struct{})
+	h := startWith(t, Options{Check: fakeChecker{admit: a}, Cancel: func() { <-release }})
+	done := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(done)
+	row := &pgproto3.DataRow{Values: [][]byte{[]byte("x")}}
+
+	// The statement finishes before the cancel reaches Postgres, so the cancel could land on whatever runs next.
+	h.send(&pgproto3.Query{String: "select slot from big"})
+	h.serverGets(&pgproto3.Query{String: "select slot from big"})
+	h.reply(row, row, row, &pgproto3.CommandComplete{CommandTag: []byte("SELECT 3")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	expect(t, h.cancels, struct{}{})
+	h.clientGets(row, row, row, &pgproto3.CommandComplete{CommandTag: []byte("SELECT 3")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	h.send(&pgproto3.Query{String: "select 'next'"})
+	h.pg.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if n, err := h.pg.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Postgres got %d bytes, %v, while the cancel was in flight; want nothing until it is done", n, err)
+	}
+	done()
+	h.serverGets(&pgproto3.Query{String: "select 'next'"})
 }
 
 func TestLeavesAReadInATransactionUncut(t *testing.T) {

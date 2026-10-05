@@ -16,7 +16,7 @@ type Upstream interface {
 	Acquire(ctx context.Context, startup *pgproto3.StartupMessage) (net.Conn, error)
 	// Release gives back a connection from Acquire once its client is done.
 	Release(conn net.Conn)
-	// Cancel delivers a client's CancelRequest to the server.
+	// Cancel delivers a client's CancelRequest to the server, returning once the server has acted on it.
 	Cancel(ctx context.Context, req *pgproto3.CancelRequest) error
 }
 
@@ -48,7 +48,15 @@ func (d Dialer) Cancel(ctx context.Context, req *pgproto3.CancelRequest) error {
 		return err
 	}
 	defer conn.Close()
-	return writeMessage(conn, req)
+	if err := writeMessage(conn, req); err != nil {
+		return err
+	}
+	// Postgres closes the connection once it has signalled the backend, so until then a statement sent next could get the cancel.
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetReadDeadline(deadline)
+	}
+	_, err = io.Copy(io.Discard, conn)
+	return err
 }
 
 func (d Dialer) dial(ctx context.Context) (net.Conn, error) {

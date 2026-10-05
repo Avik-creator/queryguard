@@ -335,6 +335,32 @@ func TestGivesClientItsOwnCancelKey(t *testing.T) {
 	}
 }
 
+func TestCancelWaitsForPostgresToHandleIt(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	// The postmaster closes the connection once it has signalled the backend, as libpq waits for.
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		io.ReadFull(conn, make([]byte, 16))
+		time.Sleep(200 * time.Millisecond)
+		conn.Close()
+	}()
+
+	start := time.Now()
+	if err := (Dialer{Addr: ln.Addr().String()}).Cancel(t.Context(), &pgproto3.CancelRequest{ProcessID: 1, SecretKey: []byte{1, 2, 3, 4}}); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took < 200*time.Millisecond {
+		t.Errorf("Cancel returned after %v; want it to wait for Postgres to close the connection", took)
+	}
+}
+
 func TestForwardsCancelRequestWithServerKey(t *testing.T) {
 	pg := startFakePostgres(t)
 	addr, _ := startProxy(t, newServer(t, pg.addr))

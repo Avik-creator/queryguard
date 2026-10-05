@@ -251,6 +251,7 @@ type session struct {
 	idleGen        int           // bumped by each client message, so an idle timer firing late does nothing
 	interrupted    *Interruption // why the proxy cancelled the running statement, so Postgres's cancel error says so
 	interruptedRan *hooks        // that statement's admission, told once the cancel lands
+	cancelling     chan struct{} // closed once the proxy's own cancel request is done; nil when none is in flight
 	settled        []func()      // from admissions, called once the session is idle outside a transaction
 	idle           []func()      // what admitted statements want called once the server is next idle
 
@@ -418,6 +419,7 @@ func (s *session) fromClient() error {
 		if err != nil {
 			return err
 		}
+		s.awaitCancel()
 		s.clientSent()
 		if s.record != nil {
 			s.noteText(typ, n)
@@ -791,11 +793,14 @@ func (s *session) statementTimedOut() { s.interrupt(statementTimeout) }
 func (s *session) interrupt(i Interruption) bool {
 	s.mu.Lock()
 	busy := len(s.pending) > 0 && s.cancel != nil
+	var done chan struct{}
 	if busy {
 		s.interrupted, s.interruptedRan = &i, s.running()
+		done = s.startCancel()
 	}
 	s.mu.Unlock()
 	if busy {
+		defer s.endCancel(done)
 		s.cancel()
 	}
 	return busy
@@ -1349,11 +1354,40 @@ func (s *session) returnedRow(p *sent, n int) {
 	i.Hint = "Add a LIMIT, or page through the rows."
 	p.capped = false
 	s.interrupted, s.interruptedRan = &i, p.ran
+	done := s.startCancel()
 	// The cancel opens a connection to Postgres, which mustn't hold up the rows still arriving.
 	go func() {
 		defer safe.Recover(s.stop)
+		defer s.endCancel(done)
 		s.cancel()
 	}()
+}
+
+// startCancel notes that the proxy is cancelling the running statement, returning what endCancel takes; the caller holds mu.
+func (s *session) startCancel() chan struct{} {
+	done := make(chan struct{})
+	s.cancelling = done
+	return done
+}
+
+// endCancel notes that the cancel startCancel noted has reached Postgres.
+func (s *session) endCancel(done chan struct{}) {
+	s.mu.Lock()
+	if s.cancelling == done {
+		s.cancelling = nil
+	}
+	s.mu.Unlock()
+	close(done)
+}
+
+// awaitCancel waits for the proxy's cancel in flight, if any, which would otherwise land on a statement sent before it does.
+func (s *session) awaitCancel() {
+	s.mu.Lock()
+	done := s.cancelling
+	s.mu.Unlock()
+	if done != nil {
+		<-done
+	}
 }
 
 // recordAnswer records the statement head belongs to, now answered by a message of type typ; the caller holds mu.
