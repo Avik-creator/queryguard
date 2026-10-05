@@ -266,7 +266,7 @@ func TestRelayAuthRepliesStopsAtTheFirstOtherMessage(t *testing.T) {
 }
 
 func TestRelayStartupExplainsAChannelBindingRefusal(t *testing.T) {
-	refusal := &pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "08P01", Message: "SCRAM channel binding negotiation error"}
+	refusal := &pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "28000", Message: "SCRAM channel binding negotiation error"}
 	for _, binding := range []bool{false, true} {
 		server := bytes.NewReader(concat(
 			encode(t, &pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"}}),

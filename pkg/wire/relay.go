@@ -131,8 +131,8 @@ func relayRefusal(client io.Writer, server io.Reader, head [5]byte, size int64, 
 		}
 		return ErrLoginRefused
 	}
-	// Postgres over TLS refuses SCRAM's "y" flag, which libpq sends over TLS when it is offered no -PLUS mechanism.
-	if hidBinding && e.Code == "08P01" && e.Hint == "" {
+	// Postgres over TLS refuses SCRAM's "y" flag, which libpq and pgx send over TLS when offered no -PLUS mechanism, with 28000.
+	if hidBinding && e.Hint == "" && (e.Code == "08P01" || e.Code == "28000" && strings.Contains(e.Message, "channel binding")) {
 		e.Hint = bindingHint
 		if err := writeMessage(client, &e); err != nil {
 			return err
