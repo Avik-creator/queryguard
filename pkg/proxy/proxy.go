@@ -29,6 +29,7 @@ import (
 	"github.com/Avik-creator/queryguard/pkg/sched"
 	"github.com/Avik-creator/queryguard/pkg/session"
 	"github.com/Avik-creator/queryguard/pkg/stats"
+	"github.com/Avik-creator/queryguard/pkg/telemetry"
 	"github.com/Avik-creator/queryguard/pkg/wire"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -101,16 +102,20 @@ type Server struct {
 	AdminAuthDatabase string
 	// Reload reads the config file again, for the console's RELOAD; nil means there is none.
 	Reload func() error
+	// Metrics gets the proxy's metrics, such as statements by tenant and open sessions; nil keeps none.
+	Metrics *telemetry.Registry
 
 	keys     cancelKeys
 	sessions sessionCount
+	throttle loginThrottle
+	backends backends
+	policies policy.Holder
+	open     atomic.Int64  // sessions connected to Postgres
+	starting atomic.Int64  // connections that have yet to send their startup message
+	capacity atomic.Uint64 // the server's measured cost units a second, as float64 bits; 0 until measured
+
 	// Each holds back a flood of one kind of line, such as failed handshakes from a port scanner.
 	startupLogs, cancelLogs quietLog
-	throttle                loginThrottle
-	backends                backends
-	policies                policy.Holder
-	starting                atomic.Int64  // connections that have yet to send their startup message
-	capacity                atomic.Uint64 // the server's measured cost units a second, as float64 bits; 0 until measured
 
 	// Only the Monitor's goroutine uses these.
 	observed   time.Time              // when it last reported
@@ -123,6 +128,10 @@ type Server struct {
 	fleetMu   sync.Mutex
 	known     map[string]time.Time // tenants with the default budget seen lately, when last seen
 	lastWants time.Time
+
+	// Made from Metrics by Serve; nil without it.
+	statements *telemetry.Counter
+	took       *telemetry.Histogram
 
 	mu      sync.Mutex
 	sched   *sched.Scheduler // made with the first policy and reconfigured by each one after
@@ -148,6 +157,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 
 	if s.Policy != nil && s.policies.Load() == nil {
 		s.SetPolicy(s.Policy)
+	}
+	if s.Metrics != nil {
+		s.registerMetrics(s.Metrics)
 	}
 	s.mu.Lock()
 	s.serving = ctx
@@ -404,6 +416,8 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 		return
 	}
 	defer s.Upstream.Release(server)
+	s.open.Add(1)
+	defer s.open.Add(-1)
 
 	// The login sets forget and unfile; they are called once the session is over.
 	forget, unfile := func() {}, func() {}
@@ -442,10 +456,13 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 		}
 	}
 	var record func(session.Finished)
-	if t := s.Stats; t != nil {
+	if t := s.Stats; t != nil || s.statements != nil {
 		record = func(f session.Finished) {
-			t.Record(stats.Statement{At: time.Now(), Database: database, Role: role, SQL: f.SQL, Took: f.Took, Rows: f.Rows, Code: f.Code,
-				Message: f.Message, Rejected: f.Rejected, NotRun: f.NotRun})
+			if t != nil {
+				t.Record(stats.Statement{At: time.Now(), Database: database, Role: role, SQL: f.SQL, Took: f.Took, Rows: f.Rows, Code: f.Code,
+					Message: f.Message, Rejected: f.Rejected, NotRun: f.NotRun})
+			}
+			s.count(role, f)
 		}
 	}
 	err = session.Relay(client, server, session.Options{Check: check, Cancel: cancel, Record: record,
@@ -615,6 +632,68 @@ func ownCertificate(cfg *tls.Config) *tls.Certificate {
 		return nil
 	}
 	return &cfg.Certificates[0]
+}
+
+// durationBuckets are the statement time histogram's upper bounds, in seconds.
+var durationBuckets = []float64{0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
+
+// registerMetrics adds the proxy's metrics to r.
+func (s *Server) registerMetrics(r *telemetry.Registry) {
+	s.statements = r.Counter("queryguard_statements_total", "Statements by tenant and result: ok, error, rejected by QueryGuard, or not_run when Parse or Bind failed.", "tenant", "result")
+	s.took = r.Histogram("queryguard_statement_duration_seconds", "Time from sending a statement to Postgres to its answer, by tenant.", durationBuckets, "tenant")
+	r.Gauge("queryguard_sessions", "Client sessions connected to Postgres.", func(emit func(float64, ...string)) { emit(float64(s.open.Load())) })
+	r.Gauge("queryguard_connections_starting", "Connections yet to send their startup message.", func(emit func(float64, ...string)) {
+		emit(float64(s.starting.Load()))
+	})
+	r.Gauge("queryguard_capacity_units_per_second", "The server's measured cost units a second; 0 until measured.", func(emit func(float64, ...string)) {
+		emit(math.Float64frombits(s.capacity.Load()))
+	})
+	r.Gauge("queryguard_admission_limit", "Statements the fast lane runs at once now, as the adaptive limit sets it; 0 means no limit.",
+		func(emit func(float64, ...string)) {
+			if sc := s.scheduler(); sc != nil {
+				emit(float64(sc.Limit()))
+			}
+		})
+	tenants := func(value func(sched.TenantState) float64) func(func(float64, ...string)) {
+		return func(emit func(float64, ...string)) {
+			if sc := s.scheduler(); sc != nil {
+				for _, t := range sc.Tenants() {
+					emit(value(t), t.Name)
+				}
+			}
+		}
+	}
+	r.Gauge("queryguard_tenant_running", "Statements each tenant runs now.", tenants(func(t sched.TenantState) float64 { return float64(t.Running) }), "tenant")
+	r.Gauge("queryguard_tenant_budget_units", "Cost units each tenant has left; below zero, what it owes.", tenants(func(t sched.TenantState) float64 { return t.Tokens }), "tenant")
+	r.CounterFunc("queryguard_plan_cache_hits_total", "Statements whose plan came from the cache.", func(emit func(float64, ...string)) {
+		emit(float64(s.Plans.Stats().Hits))
+	})
+	r.CounterFunc("queryguard_plan_cache_misses_total", "Statements QueryGuard explained.", func(emit func(float64, ...string)) {
+		emit(float64(s.Plans.Stats().Misses))
+	})
+	r.CounterFunc("queryguard_explain_seconds_total", "Time spent explaining statements, which is what the cost check adds to queries.",
+		func(emit func(float64, ...string)) { emit(s.Plans.Stats().Explaining.Seconds()) })
+}
+
+// count adds a finished statement of role to the metrics.
+func (s *Server) count(role string, f session.Finished) {
+	if s.statements == nil {
+		return
+	}
+	tenant := s.tenantOf(role, f.SQL)
+	result := "ok"
+	switch {
+	case f.Rejected:
+		result = "rejected"
+	case f.NotRun:
+		result = "not_run"
+	case f.Code != "":
+		result = "error"
+	}
+	s.statements.Inc(tenant, result)
+	if f.Took > 0 && !f.Rejected {
+		s.took.Observe(f.Took.Seconds(), tenant)
+	}
 }
 
 // logPlanStats logs at each tick the cache hit rate and average explain time, the latency the cost check adds, since the last line.

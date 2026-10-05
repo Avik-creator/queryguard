@@ -11,6 +11,7 @@ import (
 	"maps"
 	"math"
 	"net"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"slices"
@@ -30,6 +31,7 @@ import (
 	"github.com/Avik-creator/queryguard/pkg/sched"
 	"github.com/Avik-creator/queryguard/pkg/session"
 	"github.com/Avik-creator/queryguard/pkg/stats"
+	"github.com/Avik-creator/queryguard/pkg/telemetry"
 	"github.com/Avik-creator/queryguard/pkg/wire"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -2052,5 +2054,37 @@ func TestQuietLogHoldsBackAFloodAndCountsIt(t *testing.T) {
 	}
 	if ok, held := q.allow(start.Add(quietWindow + time.Second)); !ok || held != 5 {
 		t.Errorf("next window: allow = %v, %d; want it logged with 5 held back", ok, held)
+	}
+}
+
+func TestMetricsCountStatementsAndOpenSessions(t *testing.T) {
+	s := newServer(t, startFakePostgres(t).addr)
+	s.Policy = mustPolicy(t, `{"rules": [{"check": "require_where"}]}`)
+	s.Metrics = &telemetry.Registry{}
+	addr, _ := startProxy(t, s)
+	conn := startSession(t, addr)
+
+	send(t, conn, &pgproto3.Query{String: "delete from orders"})
+	receive(t, conn)
+	receive(t, conn)
+	// The fake server echoes queries rather than answering them, so a statement that ran is handed over directly.
+	s.count("alice", session.Finished{SQL: "select 1", Took: time.Millisecond, Rows: 1})
+
+	var body string
+	waitUntil(t, func() bool {
+		rec := httptest.NewRecorder()
+		s.Metrics.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+		body = rec.Body.String()
+		return strings.Contains(body, `queryguard_statements_total{tenant="alice",result="rejected"} 1`)
+	})
+	for _, want := range []string{
+		`queryguard_statements_total{tenant="alice",result="ok"} 1`,
+		`queryguard_statement_duration_seconds_count{tenant="alice"} 1`,
+		"queryguard_sessions 1",
+		"queryguard_plan_cache_misses_total 0",
+	} {
+		if !strings.Contains(body, want+"\n") {
+			t.Errorf("metrics lack %q:\n%s", want, body)
+		}
 	}
 }
