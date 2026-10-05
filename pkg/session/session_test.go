@@ -931,13 +931,23 @@ func start(t *testing.T, check Checker) *harness {
 // startWithLogin is start with the given login in place of one that succeeds at once.
 func startWithLogin(t *testing.T, check Checker, login func(io.Writer, io.Reader, func(name, value string)) error) *harness {
 	t.Helper()
+	return startWith(t, Options{Check: check, Login: login})
+}
+
+// startWith is start with opts; the harness fills in Cancel and Interrupt, and a login that succeeds at once when opts has none.
+func startWith(t *testing.T, opts Options) *harness {
+	t.Helper()
 	client, proxyClient := tcpPair(t)
 	pg, proxyServer := tcpPair(t)
 	h := &harness{t: t, client: client, pg: pg, done: make(chan struct{}), cancels: make(chan struct{}, 10), interrupts: make(chan func(Interruption) bool, 1)}
+	if opts.Login == nil {
+		opts.Login = func(io.Writer, io.Reader, func(string, string)) error { return nil }
+	}
+	opts.Cancel = func() { h.cancels <- struct{}{} }
+	opts.Interrupt = func(f func(Interruption) bool) { h.interrupts <- f }
 	go func() {
 		defer close(h.done)
-		h.err = Relay(proxyClient, proxyServer, Options{Check: check, Login: login, Cancel: func() { h.cancels <- struct{}{} },
-			Interrupt: func(f func(Interruption) bool) { h.interrupts <- f }})
+		h.err = Relay(proxyClient, proxyServer, opts)
 	}()
 	t.Cleanup(func() {
 		client.Close()
@@ -1097,5 +1107,183 @@ func expectPanic(t *testing.T, done <-chan error) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Relay did not return")
+	}
+}
+
+func TestRecordsASimpleQueryWithItsRowsAndTime(t *testing.T) {
+	rec := make(chan Finished, 10)
+	h := startWith(t, Options{Record: func(f Finished) { rec <- f }})
+
+	h.send(&pgproto3.Query{String: "select 1"})
+	h.serverGets(&pgproto3.Query{String: "select 1"})
+	h.reply(&pgproto3.DataRow{Values: [][]byte{[]byte("1")}}, &pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")},
+		&pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	f := expectFinished(t, rec)
+	if f.SQL != "select 1" || f.Rows != 1 || f.Took <= 0 || f.Code != "" || f.Rejected || f.NotRun {
+		t.Errorf("recorded %+v; want select 1, one row, a time", f)
+	}
+}
+
+func TestRecordsAQuerysErrorCode(t *testing.T) {
+	rec := make(chan Finished, 10)
+	h := startWith(t, Options{Record: func(f Finished) { rec <- f }})
+
+	h.send(&pgproto3.Query{String: "select 1/0"})
+	h.serverGets(&pgproto3.Query{String: "select 1/0"})
+	h.reply(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "22012", Message: "division by zero"}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	if f := expectFinished(t, rec); f.Code != "22012" || f.Message != "division by zero" || f.SQL != "select 1/0" {
+		t.Errorf("recorded %+v; want the division error", f)
+	}
+}
+
+func TestRecordsAMultiStatementQueryOnceWithEveryRow(t *testing.T) {
+	rec := make(chan Finished, 10)
+	h := startWith(t, Options{Record: func(f Finished) { rec <- f }})
+	q := &pgproto3.Query{String: "update a set x = 1; update b set x = 1"}
+
+	h.send(q)
+	h.serverGets(q)
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("UPDATE 2")}, &pgproto3.CommandComplete{CommandTag: []byte("UPDATE 3")},
+		&pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	if f := expectFinished(t, rec); f.Rows != 5 {
+		t.Errorf("recorded %+v; want 5 rows", f)
+	}
+	expectNoFinished(t, rec)
+}
+
+func TestRecordsAnExecuteWithItsStatementsText(t *testing.T) {
+	rec := make(chan Finished, 10)
+	h := startWith(t, Options{Record: func(f Finished) { rec <- f }})
+	parse := &pgproto3.Parse{Name: "s1", Query: "insert into t values ($1)"}
+	bind := &pgproto3.Bind{DestinationPortal: "p1", PreparedStatement: "s1", Parameters: [][]byte{[]byte("7")}}
+
+	h.send(parse, bind, &pgproto3.Execute{Portal: "p1"}, &pgproto3.Sync{})
+	h.serverGets(parse, bind, &pgproto3.Execute{Portal: "p1"}, &pgproto3.Sync{})
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, &pgproto3.CommandComplete{CommandTag: []byte("INSERT 0 1")},
+		&pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	if f := expectFinished(t, rec); f.SQL != parse.Query || f.Rows != 1 || f.Took <= 0 {
+		t.Errorf("recorded %+v; want the insert, one row and a time", f)
+	}
+	expectNoFinished(t, rec)
+}
+
+func TestStatementsSharingASyncAreRecordedWithoutATime(t *testing.T) {
+	rec := make(chan Finished, 10)
+	h := startWith(t, Options{Record: func(f Finished) { rec <- f }})
+	parse := &pgproto3.Parse{Query: "select 1"}
+
+	h.send(parse, &pgproto3.Bind{}, &pgproto3.Execute{}, &pgproto3.Bind{}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	h.serverGets(parse, &pgproto3.Bind{}, &pgproto3.Execute{}, &pgproto3.Bind{}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	tag := &pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, tag, &pgproto3.BindComplete{}, tag, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	for range 2 {
+		if f := expectFinished(t, rec); f.SQL != "select 1" || f.Took != 0 || f.Rows != 1 {
+			t.Errorf("recorded %+v; want select 1 counted without a time of its own", f)
+		}
+	}
+}
+
+func TestRecordsAParseErrorAsNotRun(t *testing.T) {
+	rec := make(chan Finished, 10)
+	h := startWith(t, Options{Record: func(f Finished) { rec <- f }})
+	parse := &pgproto3.Parse{Query: "selec 1"}
+
+	h.send(parse, &pgproto3.Sync{})
+	h.serverGets(parse, &pgproto3.Sync{})
+	h.reply(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "42601", Message: "syntax error"}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	if f := expectFinished(t, rec); f.SQL != "selec 1" || f.Code != "42601" || !f.NotRun {
+		t.Errorf("recorded %+v; want the syntax error, not run", f)
+	}
+}
+
+func TestRecordsTheProxysOwnRejection(t *testing.T) {
+	rec := make(chan Finished, 10)
+	h := startWith(t, Options{Check: fakeChecker{}, Record: func(f Finished) { rec <- f }, Login: loginReporting})
+
+	h.send(&pgproto3.Query{String: "select bad"})
+	h.clientGets(rejected, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	if f := expectFinished(t, rec); f.SQL != "select bad" || f.Code != rejected.Code || !f.Rejected {
+		t.Errorf("recorded %+v; want the proxy's rejection", f)
+	}
+}
+
+func TestRecordsARejectionPostgresRaisesForTheProxy(t *testing.T) {
+	rec := make(chan Finished, 10)
+	h := startWith(t, Options{Check: fakeChecker{}, Record: func(f Finished) { rec <- f }, Login: loginReporting})
+
+	// The first query is still in flight, so the second's rejection must come from Postgres, after it.
+	h.send(&pgproto3.Query{String: "select 1"}, &pgproto3.Query{String: "select bad"})
+	h.serverGets(&pgproto3.Query{String: "select 1"}, &pgproto3.Query{String: wantDo})
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'},
+		rejected, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	if f := expectFinished(t, rec); f.SQL != "select 1" || f.Rejected {
+		t.Errorf("first recorded %+v; want select 1", f)
+	}
+	if f := expectFinished(t, rec); f.SQL != "select bad" || f.Code != rejected.Code || !f.Rejected {
+		t.Errorf("second recorded %+v; want the rejection under its own text", f)
+	}
+}
+
+// loginReporting is the login start uses, which reports the settings a checked statement needs.
+func loginReporting(_ io.Writer, _ io.Reader, report func(name, value string)) error {
+	report("standard_conforming_strings", loginSettings.StandardConformingStrings)
+	report("client_encoding", loginSettings.ClientEncoding)
+	return nil
+}
+
+func expectFinished(t *testing.T, rec <-chan Finished) Finished {
+	t.Helper()
+	select {
+	case f := <-rec:
+		return f
+	case <-time.After(2 * time.Second):
+		t.Fatal("nothing recorded")
+		return Finished{}
+	}
+}
+
+func expectNoFinished(t *testing.T, rec <-chan Finished) {
+	t.Helper()
+	select {
+	case f := <-rec:
+		t.Errorf("recorded %+v; want nothing more", f)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestRecordsTheErrorPostgresGaveTheCostChecksExplain(t *testing.T) {
+	for name, run := range map[string]func(h *harness){
+		"query": func(h *harness) {
+			h.send(&pgproto3.Query{String: "select plan from nowhere"})
+			h.serverGets(&pgproto3.Query{String: explainPrefix + "select plan from nowhere"})
+			h.reply(postgresError, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+		},
+		"bind": func(h *harness) {
+			parse := &pgproto3.Parse{Name: "s1", Query: "select plan from nowhere"}
+			h.send(parse, &pgproto3.Bind{PreparedStatement: "s1"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+			h.serverGets(append([]encoder{parse}, explainBind(explainPrefix+parse.Query, nil, nil, nil)...)...)
+			h.reply(&pgproto3.ParseComplete{}, &pgproto3.CloseComplete{}, &pgproto3.ParseComplete{}, postgresError)
+			h.serverGets(&pgproto3.Sync{})
+			h.reply(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := make(chan Finished, 10)
+			h := startWith(t, Options{Check: fakeChecker{}, Record: func(f Finished) { rec <- f }, Login: loginReporting})
+
+			run(h)
+
+			if f := expectFinished(t, rec); f.SQL != "select plan from nowhere" || f.Code != postgresError.Code || !f.NotRun || f.Rejected {
+				t.Errorf("recorded %+v; want Postgres's error for the statement, which never ran", f)
+			}
+		})
 	}
 }

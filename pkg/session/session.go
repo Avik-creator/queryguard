@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -104,6 +105,19 @@ type Options struct {
 	Cancel func()                                                                          // asks Postgres to cancel what the server connection runs; nil can't
 	// Interrupt gets, as Relay starts, a func that cancels what the session runs with i as the reason, reporting whether it ran anything.
 	Interrupt func(interrupt func(i Interruption) bool)
+	// Record gets each statement once it is answered; it runs with the session's lock held, so it must not block. nil records nothing.
+	Record func(Finished)
+}
+
+// Finished is a statement Postgres, or the proxy, has answered.
+type Finished struct {
+	SQL      string        // its Query or Parse text
+	Took     time.Duration // from when it went to Postgres to its answer; 0 when it shared a Sync with another, so has no time of its own
+	Rows     int64         // from its CommandCompletes
+	Code     string        // its error's SQLSTATE; "" when it succeeded
+	Message  string        // its error's text
+	Rejected bool          // the proxy refused it
+	NotRun   bool          // it failed at Parse or Bind, before running
 }
 
 // Interruption is why the proxy cancelled a statement: the client gets Postgres's cancel error with these fields in its place.
@@ -127,6 +141,7 @@ func Relay(client, server net.Conn, opts Options) error {
 	login := opts.Login
 	s := &session{
 		check:      opts.Check,
+		record:     opts.Record,
 		cancel:     opts.Cancel,
 		client:     client,
 		clientIn:   bufio.NewReaderSize(client, bufSize),
@@ -227,6 +242,11 @@ type session struct {
 	inBatch    bool                      // extended-protocol messages went to the server since the last Sync
 	discard    untilSync                 // what to do with client messages after a rejected Parse
 	statements map[string]statement      // prepared statements with a cost check, by name
+	record     func(Finished)            // from Options
+	text       string                    // the statement text of the client message being handled, when recording
+	rejecting  bool                      // the message being sent is the proxy's rejection of text
+	texts      map[string]string         // every prepared statement's text, by name, when recording
+	portals    map[string]string         // the text of each portal's statement, by portal name, when recording
 	ran        func(time.Duration, bool) // from the last admission, for the message that runs its statement
 	ranOn      byte                      // that message: Q for a simple query, E for a bound statement
 	ranPortal  string                    // the portal an E must name to run it
@@ -234,11 +254,28 @@ type session struct {
 
 // sent is a message the server will answer.
 type sent struct {
-	typ    byte
-	how    answer
-	ran    func(time.Duration, bool) // reports how the statement it runs went, if anyone asked
-	start  time.Time                 // when it went to the server, if ran is set and nothing ran ahead of it
-	failed bool                      // Postgres answered with an error
+	typ      byte
+	how      answer
+	ran      func(time.Duration, bool) // reports how the statement it runs went, if anyone asked
+	start    time.Time                 // when it went to the server, if it is timed and nothing ran ahead of it
+	failed   bool                      // Postgres answered with an error
+	sql      string                    // the statement it belongs to, when recording
+	rejected bool                      // it is the proxy's rejection of sql
+	reply    reply                     // what Postgres's answers to it said so far
+}
+
+// reply is what a recorded message's answers said.
+type reply struct {
+	rows          int64
+	code, message string
+}
+
+// add takes in one more answer.
+func (r *reply) add(more reply) {
+	r.rows += more.rows
+	if r.code == "" {
+		r.code, r.message = more.code, more.message
+	}
 }
 
 // answer says where the server's answers to a message go.
@@ -296,6 +333,51 @@ func (s *session) awaitLogin() error {
 	return nil
 }
 
+// recordRefused records the error Postgres gave the cost check's EXPLAIN as the statement's own, since it would have failed the same way.
+func (s *session) recordRefused(refused *pgproto3.ErrorResponse) {
+	if s.record != nil && s.text != "" {
+		s.record(Finished{SQL: s.text, Code: refused.Code, Message: refused.Message, NotRun: true})
+	}
+}
+
+// noteText sets text to the statement a Bind or Execute uses, and keeps track of which statement each portal runs.
+func (s *session) noteText(typ byte, n int) {
+	s.text = ""
+	if !strings.ContainsRune("BEC", rune(typ)) {
+		return
+	}
+	body, err := s.clientIn.Peek(min(n, bufSize))
+	if err != nil {
+		return
+	}
+	switch typ {
+	case 'B':
+		portal, rest, ok := bytes.Cut(body, []byte{0})
+		name, _, ok2 := bytes.Cut(rest, []byte{0})
+		if !ok || !ok2 {
+			return
+		}
+		if s.portals == nil {
+			s.portals = map[string]string{}
+		}
+		s.text = s.texts[string(name)]
+		s.portals[string(portal)] = s.text
+	case 'E':
+		portal, _, _ := bytes.Cut(body, []byte{0})
+		s.text = s.portals[string(portal)]
+	case 'C':
+		if len(body) == 0 {
+			return
+		}
+		name, _, _ := bytes.Cut(body[1:], []byte{0})
+		if body[0] == 'S' {
+			delete(s.texts, string(name))
+		} else {
+			delete(s.portals, string(name))
+		}
+	}
+}
+
 // fromClient relays client messages to the server, checking each Query and Parse.
 func (s *session) fromClient() error {
 	for {
@@ -310,16 +392,21 @@ func (s *session) fromClient() error {
 			return err
 		}
 		s.clientSent()
+		if s.record != nil {
+			s.noteText(typ, n)
+		}
 		switch {
 		case s.discard != relayAll:
 			err = s.dropUntilSync(typ, n)
-		case (typ == 'Q' || typ == 'P') && s.check != nil:
-			// The client gets ReadyForQuery before loggedIn runs; waiting keeps a quick first query from seeing status 0.
-			if err := s.awaitLogin(); err != nil {
-				return err
-			}
-			if s.loginErr != nil {
-				return s.loginErr
+		case (typ == 'Q' || typ == 'P') && (s.check != nil || s.record != nil):
+			if s.check != nil {
+				// The client gets ReadyForQuery before loggedIn runs; waiting keeps a quick first query from seeing status 0.
+				if err := s.awaitLogin(); err != nil {
+					return err
+				}
+				if s.loginErr != nil {
+					return s.loginErr
+				}
 			}
 			err = s.checkStatement(typ, n)
 		case typ == 'B' && len(s.statements) > 0:
@@ -341,11 +428,15 @@ func (s *session) fromClient() error {
 func (s *session) checkStatement(typ byte, n int) error {
 	if n > maxCheckedLen {
 		if typ == 'P' {
-			// The statement replaces any of the same name, unchecked.
+			// The statement replaces any of the same name, unchecked and unrecorded.
 			if head, err := s.clientIn.Peek(bufSize); err == nil {
 				name, _, _ := bytes.Cut(head, []byte{0})
 				delete(s.statements, string(name))
+				delete(s.texts, string(name))
 			}
+		}
+		if s.check == nil {
+			return s.forward(typ, n)
 		}
 		if rej := s.check.CheckTooLong(n); rej != nil {
 			if _, err := s.clientIn.Discard(n); err != nil {
@@ -360,7 +451,18 @@ func (s *session) checkStatement(typ byte, n int) error {
 		return unexpected(err)
 	}
 	// A malformed message goes on unchanged, for Postgres to refuse.
-	if sql, ok := statementText(typ, body); ok {
+	sql, ok := statementText(typ, body)
+	if ok && s.record != nil {
+		s.text = sql
+		if typ == 'P' {
+			name, _, _ := bytes.Cut(body, []byte{0})
+			if s.texts == nil {
+				s.texts = map[string]string{}
+			}
+			s.texts[string(name)] = sql
+		}
+	}
+	if ok && s.check != nil {
 		set := s.settings()
 		rej, gate := s.check.Check(sql, set)
 		switch {
@@ -445,6 +547,7 @@ func (s *session) checkQueryCost(sql string, gate Gate) (handled bool, err error
 		return true, err
 	case refused != nil:
 		// The query would have failed the same way; Postgres's ReadyForQuery went with the EXPLAIN, so the proxy sends one.
+		s.recordRefused(refused)
 		return true, s.toClient(refused, &pgproto3.ReadyForQuery{TxStatus: s.statusNow()})
 	case rej != nil:
 		return true, s.reject('Q', rej)
@@ -531,6 +634,7 @@ func (s *session) checkBind(n int) error {
 		}
 		// Postgres now skips to Sync, as it would after the client's own Bind failed.
 		s.discard = forwardSync
+		s.recordRefused(refused)
 		return s.toClient(refused)
 	}
 	if body == nil {
@@ -859,9 +963,14 @@ func (s *session) forward(typ byte, n int) error {
 
 // reject answers a rejected Query or Parse itself when nothing is in flight, and otherwise makes Postgres raise the error.
 func (s *session) reject(typ byte, rej *pgproto3.ErrorResponse) error {
+	s.rejecting = true
+	defer func() { s.rejecting = false }()
 	s.mu.Lock()
 	if s.status == 'I' && len(s.pending) == 0 && !s.inBatch {
 		defer s.mu.Unlock()
+		if s.record != nil && s.text != "" {
+			s.record(Finished{SQL: s.text, Code: rej.Code, Message: rej.Message, Rejected: true, NotRun: typ == 'P'})
+		}
 		buf, err := rej.Encode(nil)
 		if err != nil {
 			return err
@@ -934,6 +1043,10 @@ func (s *session) track(typ byte, how answer) {
 	if typ == s.ranOn && how == relayed {
 		m.ran = s.ran
 	}
+	// The proxy's rejection through Postgres runs as a hidden Execute, which is what answers for the rejected statement.
+	if s.record != nil && strings.ContainsRune("QPBE", rune(typ)) && (how == relayed || (how == hidden && typ == 'E')) {
+		m.sql, m.rejected = s.text, s.rejecting
+	}
 	if typ == s.ranOn || typ == 'S' {
 		// A statement bound but never executed before Sync reports nothing.
 		s.ran = nil
@@ -946,7 +1059,8 @@ func (s *session) track(typ byte, how answer) {
 		return
 	}
 	// Postgres sends a pipeline's answers together at Sync, so a statement behind another running one can't be timed on its own.
-	if m.ran != nil && !slices.ContainsFunc(s.pending, func(p sent) bool { return p.typ == 'Q' || p.typ == 'E' }) {
+	timed := m.ran != nil || (m.sql != "" && (typ == 'Q' || typ == 'E'))
+	if timed && !slices.ContainsFunc(s.pending, func(p sent) bool { return p.typ == 'Q' || p.typ == 'E' }) {
 		m.start = time.Now()
 	}
 	s.pending = append(s.pending, m)
@@ -1001,7 +1115,13 @@ func (s *session) relayAnswer(typ byte, n int) error {
 			s.report(string(name), string(value))
 		}
 	}
-	switch how := s.answered(typ); {
+	var r reply
+	if s.record != nil && (typ == 'C' || typ == 'E') && n <= bufSize {
+		if body, err := s.serverIn.Peek(n); err == nil {
+			r = readReply(typ, body)
+		}
+	}
+	switch how := s.answered(typ, r); {
 	case how == captured:
 		return s.capture(typ, n)
 	case how == hidden && typ != 'E':
@@ -1069,7 +1189,7 @@ func (s *session) endExplaining() {
 }
 
 // answered matches a server message to the oldest pending message and returns where it goes.
-func (s *session) answered(typ byte) answer {
+func (s *session) answered(typ byte, r reply) answer {
 	// Notices, parameter changes and notifications can arrive at any time.
 	if len(s.pending) == 0 || typ == 'N' || typ == 'S' || typ == 'A' {
 		return relayed
@@ -1078,17 +1198,22 @@ func (s *session) answered(typ byte) answer {
 	if !finishes(head.typ, typ) {
 		// A simple query's error comes before its ReadyForQuery.
 		s.pending[0].failed = s.pending[0].failed || typ == 'E'
+		s.pending[0].reply.add(r)
 		return head.how
 	}
 	s.pending = s.pending[1:]
+	head.reply.add(r)
+	var took time.Duration
+	// A pipeline's answers all arrive at its Sync, so a statement sharing one has no time of its own.
+	if !head.start.IsZero() && !(head.typ == 'E' && executesBeforeSync(s.pending)) {
+		took = time.Since(head.start)
+	}
 	// A suspended portal or an empty query ran nothing that says how its plan does.
 	if head.ran != nil && typ != 's' && typ != 'I' {
-		var took time.Duration
-		// A pipeline's answers all arrive at its Sync, so a statement sharing one has no time of its own.
-		if !head.start.IsZero() && !(head.typ == 'E' && executesBeforeSync(s.pending)) {
-			took = time.Since(head.start)
-		}
 		head.ran(took, !head.failed && typ != 'E')
+	}
+	if head.sql != "" && s.record != nil {
+		s.recordAnswer(head, typ, took)
 	}
 	// Each statement of a pipeline gets the whole timeout from when the one before it ends.
 	if (head.typ == 'Q' || head.typ == 'E') && s.stmtTimer != nil && len(s.pending) > 0 {
@@ -1104,6 +1229,63 @@ func (s *session) answered(typ byte) answer {
 		}
 	}
 	return head.how
+}
+
+// recordAnswer records the statement head belongs to, now answered by a message of type typ; the caller holds mu.
+func (s *session) recordAnswer(head sent, typ byte, took time.Duration) {
+	f := Finished{SQL: head.sql, Took: took, Rows: head.reply.rows, Code: head.reply.code, Message: head.reply.message, Rejected: head.rejected}
+	switch head.typ {
+	case 'Q', 'E':
+		// A suspended portal runs on at the next Execute, and an empty query runs nothing.
+		if typ == 's' || typ == 'I' {
+			return
+		}
+	case 'P', 'B':
+		if typ != 'E' {
+			return
+		}
+		f.Took, f.NotRun = 0, true
+	default:
+		return
+	}
+	s.record(f)
+}
+
+// readReply reads the rows of a CommandComplete or the code and text of an ErrorResponse.
+func readReply(typ byte, body []byte) reply {
+	var r reply
+	if typ == 'C' {
+		tag, _, _ := bytes.Cut(body, []byte{0})
+		r.rows = rowsOf(string(tag))
+		return r
+	}
+	for len(body) > 1 {
+		field := body[0]
+		value, rest, ok := bytes.Cut(body[1:], []byte{0})
+		if !ok {
+			break
+		}
+		switch field {
+		case 'C':
+			r.code = string(value)
+		case 'M':
+			r.message = string(value)
+		}
+		body = rest
+	}
+	return r
+}
+
+// rowsOf returns the rows a command tag such as "INSERT 0 3" or "SELECT 5" counts; 0 for a command that counts none.
+func rowsOf(tag string) int64 {
+	verb, _, _ := strings.Cut(tag, " ")
+	switch verb {
+	case "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "FETCH", "MOVE", "COPY":
+		_, count, _ := strings.CutLast(tag, " ")
+		n, _ := strconv.ParseInt(count, 10, 64)
+		return n
+	}
+	return 0
 }
 
 // executesBeforeSync reports whether pending holds a statement to run before its next Sync.
