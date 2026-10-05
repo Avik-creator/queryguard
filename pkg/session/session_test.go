@@ -257,6 +257,34 @@ func TestExplainsBindWithItsValues(t *testing.T) {
 	h.clientGets(&pgproto3.ParseComplete{})
 }
 
+func TestTellsCheckerWhichValuesWereBound(t *testing.T) {
+	values := make(chan string, 10)
+	h := start(t, fakeChecker{values: values})
+	parse := &pgproto3.Parse{Name: "s1", Query: "select plan where id = $1"}
+	h.send(parse)
+	h.serverGets(parse)
+	h.reply(&pgproto3.ParseComplete{})
+	h.clientGets(&pgproto3.ParseComplete{})
+
+	var got []string
+	for _, v := range []string{"7", "8", "7"} {
+		bind := &pgproto3.Bind{PreparedStatement: "s1", Parameters: [][]byte{[]byte(v)}}
+		h.send(bind, &pgproto3.Execute{}, &pgproto3.Sync{})
+		h.serverGets(explainBind(explainPrefix+parse.Query, nil, nil, [][]byte{[]byte(v)})...)
+		h.reply(&pgproto3.CloseComplete{}, &pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, plan("small"),
+			&pgproto3.CommandComplete{CommandTag: []byte("EXPLAIN")}, &pgproto3.CloseComplete{})
+		h.serverGets(bind, &pgproto3.Execute{}, &pgproto3.Sync{})
+		h.reply(&pgproto3.BindComplete{}, &pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+		h.clientGets(&pgproto3.BindComplete{}, &pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+		got = append(got, <-values)
+	}
+
+	// The checker keys plans by the values, so the same values must give the same digest and other values another.
+	if got[0] == "" || got[0] == got[1] || got[0] != got[2] {
+		t.Errorf("values digests %q; want the first and last equal, the middle different, none empty", got)
+	}
+}
+
 func TestRejectsBindByItsPlanThroughPostgres(t *testing.T) {
 	h := start(t, fakeChecker{})
 	parse := &pgproto3.Parse{Name: "s1", Query: "select plan"}
@@ -698,6 +726,7 @@ type fakeChecker struct {
 	allowTooLong bool
 	seen         chan<- Settings // gets the settings of each checked statement, when set
 	generic      chan<- bool     // gets whether each plan explained was generic, when set
+	values       chan<- string   // gets the values digest of each plan explained, when set
 	admit        *admitter       // admits "slot" statements, when set
 }
 
@@ -756,6 +785,9 @@ func (c fakeChecker) Check(sql string, set Settings) (*pgproto3.ErrorResponse, G
 		out, _ := e.Run()
 		if c.generic != nil {
 			c.generic <- e.Generic
+		}
+		if c.values != nil {
+			c.values <- e.Values
 		}
 		if strings.Contains(out, "big") {
 			return Admission{Reject: tooCostly}

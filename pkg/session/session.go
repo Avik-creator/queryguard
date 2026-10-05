@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -69,6 +70,7 @@ type Admission struct {
 // Explain gets the plan of the statement about to run.
 type Explain struct {
 	Generic bool                   // the plan for any parameter values, used when the bound values are too large to send twice
+	Values  string                 // a digest of the bound values, which can change the plan; "" for a simple query, whose values are in its text
 	Run     func() (string, error) // EXPLAIN (FORMAT JSON, VERBOSE)'s output, or ErrNoPlan
 }
 
@@ -435,6 +437,7 @@ func (s *session) checkBind(n int) error {
 	}
 
 	var body []byte
+	var values string
 	prefix, bind := explainPrefix, &pgproto3.Bind{DestinationPortal: explainName, PreparedStatement: explainName}
 	if n <= maxReplayed {
 		body = make([]byte, n)
@@ -447,6 +450,10 @@ func (s *session) checkBind(n int) error {
 			return s.send('B', body)
 		}
 		bind.ParameterFormatCodes, bind.Parameters = b.ParameterFormatCodes, b.Parameters
+		// What follows the portal and statement names is the formats and values.
+		_, formats, _ := bytes.Cut(body[len(portal)+1:], []byte{0})
+		digest := sha256.Sum256(formats)
+		values = string(digest[:])
 	} else {
 		count, ok := paramCount(rest)
 		if !ok {
@@ -457,7 +464,7 @@ func (s *session) checkBind(n int) error {
 	}
 
 	var refused *pgproto3.ErrorResponse
-	rej := s.admit(st.gate, 'E', Explain{Generic: prefix == genericPrefix, Run: func() (string, error) {
+	rej := s.admit(st.gate, 'E', Explain{Generic: prefix == genericPrefix, Values: values, Run: func() (string, error) {
 		var out string
 		out, refused, err = s.explain(len(prefix),
 			&pgproto3.Close{ObjectType: 'S', Name: explainName},

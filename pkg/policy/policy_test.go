@@ -307,27 +307,44 @@ func TestCostRejectionCarriesNumbersNotNames(t *testing.T) {
 }
 
 func TestCostCheckUsesCachedPlans(t *testing.T) {
-	c := costChecker(t, costRules, nil, discard)
-	runs := 0
-	for _, sql := range []string{"select * from orders where id = 1", "select * from orders where id = 2"} {
-		_, cost := c.Check(sql, standard)
-		costOf(cost, session.Explain{Run: func() (string, error) {
-			runs++
-			return `[{"Plan": {"Node Type": "Index Scan", "Total Cost": 8}}]`, nil
-		}})
-	}
-	_, cost := c.Check("select * from orders where id = 3", standard)
-	costOf(cost, session.Explain{Generic: true, Run: func() (string, error) {
-		runs++
-		return `[{"Plan": {"Node Type": "Index Scan", "Total Cost": 8}}]`, nil
-	}})
+	for config, want := range map[string]plan.Stats{
+		// Enforced cost rules judge each statement's own values, so only the same text hits the cache.
+		costRules: {Hits: 1, Misses: 3},
+		// Rules that only log share one plan across values, as budgets do.
+		`{"rules": [{"check": "max_cost", "cost": 1000, "mode": "warn"}]}`: {Hits: 2, Misses: 2},
+	} {
+		c := costChecker(t, config, nil, discard)
+		for _, sql := range []string{"select * from orders where id = 1", "select * from orders where id = 1", "select * from orders where id = 2"} {
+			_, cost := c.Check(sql, standard)
+			costOf(cost, costing(8))
+		}
+		// A generic plan is a different plan.
+		_, cost := c.Check("select * from orders where id = 3", standard)
+		costOf(cost, session.Explain{Generic: true, Run: costing(8).Run})
 
-	// The same statement with other constants hits the cache; a generic plan is a different plan.
-	if runs != 2 {
-		t.Errorf("explained %d times; want 2", runs)
+		if s := c.Env.Plans.Stats(); s.Hits != want.Hits || s.Misses != want.Misses {
+			t.Errorf("%s: cache stats %+v; want %d hits, %d misses", config, s, want.Hits, want.Misses)
+		}
 	}
-	if s := c.Env.Plans.Stats(); s.Hits != 1 || s.Misses != 2 {
-		t.Errorf("cache stats %+v; want 1 hit, 2 misses", s)
+}
+
+func TestEnforcedCostRulesJudgeEachValuesOwnPlan(t *testing.T) {
+	c := costChecker(t, costRules, nil, discard)
+	// A rare status gets an index lookup; a common one, with the same fingerprint, reads most of the table.
+	if got := costOf(gateOf(t, c, "select * from orders where status = 'rare'"), costing(8)); got != nil {
+		t.Fatalf("cheap statement got %v", got)
+	}
+	if got := costOf(gateOf(t, c, "select * from orders where status = 'common'"), costing(5000)); ruleOf(got) != "max_cost" {
+		t.Errorf("costly value after a cheap one got %v; want max_cost", got)
+	}
+
+	// The same goes for a prepared statement's bound values.
+	const bound = "select * from orders where status = $1"
+	if got := costOf(gateOf(t, c, bound), session.Explain{Values: "rare", Run: costing(8).Run}); got != nil {
+		t.Fatalf("cheap bound value got %v", got)
+	}
+	if got := costOf(gateOf(t, c, bound), session.Explain{Values: "common", Run: costing(5000).Run}); ruleOf(got) != "max_cost" {
+		t.Errorf("costly bound value after a cheap one got %v; want max_cost", got)
 	}
 }
 
@@ -794,6 +811,16 @@ func pass(t *testing.T, c *Checker, sql string, explain session.Explain, running
 		t.Fatalf("Check(%q) = %v and gate %v; want a gate", sql, rej, gate != nil)
 	}
 	return gate(t.Context(), explain, running)
+}
+
+// gateOf checks sql and returns its gate, failing the test when it is rejected or has none.
+func gateOf(t *testing.T, c *Checker, sql string) session.Gate {
+	t.Helper()
+	rej, gate := c.Check(sql, standard)
+	if rej != nil || gate == nil {
+		t.Fatalf("Check(%q) = %v and gate %v; want a gate", sql, rej, gate != nil)
+	}
+	return gate
 }
 
 // costing explains any statement as an index scan of the given cost.

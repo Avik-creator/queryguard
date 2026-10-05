@@ -4,6 +4,7 @@ package policy
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
@@ -589,6 +590,11 @@ func (c *Checker) gate(p *Policy, sql string, q sqlparse.Query, who subject) ses
 func (c *Checker) plan(p *Policy, sql, fingerprint string, who subject, warn bool, e session.Explain) (_ plan.Plan, rej *pgproto3.ErrorResponse, ok bool) {
 	// A generic plan holds for any values.
 	key := c.statementKey(fingerprint) + "\x00" + strconv.FormatBool(e.Generic)
+	if !e.Generic && p.enforcesCost(who, warn) {
+		// Values change the plan, so a cheap plan cached for one value must not pass another; logging and budgets can share one.
+		h := sha256.Sum256([]byte(sql))
+		key += "\x00" + string(h[:]) + e.Values
+	}
 	pl, err := c.plans().Get(key, func() (plan.Plan, error) {
 		out, err := e.Run()
 		if err != nil {
@@ -620,6 +626,19 @@ func (c *Checker) plan(p *Policy, sql, fingerprint string, who subject, warn boo
 	why := checks[blocked.Check].overBy(pl, rows, *blocked)
 	return pl, rejection("54000", "queryguard: rule "+blocked.Check+" blocks this statement",
 		"Statement fingerprint "+fingerprint+". "+why, checks[blocked.Check].hint), true
+}
+
+// enforcesCost reports whether a cost rule that blocks applies to who.
+func (p *Policy) enforcesCost(who subject, warn bool) bool {
+	if warn {
+		return false
+	}
+	for i, r := range p.cfg.Rules {
+		if checks[r.Check].overBy != nil && r.Mode != Warn && p.matches(i, who) {
+			return true
+		}
+	}
+	return false
 }
 
 // learn looks pl up in its statement's history; it returns the cost to charge, whether to run it in the slow lane, and what to record once it ran.

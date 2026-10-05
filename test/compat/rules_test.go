@@ -172,6 +172,20 @@ func TestPgxCostRules(t *testing.T) {
 	}
 }
 
+func TestCostRulesJudgeEachValue(t *testing.T) {
+	conn := startCostProxy(t, nil).connect(t, "sslmode=disable")
+	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeCacheStatement, pgx.QueryExecModeExec, pgx.QueryExecModeSimpleProtocol} {
+		// Few orders are pending, read through a small partial index; most are delivered, which reads the whole table.
+		if _, err := conn.Exec(t.Context(), "select count(*) from orders where status = $1", mode, "pending"); err != nil {
+			t.Fatalf("%s: rare status failed: %v", mode, err)
+		}
+		_, err := conn.Exec(t.Context(), "select count(*) from orders where status = $1", mode, "delivered")
+		if sqlState(err) != "54000" {
+			t.Errorf("%s: common status after a rare one got %v; want 54000 from its own plan", mode, err)
+		}
+	}
+}
+
 func TestCostCheckPassesOnPostgresErrors(t *testing.T) {
 	conn := startCostProxy(t, nil).connect(t, "sslmode=disable")
 	direct := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
@@ -216,9 +230,10 @@ func TestPlanCacheServesRepeatedStatements(t *testing.T) {
 		s = srv
 	}).connect(t, "sslmode=disable")
 
-	for id := range 5 {
+	// Cost rules that block judge each value's own plan, so only a repeated value hits the cache.
+	for range 5 {
 		var got int64
-		if err := conn.QueryRow(t.Context(), "select id from orders where id = $1", id+1).Scan(&got); err != nil {
+		if err := conn.QueryRow(t.Context(), "select id from orders where id = $1", 7).Scan(&got); err != nil {
 			t.Fatal(err)
 		}
 	}

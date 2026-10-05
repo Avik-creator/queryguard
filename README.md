@@ -168,10 +168,14 @@ How QueryGuard gets the plan:
   what they were at `Parse`, since `EXPLAIN` reads its text again.
 - A statement that rules rewrite into several queries has a plan for each;
   their costs and full reads add up.
-- Plans are cached for a minute by database, role and statement fingerprint,
-  so a statement run again with other values isn't explained again. Every
-  minute QueryGuard logs the cache's hit rate and the average time spent
-  explaining, which is the latency the cost check adds.
+- Plans are cached for a minute by database, role and statement. While a
+  cost rule that blocks applies, the cache key includes the statement's
+  values, since a selective value and a common one get very different plans:
+  only the same statement with the same values skips `EXPLAIN`. Rules in
+  `warn` mode and budgets share one plan across values, keyed by the
+  statement's fingerprint. Every minute QueryGuard logs the cache's hit rate
+  and the average time spent explaining, which is the latency the cost check
+  adds.
 - If PostgreSQL refuses the `EXPLAIN`, say because a column doesn't exist, the
   client gets that error as its statement's answer, since the statement would
   have failed the same way. Inside a transaction this fails the transaction,
