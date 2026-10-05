@@ -83,8 +83,9 @@ type Server struct {
 	policies policy.Holder
 	starting atomic.Int64 // connections that have yet to send their startup message
 
-	mu    sync.Mutex
-	sched *sched.Scheduler // made with the first policy and reconfigured by each one after
+	mu      sync.Mutex
+	sched   *sched.Scheduler // made with the first policy and reconfigured by each one after
+	serving context.Context  // Serve's context, which ends the scheduler's loop; nil before Serve
 }
 
 // Serve accepts on ln until ctx is cancelled, then drains sessions for up to ShutdownTimeout.
@@ -102,6 +103,12 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	if s.Policy != nil && s.policies.Load() == nil {
 		s.SetPolicy(s.Policy)
 	}
+	s.mu.Lock()
+	s.serving = ctx
+	if s.sched != nil {
+		go s.sched.Run(ctx)
+	}
+	s.mu.Unlock()
 	if s.ActivePolicy() != nil {
 		go s.logPlanStats(ctx, log, time.Tick(planStatsInterval))
 	}
@@ -368,6 +375,9 @@ func (s *Server) SetPolicy(p *policy.Policy) {
 	defer s.mu.Unlock()
 	if s.sched == nil {
 		s.sched = sched.New(p.SchedConfig())
+		if s.serving != nil {
+			go s.sched.Run(s.serving)
+		}
 	} else {
 		s.sched.Configure(p.SchedConfig())
 	}

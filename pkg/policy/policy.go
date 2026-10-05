@@ -29,6 +29,12 @@ import (
 // defaultTenantTag is the sqlcommenter key that names a statement's tenant.
 const defaultTenantTag = "tenant"
 
+// priorityTag is the sqlcommenter key that sets a statement's priority.
+const priorityTag = "priority"
+
+// priorities are the names of sched's priorities; a tenant that names none is normal.
+var priorities = map[string]sched.Priority{"critical": sched.Critical, "normal": sched.Normal, "best_effort": sched.BestEffort}
+
 // Config is the JSON policy file.
 type Config struct {
 	// Unchecked is "reject" (the default) to block statements QueryGuard can't check, or "allow" to let them run.
@@ -67,6 +73,7 @@ type Match struct {
 // Tenant holds the settings for one tenant.
 type Tenant struct {
 	Mode                     Mode     `json:"mode"`                        // warn turns every rejection for this tenant into a log line
+	Priority                 string   `json:"priority"`                    // critical, normal (the default) or best_effort, shed first under overload
 	MaxConnections           int      `json:"max_connections"`             // for a role; 0 keeps tenant_max_connections
 	Budget                   *Budget  `json:"budget"`                      // nil keeps tenant_defaults' budget
 	StatementTimeout         Duration `json:"statement_timeout"`           // the proxy cancels statements running longer; 0 means no limit
@@ -84,9 +91,18 @@ type Budget struct {
 
 // Scheduler sets the lanes statements run in.
 type Scheduler struct {
-	MaxActive    int      `json:"max_active"`    // statements running at once; 0 means no limit
-	QueueTimeout Duration `json:"queue_timeout"` // the longest a statement waits for its budget or a slot; 0 means 5s
-	SlowLane     Lane     `json:"slow_lane"`
+	MaxActive    int       `json:"max_active"`    // statements running at once; 0 means no limit
+	QueueTimeout Duration  `json:"queue_timeout"` // the longest a statement waits for its budget or a slot; 0 means 5s
+	SlowLane     Lane      `json:"slow_lane"`
+	Adaptive     *Adaptive `json:"adaptive"` // moves the limit between a floor and max_active by how the server copes; nil keeps max_active
+}
+
+// Adaptive sets the AIMD limiter; see sched.AIMD.
+type Adaptive struct {
+	Floor         int     `json:"floor"`           // the lowest limit; 0 means 1
+	Backoff       float64 `json:"backoff"`         // what the limit is multiplied by when overloaded; 0 means 0.9
+	MaxSlowdown   float64 `json:"max_slowdown"`    // how many times slower than usual statements run before that is overload; 0 means 2
+	LockWaitShare float64 `json:"lock_wait_share"` // the share of the limit waiting on locks that is overload; 0 means 0.25
 }
 
 // Lane is the slow lane's size and patience.
@@ -239,6 +255,23 @@ func (p *Policy) compile() error {
 	if s.MaxActive < 0 || s.SlowLane.MaxActive < 0 || s.QueueTimeout < 0 || s.SlowLane.QueueTimeout < 0 {
 		errs = append(errs, errors.New("scheduler: max_active and queue_timeout must not be negative"))
 	}
+	if a := s.Adaptive; a != nil {
+		switch {
+		case s.MaxActive == 0:
+			errs = append(errs, errors.New("scheduler: adaptive needs max_active, the most the limit grows to"))
+		case a.Floor < 0 || a.Floor > s.MaxActive:
+			errs = append(errs, errors.New("scheduler: adaptive floor must be between 0 and max_active"))
+		}
+		if a.Backoff < 0 || a.Backoff >= 1 {
+			errs = append(errs, errors.New("scheduler: adaptive backoff must be at least 0 and under 1"))
+		}
+		if a.MaxSlowdown != 0 && a.MaxSlowdown <= 1 {
+			errs = append(errs, errors.New("scheduler: adaptive max_slowdown must be over 1"))
+		}
+		if a.LockWaitShare < 0 {
+			errs = append(errs, errors.New("scheduler: adaptive lock_wait_share must not be negative"))
+		}
+	}
 	seen := map[string]bool{}
 	for _, r := range c.Rules {
 		switch {
@@ -308,6 +341,9 @@ func (t Tenant) validate(name string) error {
 	if t.StatementTimeout < 0 || t.IdleInTransactionTimeout < 0 {
 		errs = append(errs, fmt.Errorf("%s: statement_timeout and idle_in_transaction_timeout must not be negative", name))
 	}
+	if _, ok := priorities[t.Priority]; t.Priority != "" && !ok {
+		errs = append(errs, fmt.Errorf("%s: priority %q: want critical, normal or best_effort", name, t.Priority))
+	}
 	if b := t.Budget; b != nil {
 		if b.Rate < 0 || b.Burst < 0 || b.Share < 0 || b.MinCharge < 0 {
 			errs = append(errs, fmt.Errorf("%s: budget rate, burst, share and min_charge must not be negative", name))
@@ -371,6 +407,9 @@ func (p *Policy) SchedConfig() sched.Config {
 			cfg.Budgets[name] = t.Budget.sched()
 		}
 	}
+	if a := s.Adaptive; a != nil {
+		cfg.Controller = sched.AIMD{Floor: a.Floor, Backoff: a.Backoff, MaxSlowdown: a.MaxSlowdown, LockWaitShare: a.LockWaitShare}
+	}
 	return cfg
 }
 
@@ -390,6 +429,7 @@ func (p *Policy) tuning() plan.Tuning {
 func (p *Policy) tenant(name string) Tenant {
 	t, d := p.cfg.Tenants[name], p.cfg.TenantDefaults
 	t.Budget = cmp.Or(t.Budget, d.Budget)
+	t.Priority = cmp.Or(t.Priority, d.Priority)
 	t.StatementTimeout = cmp.Or(t.StatementTimeout, d.StatementTimeout)
 	t.IdleInTransactionTimeout = cmp.Or(t.IdleInTransactionTimeout, d.IdleInTransactionTimeout)
 	return t
@@ -447,6 +487,16 @@ type subject struct {
 	client            netip.Addr
 	tags              map[string]string
 	trusted           bool // the role is trusted to tag its statements
+}
+
+// priority returns the priority of who's statement: its tenant's, or its tag's when the role is trusted or the tag lowers it.
+func (p *Policy) priority(who subject) sched.Priority {
+	prio := priorities[p.tenant(who.tenant).Priority]
+	// Anyone may put their own statements behind others, but only a trusted role may put them ahead.
+	if tag, ok := priorities[who.tags[priorityTag]]; ok && (who.trusted || tag < prio) {
+		prio = tag
+	}
+	return prio
 }
 
 // trusted reports whether role's tags can be believed: they name its statements' tenant and narrow rules.
@@ -577,10 +627,14 @@ func (c *Checker) gate(p *Policy, sql string, q sqlparse.Query, who subject) ses
 			lane = sched.Slow
 		}
 		if !running {
-			release, err := s.Acquire(ctx, who.tenant, lane, sched.Normal)
+			release, err := s.Acquire(ctx, who.tenant, lane, p.priority(who))
 			switch {
 			case err != nil && warn:
 				c.log.Warn("would reject statement", "rule", "busy", "tenant", who.tenant, "lane", lane)
+			case errors.Is(err, sched.ErrShed):
+				s.Refund(who.tenant, cost)
+				c.log.Warn("rejected statement", "rule", "overload", "tenant", who.tenant, "err", err)
+				return session.Admission{Reject: shed()}
 			case err != nil:
 				s.Refund(who.tenant, cost)
 				c.log.Warn("rejected statement", "rule", "busy", "tenant", who.tenant, "lane", lane, "err", err)
@@ -667,6 +721,9 @@ func (c *Checker) learn(p *Policy, sql, fingerprint string, who subject, warn bo
 		}
 	}
 	return cost, slow, func(took time.Duration, finished bool) {
+		if s := c.Env.Scheduler; s != nil && finished && took > 0 && v.Usual > 0 {
+			s.Finished(float64(took) / float64(v.Usual))
+		}
 		if !history.Ran(key, pl, took, finished, tune) {
 			return
 		}
@@ -810,6 +867,12 @@ func busy(p *Policy, lane sched.LaneID) *pgproto3.ErrorResponse {
 	}
 	return rejection("53000", "queryguard: too busy to run the statement",
 		fmt.Sprintf("No slot in the %s lane came free within %s.", lane, wait), "Retry later.")
+}
+
+// shed is the error for a best-effort statement turned away while the server is overloaded.
+func shed() *pgproto3.ErrorResponse {
+	return rejection("53000", "queryguard: server overloaded; best-effort statements are shed",
+		"The server is overloaded, so statements of best_effort priority run only when a slot is free.", "Retry later.")
 }
 
 // sameBytes are the client encodings Postgres reads without converting, so its parser sees the bytes QueryGuard's does.

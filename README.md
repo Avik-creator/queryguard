@@ -13,8 +13,6 @@ starve everyone else.
 
 ## Planned features
 
-- The number of statements running at once adjusted to the server's
-  latency and lock waits.
 - Prometheus metrics and a log of every decision.
 
 ## Requirements
@@ -273,6 +271,49 @@ for its `share` lately (use fades with a 10-second half-life). A statement
 that finds no slot within its lane's `queue_timeout` fails with `53000`. A
 session holds one slot until PostgreSQL has answered everything it sent, so
 a pipeline needs just one.
+
+### Adaptive limit
+
+With `adaptive`, `max_active` becomes a ceiling, and QueryGuard moves the
+fast lane's limit between `floor` and it every second, as TCP's congestion
+control does (AIMD: additive increase, multiplicative decrease):
+
+```json
+"scheduler": {"max_active": 32, "adaptive": {"floor": 4}}
+```
+
+- **Overload** is when the statements that finished in the last second ran,
+  on average, more than `max_slowdown` (2) times as long as their plans
+  usually take, or when more than `lock_wait_share` (a quarter) of the limit
+  waits on locks. The limit is then multiplied by `backoff` (0.9), and drops
+  by at least one.
+- **Calm and full**: when every slot was taken at some point in a calm
+  second, the limit grows by one.
+- Otherwise it stays where it is, so a quiet server doesn't drift back to
+  the ceiling before the load that needs it.
+
+A statement's usual time is the average of its plan's last 50 runs, once the
+plan has run five times, so a slow report is not one tenant's normal
+analytics query but statements taking longer than they themselves usually
+do. Lock waits come from `pg_stat_activity` over `-catalog-dsn`. A good
+ceiling is about four times the database's CPU cores.
+
+### Priorities
+
+Each tenant has a `priority`: `critical`, `normal` (the default) or
+`best_effort`. When a slot comes free it goes to the highest priority
+waiting, and then by fair share. While the adaptive limit is backing off,
+best-effort statements are shed: those waiting fail at once, and new ones
+run only if a slot is free, else fail with `53000`. The shedding ends when
+the limit grows again.
+
+A statement can also carry a `/*priority='best_effort'*/` tag. A trusted
+role's tag sets its priority either way; anyone else's can only lower it,
+since putting your own statements behind others' is always allowed.
+
+```json
+"tenants": {"nightly_export": {"priority": "best_effort"}, "payments": {"priority": "critical"}}
+```
 
 ### Time limits
 

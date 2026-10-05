@@ -232,9 +232,10 @@ type Tuning struct {
 
 // Verdict is what History makes of a statement about to run with a plan.
 type Verdict struct {
-	Factor float64 // what the plan's cost is multiplied by to match how long it runs here, next to the server's other plans
-	Flip   string  // why the plan looks like a regression from the statement's usual one, or ""
-	First  bool    // the flip is new, so worth logging
+	Factor float64       // what the plan's cost is multiplied by to match how long it runs here, next to the server's other plans
+	Flip   string        // why the plan looks like a regression from the statement's usual one, or ""
+	First  bool          // the flip is new, so worth logging
+	Usual  time.Duration // how long the plan usually runs, once it has run often enough to say; else 0
 }
 
 // statement is what History knows about one statement, by plan shape.
@@ -277,6 +278,9 @@ func (h *History) Judge(key string, p Plan, t Tuning) Verdict {
 	st.used = time.Now()
 	sh := st.shape(p, t)
 	v.Factor = h.factor(sh, t)
+	if sh.samples >= minRuns {
+		v.Usual = time.Duration(math.Exp(sh.logRatio) * max(p.Cost, 1) * float64(time.Second))
+	}
 	switch usual := st.usual(t); {
 	case sh.slow:
 		v.Flip = fmt.Sprintf("its last run was over %d times slower than its plan's usual timing", slowRatio)

@@ -22,6 +22,7 @@ import (
 	"github.com/Avik-creator/queryguard/internal/testcert"
 	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
+	"github.com/Avik-creator/queryguard/pkg/sched"
 	"github.com/Avik-creator/queryguard/pkg/wire"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -651,6 +652,64 @@ func (l *failingListener) Accept() (net.Conn, error) {
 	l.mu.Unlock()
 	return l.Listener.Accept()
 }
+
+func TestServeAdjustsTheLimit(t *testing.T) {
+	adaptive := `{"scheduler": {"max_active": 8, "adaptive": {"floor": 2}}}`
+	for name, configure := range map[string]func(*Server){
+		"policy at start":    func(s *Server) { s.Policy = mustPolicy(t, adaptive) },
+		"policy set serving": func(s *Server) { s.SetPolicy(mustPolicy(t, adaptive)) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s := &Server{Upstream: Dialer{Addr: "unused"}, Logger: slog.New(slog.DiscardHandler)}
+				if name == "policy at start" {
+					configure(s)
+				}
+				ctx, stop := context.WithCancel(t.Context())
+				done := make(chan error, 1)
+				go func() { done <- s.Serve(ctx, newIdleListener()) }()
+				synctest.Wait()
+				if name != "policy at start" {
+					configure(s)
+				}
+
+				// Half the slots wait on locks, so the limit backs off from 8 at the next adjustment.
+				s.scheduler().LockWaits(4)
+				time.Sleep(sched.AdjustInterval)
+				synctest.Wait()
+
+				if got := s.scheduler().Limit(); got != 7 {
+					t.Errorf("limit = %d; want 7", got)
+				}
+				stop()
+				if err := <-done; err != nil {
+					t.Errorf("Serve: %v", err)
+				}
+			})
+		})
+	}
+}
+
+// idleListener accepts nothing until it is closed, without touching the network, so it works in a synctest bubble.
+type idleListener struct{ closed chan struct{} }
+
+func newIdleListener() *idleListener { return &idleListener{closed: make(chan struct{})} }
+
+func (l *idleListener) Accept() (net.Conn, error) {
+	<-l.closed
+	return nil, net.ErrClosed
+}
+
+func (l *idleListener) Close() error {
+	select {
+	case <-l.closed:
+	default:
+		close(l.closed)
+	}
+	return nil
+}
+
+func (l *idleListener) Addr() net.Addr { return &net.TCPAddr{} }
 
 func TestServeReturnsNilWhenStopped(t *testing.T) {
 	_, stop := startProxy(t, newServer(t, startFakePostgres(t).addr))

@@ -6,12 +6,16 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Avik-creator/queryguard/pkg/plan"
@@ -713,20 +717,166 @@ func TestHolderAppliesReloadToExistingCheckers(t *testing.T) {
 	}
 }
 
+func TestSchedConfigWithoutAdaptive(t *testing.T) {
+	if c := mustParse(t, `{"scheduler": {"max_active": 8}}`).SchedConfig().Controller; c != nil {
+		t.Errorf("Controller = %v; want none without adaptive", c)
+	}
+}
+
+func TestGateGivesSlotsByPriority(t *testing.T) {
+	config := `{"trusted_roles": ["app"], "scheduler": {"max_active": 1, "queue_timeout": "1m"},
+		"tenants": {"batch": {"priority": "best_effort"}, "ops": {"priority": "critical"}}}`
+	// The second statement arrives later, so it goes first only with a higher priority.
+	for name, tc := range map[string]struct {
+		first, second statementBy
+		secondFirst   bool
+	}{
+		"tenant setting":                                {statementBy{"batch", "select 1"}, statementBy{"alice", "select 1"}, true},
+		"critical tenant":                               {statementBy{"alice", "select 1"}, statementBy{"ops", "select 1"}, true},
+		"tag from a trusted role":                       {statementBy{"app", "select 1"}, statementBy{"app", "select 1 /*priority='critical'*/"}, true},
+		"lowering tag from an untrusted role":           {statementBy{"alice", "select 1 /*priority='best_effort'*/"}, statementBy{"bob", "select 1"}, true},
+		"raising tag from an untrusted role is ignored": {statementBy{"alice", "select 1"}, statementBy{"bob", "select 1 /*priority='critical'*/"}, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				p := mustParse(t, config)
+				s := sched.New(p.SchedConfig())
+				checker := func(role string) *Checker {
+					c := p.Checker(role, discard)
+					c.Env = Env{Database: "shop", Plans: &plan.Cache{RefreshOneIn: -1}, Scheduler: s}
+					return c
+				}
+				hold := pass(t, checker("x"), "select 0", costing(1), false)
+
+				var mu sync.Mutex
+				var order []string
+				var wg sync.WaitGroup
+				for _, st := range []statementBy{tc.first, tc.second} {
+					wg.Go(func() {
+						a := pass(t, checker(st.role), st.sql, costing(1), false)
+						mu.Lock()
+						order = append(order, st.role+": "+st.sql)
+						mu.Unlock()
+						if a.Release != nil {
+							a.Release()
+						}
+					})
+					synctest.Wait()
+				}
+				hold.Release()
+				wg.Wait()
+
+				want := tc.first
+				if tc.secondFirst {
+					want = tc.second
+				}
+				if order[0] != want.role+": "+want.sql {
+					t.Errorf("first slot went to %q; want %q", order[0], want.role+": "+want.sql)
+				}
+			})
+		})
+	}
+}
+
+// statementBy is a statement sent by a role.
+type statementBy struct{ role, sql string }
+
+func TestShedStatementIsRejectedAsBusy(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := mustParse(t, `{"scheduler": {"max_active": 2, "queue_timeout": "1m"}, "tenants": {"batch": {"priority": "best_effort"}}}`)
+		limit := &lowered{}
+		cfg := p.SchedConfig()
+		cfg.Controller = limit
+		s := sched.New(cfg)
+		go s.Run(t.Context())
+		c := p.Checker("batch", discard)
+		c.Env = Env{Database: "shop", Plans: &plan.Cache{RefreshOneIn: -1}, Scheduler: s}
+		pass(t, c, "select 1", costing(1), false)
+		limit.on.Store(true)
+		time.Sleep(sched.AdjustInterval)
+		synctest.Wait()
+
+		a := pass(t, c, "select 1", costing(1), false)
+
+		if codeOf(a.Reject) != "53000" || !strings.Contains(a.Reject.Message, "overloaded") {
+			t.Errorf("best-effort statement under overload got %v; want 53000 saying the server is overloaded", a.Reject)
+		}
+	})
+}
+
+// lowered is a Controller that drops the limit to 1 once on is set.
+type lowered struct{ on atomic.Bool }
+
+func (l *lowered) Adjust(limit int, _ sched.Signal) int {
+	if l.on.Load() {
+		return 1
+	}
+	return limit
+}
+
+func TestGateReportsSlowdown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := mustParse(t, `{"scheduler": {"max_active": 4}}`)
+		seen := &signals{}
+		cfg := p.SchedConfig()
+		cfg.Controller = seen
+		s := sched.New(cfg)
+		go s.Run(t.Context())
+		c := p.Checker("alice", discard)
+		c.Env = Env{Database: "shop", Plans: &plan.Cache{RefreshOneIn: -1}, Scheduler: s}
+		train(t, c, lookupSQL, explained(orderLookup, nil), 5, 10*time.Millisecond)
+		time.Sleep(sched.AdjustInterval)
+		synctest.Wait()
+
+		train(t, c, lookupSQL, explained(orderLookup, nil), 1, 40*time.Millisecond)
+		time.Sleep(sched.AdjustInterval)
+		synctest.Wait()
+
+		// The first five runs set the plan's usual time, so they report nothing; the sixth took four times as long.
+		got := seen.last()
+		if got[0].Slowdown != 0 || math.Abs(got[1].Slowdown-4) > 1e-3 {
+			t.Errorf("slowdowns %v, %v; want 0 while learning, then 4", got[0].Slowdown, got[1].Slowdown)
+		}
+	})
+}
+
+// signals is a Controller that keeps the limit and records each Signal.
+type signals struct {
+	mu   sync.Mutex
+	seen []sched.Signal
+}
+
+func (s *signals) Adjust(limit int, sig sched.Signal) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seen = append(s.seen, sig)
+	return limit
+}
+
+// last returns the last two signals.
+func (s *signals) last() [2]sched.Signal {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return [2]sched.Signal(s.seen[len(s.seen)-2:])
+}
+
 func TestSchedConfig(t *testing.T) {
-	p := mustParse(t, `{"scheduler": {"max_active": 8, "queue_timeout": "2s", "slow_lane": {"max_active": 1, "queue_timeout": "30s"}},
+	p := mustParse(t, `{"scheduler": {"max_active": 8, "queue_timeout": "2s", "slow_lane": {"max_active": 1, "queue_timeout": "30s"},
+			"adaptive": {"floor": 2, "backoff": 0.5, "max_slowdown": 3, "lock_wait_share": 0.1}},
 		"tenant_defaults": {"budget": {"rate": 10}},
 		"tenants": {"acme": {"budget": {"rate": 100, "burst": 1000, "share": 2, "min_charge": 5, "when_over": "slow"}}, "bob": {"mode": "warn"}}}`)
 
 	got := p.SchedConfig()
 
 	want := sched.Config{
-		Fast:    sched.Lane{MaxActive: 8, QueueTimeout: 2 * time.Second},
-		Slow:    sched.Lane{MaxActive: 1, QueueTimeout: 30 * time.Second},
-		Budgets: map[string]sched.Budget{"acme": {Rate: 100, Burst: 1000, Share: 2, MinCharge: 5, WhenOver: sched.SlowLane}},
-		Default: sched.Budget{Rate: 10},
+		Fast:       sched.Lane{MaxActive: 8, QueueTimeout: 2 * time.Second},
+		Slow:       sched.Lane{MaxActive: 1, QueueTimeout: 30 * time.Second},
+		Budgets:    map[string]sched.Budget{"acme": {Rate: 100, Burst: 1000, Share: 2, MinCharge: 5, WhenOver: sched.SlowLane}},
+		Default:    sched.Budget{Rate: 10},
+		Controller: sched.AIMD{Floor: 2, Backoff: 0.5, MaxSlowdown: 3, LockWaitShare: 0.1},
 	}
-	if got.Fast != want.Fast || got.Slow != want.Slow || got.Default != want.Default || !maps.Equal(got.Budgets, want.Budgets) {
+	if got.Fast != want.Fast || got.Slow != want.Slow || got.Default != want.Default || !maps.Equal(got.Budgets, want.Budgets) ||
+		got.Controller != want.Controller {
 		t.Errorf("SchedConfig = %+v; want %+v", got, want)
 	}
 }
@@ -772,6 +922,12 @@ func TestParseRejectsBadConfig(t *testing.T) {
 		`{"plan_flips": {"mode": "loud"}}`:                                           "loud",
 		`{"plan_flips": {"quarantine": "-1m"}}`:                                      "quarantine",
 		`{"rules": [{"check": "deny_ddl", "match": {"tags": {"route": "/admin"}}}]}`: "trusted_roles",
+		`{"scheduler": {"adaptive": {}}}`:                                            "max_active",
+		`{"scheduler": {"max_active": 4, "adaptive": {"floor": 8}}}`:                 "floor",
+		`{"scheduler": {"max_active": 4, "adaptive": {"backoff": 1}}}`:               "backoff",
+		`{"scheduler": {"max_active": 4, "adaptive": {"max_slowdown": 0.5}}}`:        "max_slowdown",
+		`{"scheduler": {"max_active": 4, "adaptive": {"lock_wait_share": -1}}}`:      "lock_wait_share",
+		`{"tenants": {"a": {"priority": "urgent"}}}`:                                 "urgent",
 	} {
 		if _, err := Parse([]byte(config)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("Parse(%s) = %v; want an error mentioning %q", config, err, want)
