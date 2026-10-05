@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -659,6 +660,32 @@ func TestClosesConnectionsOverStartupCap(t *testing.T) {
 
 	login(t, silent)
 	startSession(t, addr)
+}
+
+func TestOneSessionsPanicLeavesTheOthersRunning(t *testing.T) {
+	pg := startFakePostgres(t)
+	s := newServer(t, pg.addr)
+	s.Upstream = &panicOnce{Upstream: s.Upstream}
+	addr, _ := startProxy(t, s)
+
+	conn := dial(t, addr)
+	sendStartup(t, conn)
+	expectClosed(t, conn)
+
+	startSession(t, addr)
+}
+
+// panicOnce panics in its first Acquire, as a bug in a session would.
+type panicOnce struct {
+	Upstream
+	done atomic.Bool
+}
+
+func (p *panicOnce) Acquire(ctx context.Context, startup *pgproto3.StartupMessage) (net.Conn, error) {
+	if !p.done.Swap(true) {
+		panic("bug")
+	}
+	return p.Upstream.Acquire(ctx, startup)
 }
 
 // failingListener returns errs from Accept, one per call, before accepting for real.

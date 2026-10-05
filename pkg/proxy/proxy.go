@@ -13,6 +13,7 @@ import (
 	"maps"
 	"net"
 	"net/netip"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -214,6 +215,12 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 
 // handle reads the client's startup packet and either forwards a cancel or starts a session.
 func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) {
+	// A bug in one session ends that session, not every client's; the other defers still give back its slots and keys.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("session panicked", "client", client.RemoteAddr(), "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
 	defer client.Close()
 	stop := context.AfterFunc(ctx, func() { client.Close() })
 	defer stop()
