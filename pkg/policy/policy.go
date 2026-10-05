@@ -46,6 +46,7 @@ type Config struct {
 	Scheduler            Scheduler         `json:"scheduler"`
 	Calibration          Calibration       `json:"calibration"`
 	PlanFlips            PlanFlips         `json:"plan_flips"`
+	DDLGuard             DDLGuard          `json:"ddl_guard"`
 	TenantDefaults       Tenant            `json:"tenant_defaults"` // the budget and timeouts of tenants that set none
 	Rules                []Rule            `json:"rules"`
 	Tenants              map[string]Tenant `json:"tenants"` // keyed by tenant: a role, or a tag from a trusted role
@@ -94,7 +95,17 @@ type Scheduler struct {
 	MaxActive    int       `json:"max_active"`    // statements running at once; 0 means no limit
 	QueueTimeout Duration  `json:"queue_timeout"` // the longest a statement waits for its budget or a slot; 0 means 5s
 	SlowLane     Lane      `json:"slow_lane"`
-	Adaptive     *Adaptive `json:"adaptive"` // moves the limit between a floor and max_active by how the server copes; nil keeps max_active
+	Adaptive     *Adaptive `json:"adaptive"`     // moves the limit between a floor and max_active by how the server copes; nil keeps max_active
+	BlockerPays  string    `json:"blocker_pays"` // "on" (the default) charges a tenant for the time others wait on its locks; "off" doesn't
+}
+
+// DefaultDDLLockTimeout is how long DDL may wait on a lock when the DDL guard sets no lock_timeout.
+const DefaultDDLLockTimeout = 2 * time.Second
+
+// DDLGuard sets what happens to DDL waiting on a lock, which makes every later statement on its table queue behind it.
+type DDLGuard struct {
+	Mode        Mode     `json:"mode"`         // enforce (the default) cancels such DDL; warn only logs it; off does neither
+	LockTimeout Duration `json:"lock_timeout"` // how long DDL may wait on a lock with nothing queued behind it; 0 means 2s
 }
 
 // Adaptive sets the AIMD limiter; see sched.AIMD.
@@ -213,6 +224,7 @@ type Policy struct {
 	costRules bool             // some rule judges plans
 	needsCost bool             // statements are explained for cost rules, budgets or fair shares of slots
 	gated     bool             // budgets, slots or timeouts apply, so every statement passes a gate
+	guardsDDL bool             // the DDL guard is on, so DDL passes a gate that reports it
 }
 
 // Load reads and checks the policy file at path.
@@ -328,6 +340,16 @@ func (p *Policy) compile() error {
 	if c.PlanFlips.Quarantine < 0 {
 		errs = append(errs, errors.New("plan_flips quarantine must not be negative"))
 	}
+	if m := c.DDLGuard.Mode; !m.valid() && m != "off" {
+		errs = append(errs, fmt.Errorf("ddl_guard mode %q: want enforce, warn or off", m))
+	}
+	if c.DDLGuard.LockTimeout < 0 {
+		errs = append(errs, errors.New("ddl_guard lock_timeout must not be negative"))
+	}
+	if b := s.BlockerPays; b != "" && b != "on" && b != "off" {
+		errs = append(errs, fmt.Errorf("scheduler blocker_pays %q: want on or off", b))
+	}
+	p.guardsDDL = c.DDLGuard.Mode != "off"
 	slots := s.MaxActive > 0 || s.SlowLane.MaxActive > 0
 	// Fair shares of slots go by cost too, so limited slots need plans as budgets do.
 	p.needsCost = p.costRules || budgeted || slots
@@ -382,6 +404,20 @@ func limit(needed bool, v float64) bool {
 	}
 	return v == 0
 }
+
+// DDLGuard returns the DDL guard's settings, with its defaults filled in.
+func (p *Policy) DDLGuard() DDLGuard {
+	g := p.cfg.DDLGuard
+	g.Mode = cmp.Or(g.Mode, Enforce)
+	g.LockTimeout = cmp.Or(g.LockTimeout, Duration(DefaultDDLLockTimeout))
+	return g
+}
+
+// BlockerPays reports whether tenants are charged for the time others wait on their locks.
+func (p *Policy) BlockerPays() bool { return p.cfg.Scheduler.BlockerPays != "off" }
+
+// TenantMode returns whether a tenant's statements are held to the policy or only logged.
+func (p *Policy) TenantMode(tenant string) Mode { return cmp.Or(p.cfg.Tenants[tenant].Mode, Enforce) }
 
 // NeedsCatalog reports whether a rule needs table sizes.
 func (p *Policy) NeedsCatalog() bool {
@@ -469,6 +505,13 @@ type Env struct {
 	History   *plan.History    // shared by every session; nil gives the Checker a history of its own
 	Tables    TableSizes       // needed by max_scan_rows; nil leaves every table's size unknown
 	Scheduler *sched.Scheduler // shared by every session; nil admits every statement at once
+	Backend   Backend          // told what the session's server connection runs; nil tells no one
+}
+
+// Backend learns what one session's server connection runs, for checks that look at the whole server, such as the DDL guard.
+type Backend interface {
+	// Running says the connection now runs a statement of tenant, DDL or not, or has finished it (ddl false).
+	Running(tenant string, ddl bool)
 }
 
 // Checker checks the statements of one session; only the session's own goroutine uses it.
@@ -505,7 +548,9 @@ func (p *Policy) trusted(role string) bool { return slices.Contains(p.cfg.Truste
 // Check returns the error to send instead of running sql, or nil, and the gate it passes just before it executes, if any.
 func (c *Checker) Check(sql string, set session.Settings) (*pgproto3.ErrorResponse, session.Gate) {
 	p := c.policy()
-	if len(p.cfg.Rules) == 0 && !p.gated {
+	// Without a Backend to tell, nothing needs DDL found, so a policy with nothing else to check needn't parse the statement.
+	guardsDDL := p.guardsDDL && c.Env.Backend != nil
+	if len(p.cfg.Rules) == 0 && !p.gated && !guardsDDL {
 		return nil, nil
 	}
 	tags := sqlparse.Tags(sql)
@@ -541,7 +586,7 @@ func (c *Checker) Check(sql string, set session.Settings) (*pgproto3.ErrorRespon
 			checks[blocked.Check].hint), nil
 	}
 	// EXPLAIN plans one statement at a time, and a later statement may need what an earlier one creates.
-	if !p.gated && !(p.costRules && (q.Explainable || q.DDL || q.Analyzes)) {
+	if !p.gated && !(p.costRules && (q.Explainable || q.DDL || q.Analyzes)) && !(guardsDDL && q.DDL) {
 		return nil, nil
 	}
 	return nil, c.gate(p, sql, q, who)
@@ -563,8 +608,27 @@ func (c *Checker) tenant(p *Policy, tags map[string]string) string {
 	return c.role
 }
 
-// gate admits sql when it is about to execute: it waits for the tenant's budget, judges the plan, and takes a slot.
+// gate admits sql as admit does, and tells the Backend what runs.
 func (c *Checker) gate(p *Policy, sql string, q sqlparse.Query, who subject) session.Gate {
+	admit := c.admit(p, sql, q, who)
+	return func(ctx context.Context, e session.Explain, running bool) session.Admission {
+		a := admit(ctx, e, running)
+		if b := c.Env.Backend; b != nil && a.Reject == nil {
+			b.Running(who.tenant, q.DDL)
+			ran := a.Ran
+			a.Ran = func(took time.Duration, finished bool) {
+				if ran != nil {
+					ran(took, finished)
+				}
+				b.Running(who.tenant, false)
+			}
+		}
+		return a
+	}
+}
+
+// admit admits sql when it is about to execute: it waits for the tenant's budget, judges the plan, and takes a slot.
+func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) session.Gate {
 	return func(ctx context.Context, e session.Explain, running bool) session.Admission {
 		t := p.tenant(who.tenant)
 		warn := t.Mode == Warn

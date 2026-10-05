@@ -82,8 +82,11 @@ type Server struct {
 
 	keys     cancelKeys
 	sessions sessionCount
+	backends backends
 	policies policy.Holder
 	starting atomic.Int64 // connections that have yet to send their startup message
+
+	observed time.Time // when the Monitor last reported; only its goroutine uses it
 
 	mu      sync.Mutex
 	sched   *sched.Scheduler // made with the first policy and reconfigured by each one after
@@ -223,6 +226,7 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 		check         session.Checker
 		authenticated func() *wire.Error
 		release       = func() {}
+		running       *backend // what the server connection runs, for the checks that read the server's activity
 	)
 	if p := s.ActivePolicy(); p != nil {
 		c := s.policies.Checker(role, log.With("client", client.RemoteAddr()))
@@ -230,6 +234,10 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 		c.Env = policy.Env{Database: pgName(cmp.Or(startup.Parameters["database"], role)), Client: clientAddr(client), Plans: &s.Plans, History: &s.History, Scheduler: s.scheduler()}
 		if s.Catalog != nil {
 			c.Env.Tables = s.Catalog
+		}
+		if s.Monitor != nil {
+			running = &backend{}
+			c.Env.Backend = running
 		}
 		if rej := c.CheckStartup(wire.StartupSettings(startup.Parameters)); rej != nil {
 			if buf, err := rej.Encode(nil); err == nil {
@@ -262,8 +270,8 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	}
 	defer s.Upstream.Release(server)
 
-	// The login sets forget; it is called once the session is over.
-	forget := func() {}
+	// The login sets forget and unfile; they are called once the session is over.
+	forget, unfile := func() {}, func() {}
 	var serverKey atomic.Pointer[pgproto3.BackendKeyData]
 	opts := wire.StartupOptions{
 		ChannelBinding: sameCertificate(client, server, s.TLSConfig),
@@ -273,6 +281,10 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 			forget()
 			issued, f := s.keys.issue(key)
 			forget = f
+			if running != nil {
+				unfile()
+				unfile = s.backends.add(int32(key.ProcessID), running)
+			}
 			return issued
 		},
 	}
@@ -295,11 +307,17 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 		}
 	}
 	err = session.Relay(client, server, session.Options{Check: check, Cancel: cancel,
+		Interrupt: func(interrupt func(session.Interruption) bool) {
+			if running != nil {
+				running.setInterrupt(interrupt)
+			}
+		},
 		Login: func(client io.Writer, server io.Reader, report func(name, value string)) error {
 			opts.Report = report
 			return wire.RelayStartup(client, server, opts)
 		}})
 	forget()
+	unfile()
 	// A login refused over the cap was logged when it was refused, and Postgres logs the logins it refuses.
 	if _, refused := errors.AsType[*wire.Error](err); !refused && !errors.Is(err, wire.ErrLoginRefused) && !hungUp(err) {
 		log.Warn("session ended", "client", client.RemoteAddr(), "err", err)
@@ -376,10 +394,90 @@ func (s *Server) logPlanStats(ctx context.Context, log *slog.Logger, tick <-chan
 	}
 }
 
+// maxObserveGap caps the time one reading accounts for, so readings missed while the catalog was unreachable aren't charged.
+const maxObserveGap = 5 * time.Second
+
+// lockTimeout is what a client gets when the DDL guard cancels its statement: Postgres's own lock_timeout error, which migration tools retry.
+var lockTimeout = session.Interruption{Code: "55P03", Message: "queryguard: canceling statement due to lock timeout",
+	Hint: "QueryGuard cancels DDL that waits on a lock while other statements queue behind it, or longer than ddl_guard's lock_timeout. " +
+		"Retry when the table is less busy."}
+
 // observe acts on one reading of the server's activity.
 func (s *Server) observe(a plan.Activity) {
-	if sc := s.scheduler(); sc != nil {
+	now := time.Now()
+	elapsed := min(now.Sub(s.observed), maxObserveGap)
+	if s.observed.IsZero() {
+		elapsed = 0
+	}
+	s.observed = now
+
+	sc, p := s.scheduler(), s.ActivePolicy()
+	if sc != nil {
 		sc.LockWaits(a.LockWaits())
+	}
+	if p == nil {
+		return
+	}
+	s.guardDDL(p, a)
+	if sc != nil && p.BlockerPays() && elapsed > 0 {
+		s.chargeBlockers(sc, a, elapsed)
+	}
+}
+
+// guardDDL cancels this proxy's DDL that waits on a lock while others queue behind it, or past the guard's lock_timeout.
+func (s *Server) guardDDL(p *policy.Policy, a plan.Activity) {
+	g := p.DDLGuard()
+	if g.Mode == "off" {
+		return
+	}
+	// A backend that others wait for while it waits itself is at the head of a lock queue.
+	blocking := map[int32]bool{}
+	for _, w := range a.Waiting {
+		for _, pid := range w.Blockers {
+			blocking[pid] = true
+		}
+	}
+	log := cmp.Or(s.Logger, slog.Default())
+	for pid, w := range a.Waiting {
+		b := s.backends.get(pid)
+		if b == nil {
+			continue
+		}
+		tenant, ddl := b.state()
+		if !ddl || (!blocking[pid] && w.Waited < time.Duration(g.LockTimeout)) || !b.flag() {
+			continue
+		}
+		attrs := []any{"rule", "ddl_guard", "tenant", tenant, "pid", pid, "waited", w.Waited, "queued_behind", blocking[pid]}
+		if g.Mode == policy.Warn || p.TenantMode(tenant) == policy.Warn {
+			log.Warn("would cancel DDL waiting on a lock", attrs...)
+			continue
+		}
+		if b.cancel(lockTimeout) {
+			log.Warn("cancelled DDL waiting on a lock", attrs...)
+		}
+	}
+}
+
+// chargeBlockers moves the cost of elapsed time spent waiting on a lock from each waiting tenant to the tenants it waits for.
+func (s *Server) chargeBlockers(sc *sched.Scheduler, a plan.Activity, elapsed time.Duration) {
+	cost, ok := s.History.CostOf(elapsed)
+	if !ok {
+		return
+	}
+	for pid, w := range a.Waiting {
+		waiter := s.backends.get(pid)
+		if waiter == nil || len(w.Blockers) == 0 {
+			continue
+		}
+		waiting, _ := waiter.state()
+		// The wait is shared among everyone it waits for, though only this proxy's sessions can be charged.
+		share := cost / float64(len(w.Blockers))
+		for _, blocker := range w.Blockers {
+			if h := s.backends.get(blocker); h != nil {
+				holding, _ := h.state()
+				sc.Transfer(waiting, holding, share)
+			}
+		}
 	}
 }
 

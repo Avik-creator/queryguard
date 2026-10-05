@@ -348,6 +348,48 @@ func TestMonitorSeesLockWaitsAndTheOldestSnapshot(t *testing.T) {
 	}
 }
 
+func TestDDLStuckBehindALongTransactionIsCancelled(t *testing.T) {
+	dsn := catalogDSN(t) + " dbname=queryguard"
+	direct := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
+	name := fmt.Sprintf("qg_ddl_guard_%d", time.Now().UnixNano())
+	mustExec(t, direct, "create table "+name+" (id int)")
+	t.Cleanup(func() { direct.Exec(context.Background(), "drop table "+name) })
+	// A long transaction holds a lock on the table that ALTER TABLE must wait for.
+	mustExec(t, direct, "begin")
+	mustExec(t, direct, "select * from "+name)
+	t.Cleanup(func() { direct.Exec(context.Background(), "rollback") })
+
+	var logs lockedBuffer
+	qg := startProxyWith(t, func(s *proxy.Server) {
+		s.Policy = mustPolicy(t, `{}`)
+		s.Monitor = &plan.Monitor{DSN: dsn, Interval: 100 * time.Millisecond}
+		s.Logger = slog.New(slog.NewTextHandler(io.MultiWriter(&logs, t.Output()), nil))
+	})
+	migrator, reader := qg.connect(t, "sslmode=disable"), qg.connect(t, "sslmode=disable")
+	altered := make(chan error, 1)
+	go func() {
+		_, err := migrator.Exec(context.Background(), "alter table "+name+" add column note text")
+		altered <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// The read queues behind the ALTER's lock request, so the ALTER is cancelled and the read runs.
+	start := time.Now()
+	if _, err := reader.Exec(t.Context(), "select count(*) from "+name); err != nil {
+		t.Fatalf("read behind the ALTER: %v", err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("the read waited %v; want the ALTER cancelled within a second or so", took)
+	}
+	if err := <-altered; sqlState(err) != "55P03" {
+		t.Errorf("ALTER got %v; want 55P03 lock_not_available", err)
+	}
+	if !strings.Contains(logs.String(), "cancelled DDL waiting on a lock") {
+		t.Errorf("log %q; want the cancel", logs.String())
+	}
+	expectSelectOne(t, migrator)
+}
+
 // pidOf returns conn's backend process ID.
 func pidOf(t testing.TB, conn *pgx.Conn) int32 {
 	t.Helper()

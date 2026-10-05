@@ -717,6 +717,75 @@ func TestHolderAppliesReloadToExistingCheckers(t *testing.T) {
 	}
 }
 
+func TestGateTellsTheBackendWhatRuns(t *testing.T) {
+	for _, tc := range []struct {
+		config, sql string
+		want        []running
+	}{
+		// DDL is reported even with nothing to schedule, for the DDL guard.
+		{`{}`, "alter table orders add column note text", []running{{"alice", true}, {"alice", false}}},
+		{`{"scheduler": {"max_active": 4}}`, "select 1", []running{{"alice", false}, {"alice", false}}},
+	} {
+		c := mustParse(t, tc.config).Checker("alice", discard)
+		b := &backend{}
+		c.Env = Env{Database: "shop", Plans: &plan.Cache{RefreshOneIn: -1}, Scheduler: sched.New(mustParse(t, tc.config).SchedConfig()), Backend: b}
+
+		a := pass(t, c, tc.sql, costing(1), false)
+		if a.Ran == nil {
+			t.Fatalf("%s: no Ran to report the statement's end", tc.sql)
+		}
+		a.Ran(time.Millisecond, true)
+
+		if !slices.Equal(b.runs, tc.want) {
+			t.Errorf("%s: backend told %v; want %v", tc.sql, b.runs, tc.want)
+		}
+	}
+}
+
+func TestDDLGetsAGateOnlyForTheGuard(t *testing.T) {
+	for config, wantGate := range map[string]bool{`{"ddl_guard": {"mode": "off"}}`: false, `{}`: true} {
+		c := mustParse(t, config).Checker("alice", discard)
+		c.Env.Backend = &backend{}
+		if _, gate := c.Check("alter table orders add column note text", standard); (gate != nil) != wantGate {
+			t.Errorf("%s: DDL got a gate: %v; want %v", config, gate != nil, wantGate)
+		}
+		// Without a Backend no one needs to know, so nothing is parsed.
+		c.Env.Backend = nil
+		if _, gate := c.Check("alter table orders add column note text", standard); gate != nil {
+			t.Errorf("%s: DDL got a gate with no Backend to tell", config)
+		}
+	}
+}
+
+func TestDDLGuard(t *testing.T) {
+	for config, want := range map[string]DDLGuard{
+		`{}`: {Mode: Enforce, LockTimeout: Duration(DefaultDDLLockTimeout)},
+		`{"ddl_guard": {"mode": "warn", "lock_timeout": "5s"}}`: {Mode: Warn, LockTimeout: Duration(5 * time.Second)},
+		`{"ddl_guard": {"mode": "off"}}`:                        {Mode: "off", LockTimeout: Duration(DefaultDDLLockTimeout)},
+	} {
+		if got := mustParse(t, config).DDLGuard(); got != want {
+			t.Errorf("%s: DDLGuard() = %+v; want %+v", config, got, want)
+		}
+	}
+}
+
+func TestTenantMode(t *testing.T) {
+	p := mustParse(t, `{"tenants": {"bob": {"mode": "warn"}}}`)
+	if p.TenantMode("bob") != Warn || p.TenantMode("alice") != Enforce {
+		t.Errorf("modes %q and %q; want warn for bob and enforce for alice", p.TenantMode("bob"), p.TenantMode("alice"))
+	}
+}
+
+// backend records what a Checker says its session runs.
+type backend struct{ runs []running }
+
+type running struct {
+	tenant string
+	ddl    bool
+}
+
+func (b *backend) Running(tenant string, ddl bool) { b.runs = append(b.runs, running{tenant, ddl}) }
+
 func TestSchedConfigWithoutAdaptive(t *testing.T) {
 	if c := mustParse(t, `{"scheduler": {"max_active": 8}}`).SchedConfig().Controller; c != nil {
 		t.Errorf("Controller = %v; want none without adaptive", c)
@@ -928,6 +997,9 @@ func TestParseRejectsBadConfig(t *testing.T) {
 		`{"scheduler": {"max_active": 4, "adaptive": {"max_slowdown": 0.5}}}`:        "max_slowdown",
 		`{"scheduler": {"max_active": 4, "adaptive": {"lock_wait_share": -1}}}`:      "lock_wait_share",
 		`{"tenants": {"a": {"priority": "urgent"}}}`:                                 "urgent",
+		`{"ddl_guard": {"mode": "loud"}}`:                                            "loud",
+		`{"ddl_guard": {"lock_timeout": "-1s"}}`:                                     "lock_timeout",
+		`{"scheduler": {"blocker_pays": "maybe"}}`:                                   "maybe",
 	} {
 		if _, err := Parse([]byte(config)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("Parse(%s) = %v; want an error mentioning %q", config, err, want)

@@ -4,6 +4,7 @@ package session
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -94,6 +95,15 @@ type Options struct {
 	Check  Checker                                                                         // nil checks nothing
 	Login  func(client io.Writer, server io.Reader, report func(name, value string)) error // relays the login, passing each ParameterStatus to report
 	Cancel func()                                                                          // asks Postgres to cancel what the server connection runs; nil can't
+	// Interrupt gets, as Relay starts, a func that cancels what the session runs with i as the reason, reporting whether it ran anything.
+	Interrupt func(interrupt func(i Interruption) bool)
+}
+
+// Interruption is why the proxy cancelled a statement: the client gets Postgres's cancel error with these fields in its place.
+type Interruption struct {
+	Code    string // SQLSTATE
+	Message string
+	Hint    string // "" keeps Postgres's
 }
 
 // ErrIdleInTransaction ends a session left idle in a transaction past its limit.
@@ -132,6 +142,9 @@ func Relay(client, server net.Conn, opts Options) error {
 		})
 	}
 	stop := s.stop
+	if opts.Interrupt != nil {
+		opts.Interrupt(s.interrupt)
+	}
 	var loops sync.WaitGroup
 	loops.Go(func() {
 		err := s.fromClient()
@@ -182,22 +195,22 @@ type session struct {
 	serverIn   *bufio.Reader
 	serverOut  *bufio.Writer // only fromClient writes to the server
 
-	mu         sync.Mutex
-	clientOut  *bufio.Writer // both loops write to the client, so only under mu
-	status     byte          // transaction status from the last ReadyForQuery; 0 until login ends
-	pending    []sent        // messages the server has yet to finish answering, oldest first
-	skipping   bool          // the server ignores everything up to the next Sync after an extended-protocol error
-	reported   Settings      // as last reported by the server
-	explaining *explanation  // the proxy's EXPLAIN in flight, if any
-	slot       func()        // frees the slot the session holds, if any
-	admitting  bool          // a gate is running, so the server going idle keeps the slot the statement will need
-	timeout    time.Duration // how long the running statements may take
-	idleLimit  time.Duration // how long the session may sit idle in a transaction
-	stmtTimer  *time.Timer   // cancels the running statement at its timeout
-	idleTimer  *time.Timer   // ends the session idle in a transaction too long
-	idleGen    int           // bumped by each client message, so an idle timer firing late does nothing
-	timedOut   bool          // the proxy cancelled for a timeout, so Postgres's cancel error says so
-	settled    []func()      // from admissions, called once the session is idle outside a transaction
+	mu          sync.Mutex
+	clientOut   *bufio.Writer // both loops write to the client, so only under mu
+	status      byte          // transaction status from the last ReadyForQuery; 0 until login ends
+	pending     []sent        // messages the server has yet to finish answering, oldest first
+	skipping    bool          // the server ignores everything up to the next Sync after an extended-protocol error
+	reported    Settings      // as last reported by the server
+	explaining  *explanation  // the proxy's EXPLAIN in flight, if any
+	slot        func()        // frees the slot the session holds, if any
+	admitting   bool          // a gate is running, so the server going idle keeps the slot the statement will need
+	timeout     time.Duration // how long the running statements may take
+	idleLimit   time.Duration // how long the session may sit idle in a transaction
+	stmtTimer   *time.Timer   // cancels the running statement at its timeout
+	idleTimer   *time.Timer   // ends the session idle in a transaction too long
+	idleGen     int           // bumped by each client message, so an idle timer firing late does nothing
+	interrupted *Interruption // why the proxy cancelled the running statement, so Postgres's cancel error says so
+	settled     []func()      // from admissions, called once the session is idle outside a transaction
 
 	// Only fromClient uses these.
 	inBatch    bool                      // extended-protocol messages went to the server since the last Sync
@@ -596,15 +609,24 @@ func (s *session) waitContext() (context.Context, func()) {
 	}
 }
 
+// statementTimeout is why a statement past its timeout was cancelled.
+var statementTimeout = Interruption{Code: "57014", Message: "queryguard: canceling statement due to statement timeout"}
+
 // statementTimedOut cancels the statement running past its timeout.
-func (s *session) statementTimedOut() {
+func (s *session) statementTimedOut() { s.interrupt(statementTimeout) }
+
+// interrupt cancels what the session runs, with i as the reason the client is given, and reports whether it ran anything.
+func (s *session) interrupt(i Interruption) bool {
 	s.mu.Lock()
-	busy := len(s.pending) > 0
-	s.timedOut = s.timedOut || busy
+	busy := len(s.pending) > 0 && s.cancel != nil
+	if busy {
+		s.interrupted = &i
+	}
 	s.mu.Unlock()
-	if busy && s.cancel != nil {
+	if busy {
 		s.cancel()
 	}
+	return busy
 }
 
 // clientSent stops the idle-in-transaction timer, since the client has sent something.
@@ -623,7 +645,7 @@ func (s *session) becameIdle() {
 	if s.stmtTimer != nil {
 		s.stmtTimer.Stop()
 	}
-	s.timedOut = false
+	s.interrupted = nil
 	// The proxy's own EXPLAIN ends while the statement it is for is being admitted, which needs the slot.
 	if s.admitting {
 		return
@@ -940,15 +962,15 @@ func (s *session) relayAnswer(typ byte, n int) error {
 	case how == hidden && typ != 'E':
 		_, err := s.serverIn.Discard(n)
 		return unexpected(err)
-	case typ == 'E' && s.timedOut && n <= maxCheckedLen:
-		return s.relayTimeout(n)
+	case typ == 'E' && s.interrupted != nil && n <= maxCheckedLen:
+		return s.relayInterrupted(n)
 	}
 	writeHeader(s.clientOut, typ, n)
 	return copyBody(s.clientOut, s.serverIn, n)
 }
 
-// relayTimeout passes on an error after a timeout's cancel, saying so if it is the cancel's error; the caller holds mu.
-func (s *session) relayTimeout(n int) error {
+// relayInterrupted passes on an error after the proxy's cancel, saying why if it is the cancel's error; the caller holds mu.
+func (s *session) relayInterrupted(n int) error {
 	body := make([]byte, n)
 	if _, err := io.ReadFull(s.serverIn, body); err != nil {
 		return unexpected(err)
@@ -959,8 +981,9 @@ func (s *session) relayTimeout(n int) error {
 		_, err := s.clientOut.Write(body)
 		return err
 	}
-	s.timedOut = false
-	e.Message = "queryguard: canceling statement due to statement timeout"
+	i := s.interrupted
+	s.interrupted = nil
+	e.Code, e.Message, e.Hint = i.Code, i.Message, cmp.Or(i.Hint, e.Hint)
 	return writeMessages(s.clientOut, &e)
 }
 

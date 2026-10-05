@@ -712,3 +712,13 @@ func (r *activityReader) query(ctx context.Context, watch []Table) (Activity, er
 	}
 	return a, r.conn.SendBatch(ctx, &b).Close()
 }
+
+// CostOf returns how many cost units take d on this server, from the timing of the runs History learned from, or false before any.
+func (h *History) CostOf(d time.Duration) (float64, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.server.runs == 0 {
+		return 0, false
+	}
+	return d.Seconds() / math.Exp(h.server.logRatio/h.server.cost), true
+}

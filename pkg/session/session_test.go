@@ -438,6 +438,32 @@ func TestCancelsStatementPastItsTimeout(t *testing.T) {
 		&pgproto3.ReadyForQuery{TxStatus: 'I'})
 }
 
+func TestInterruptCancelsWithItsOwnError(t *testing.T) {
+	h := start(t, fakeChecker{})
+	h.send(&pgproto3.Query{String: "alter table orders add column note text"})
+	h.serverGets(&pgproto3.Query{String: "alter table orders add column note text"})
+
+	lockTimeout := Interruption{Code: "55P03", Message: "queryguard: canceling statement due to lock timeout", Hint: "Retry later."}
+	if !h.interrupt(lockTimeout) {
+		t.Fatal("interrupt of a running statement reported nothing to cancel")
+	}
+
+	expect(t, h.cancels, struct{}{})
+	h.reply(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "57014", Message: "canceling statement due to user request"},
+		&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "55P03", Message: lockTimeout.Message, Hint: lockTimeout.Hint},
+		&pgproto3.ReadyForQuery{TxStatus: 'I'})
+}
+
+func TestInterruptLeavesAnIdleSessionAlone(t *testing.T) {
+	h := start(t, fakeChecker{})
+
+	if h.interrupt(Interruption{Code: "55P03", Message: "queryguard: canceling statement due to lock timeout"}) {
+		t.Error("interrupt of an idle session reported a cancel")
+	}
+	expectNone(t, h.cancels, "cancelled an idle session")
+}
+
 func TestNoCancelForStatementWithinItsTimeout(t *testing.T) {
 	a := newAdmitter()
 	a.timeout = 200 * time.Millisecond
@@ -811,6 +837,21 @@ type harness struct {
 	done    chan struct{} // closed when Relay returns
 	cancels chan struct{} // gets a value each time the session asks Postgres to cancel
 	err     error         // what Relay returned, once done is closed
+
+	interrupts chan func(Interruption) bool // gets Options.Interrupt's func
+}
+
+// interrupt cancels what the session runs, with i as the reason.
+func (h *harness) interrupt(i Interruption) bool {
+	h.t.Helper()
+	var f func(Interruption) bool
+	select {
+	case f = <-h.interrupts:
+	case <-time.After(2 * time.Second):
+		h.t.Fatal("Relay gave no interrupt func")
+	}
+	h.interrupts <- f
+	return f(i)
 }
 
 func start(t *testing.T, check Checker) *harness {
@@ -828,10 +869,11 @@ func startWithLogin(t *testing.T, check Checker, login func(io.Writer, io.Reader
 	t.Helper()
 	client, proxyClient := tcpPair(t)
 	pg, proxyServer := tcpPair(t)
-	h := &harness{t: t, client: client, pg: pg, done: make(chan struct{}), cancels: make(chan struct{}, 10)}
+	h := &harness{t: t, client: client, pg: pg, done: make(chan struct{}), cancels: make(chan struct{}, 10), interrupts: make(chan func(Interruption) bool, 1)}
 	go func() {
 		defer close(h.done)
-		h.err = Relay(proxyClient, proxyServer, Options{Check: check, Login: login, Cancel: func() { h.cancels <- struct{}{} }})
+		h.err = Relay(proxyClient, proxyServer, Options{Check: check, Login: login, Cancel: func() { h.cancels <- struct{}{} },
+			Interrupt: func(f func(Interruption) bool) { h.interrupts <- f }})
 	}()
 	t.Cleanup(func() {
 		client.Close()

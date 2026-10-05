@@ -23,6 +23,7 @@ import (
 	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/sched"
+	"github.com/Avik-creator/queryguard/pkg/session"
 	"github.com/Avik-creator/queryguard/pkg/wire"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -709,6 +710,117 @@ func TestFeedsLockWaitsToTheScheduler(t *testing.T) {
 		}
 		stop()
 		<-done
+	})
+}
+
+func TestDDLGuard(t *testing.T) {
+	queued := plan.Activity{Waiting: map[int32]plan.Wait{10: {Blockers: []int32{5}}, 11: {Blockers: []int32{10}}}}
+	alone := func(waited time.Duration) plan.Activity {
+		return plan.Activity{Waiting: map[int32]plan.Wait{10: {Blockers: []int32{5}, Waited: waited}}}
+	}
+	for name, tc := range map[string]struct {
+		config string
+		ddl    bool
+		a      plan.Activity
+		cancel bool
+	}{
+		"DDL with statements queued behind it": {`{}`, true, queued, true},
+		"DDL waiting briefly":                  {`{}`, true, alone(time.Second), false},
+		"DDL waiting past lock_timeout":        {`{}`, true, alone(3 * time.Second), true},
+		"DDL waiting past a longer timeout":    {`{"ddl_guard": {"lock_timeout": "5s"}}`, true, alone(3 * time.Second), false},
+		"a query, not DDL":                     {`{}`, false, queued, false},
+		"warn mode":                            {`{"ddl_guard": {"mode": "warn"}}`, true, queued, false},
+		"a tenant in warn mode":                {`{"tenants": {"alice": {"mode": "warn"}}}`, true, queued, false},
+		"guard off":                            {`{"ddl_guard": {"mode": "off"}}`, true, queued, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var logs bytes.Buffer
+			s := &Server{Logger: slog.New(slog.NewTextHandler(&logs, nil))}
+			s.SetPolicy(mustPolicy(t, tc.config))
+			b := &backend{}
+			defer s.backends.add(10, b)()
+			got := make(chan session.Interruption, 2)
+			b.setInterrupt(func(i session.Interruption) bool {
+				got <- i
+				return true
+			})
+			b.Running("alice", tc.ddl)
+
+			s.observe(tc.a)
+			s.observe(tc.a)
+
+			switch {
+			case tc.cancel:
+				if len(got) == 0 {
+					t.Fatalf("not cancelled; log %q", logs.String())
+				}
+				if i := <-got; i.Code != "55P03" {
+					t.Errorf("interrupted with %+v; want 55P03 lock_not_available", i)
+				}
+				if len(got) > 0 {
+					t.Error("the same statement was cancelled twice")
+				}
+				if !strings.Contains(logs.String(), "cancelled DDL waiting on a lock") {
+					t.Errorf("log %q; want the cancel", logs.String())
+				}
+			case len(got) > 0:
+				t.Errorf("interrupted with %+v; want no cancel", <-got)
+			case strings.Contains(name, "warn") && strings.Count(logs.String(), "would cancel DDL waiting on a lock") != 1:
+				t.Errorf("log %q; want one would-be cancel", logs.String())
+			}
+		})
+	}
+}
+
+func TestBlockerPaysForTheWaitsItCauses(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := &Server{Logger: slog.New(slog.DiscardHandler)}
+		// 1000 cost units take 0.1s here, so a second of waiting is worth 10000.
+		for range 10 {
+			s.History.Ran("s", plan.Plan{Cost: 1000}, 100*time.Millisecond, true, plan.Tuning{})
+		}
+		s.SetPolicy(mustPolicy(t, `{"tenants": {"waiter": {"budget": {"rate": 1, "burst": 20000, "when_over": "reject"}},
+			"holder": {"budget": {"rate": 1, "burst": 15000, "when_over": "reject"}}}}`))
+		waiter, holder := &backend{}, &backend{}
+		defer s.backends.add(10, waiter)()
+		defer s.backends.add(5, holder)()
+		waiter.Running("waiter", false)
+		holder.Running("holder", false)
+		s.scheduler().Charge("waiter", 25000)
+		waits := plan.Activity{Waiting: map[int32]plan.Wait{10: {Blockers: []int32{5}}}}
+
+		s.observe(waits)
+		time.Sleep(2 * time.Second)
+		s.observe(waits)
+
+		// Two seconds of waiting cost 20000: the holder had 15000, and the waiter, who owed 5000, is paid back.
+		if !s.scheduler().Spent("holder") || s.scheduler().Spent("waiter") {
+			t.Errorf("holder spent %v, waiter spent %v; want the holder to owe and the waiter not", s.scheduler().Spent("holder"), s.scheduler().Spent("waiter"))
+		}
+	})
+}
+
+func TestBlockerPaysCanBeTurnedOff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := &Server{Logger: slog.New(slog.DiscardHandler)}
+		for range 10 {
+			s.History.Ran("s", plan.Plan{Cost: 1000}, 100*time.Millisecond, true, plan.Tuning{})
+		}
+		s.SetPolicy(mustPolicy(t, `{"scheduler": {"blocker_pays": "off"}, "tenants": {"holder": {"budget": {"rate": 1, "burst": 15000, "when_over": "reject"}}}}`))
+		waiter, holder := &backend{}, &backend{}
+		defer s.backends.add(10, waiter)()
+		defer s.backends.add(5, holder)()
+		waiter.Running("waiter", false)
+		holder.Running("holder", false)
+		waits := plan.Activity{Waiting: map[int32]plan.Wait{10: {Blockers: []int32{5}}}}
+
+		s.observe(waits)
+		time.Sleep(2 * time.Second)
+		s.observe(waits)
+
+		if s.scheduler().Spent("holder") {
+			t.Error("the holder was charged with blocker_pays off")
+		}
 	})
 }
 

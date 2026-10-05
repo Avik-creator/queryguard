@@ -268,6 +268,21 @@ func TestHistoryServerTimingWeighsRunsByCost(t *testing.T) {
 	}
 }
 
+func TestHistoryCostOfTime(t *testing.T) {
+	var h History
+	if c, ok := h.CostOf(time.Second); ok {
+		t.Errorf("CostOf with nothing learned = %v; want unknown", c)
+	}
+	for range 10 {
+		h.Ran("s", Plan{Cost: 1000, Shape: 1}, 100*time.Millisecond, true, Tuning{})
+	}
+
+	// 1000 cost units take 0.1s on this server, so a second is worth 10000 of them.
+	if c, ok := h.CostOf(time.Second); !ok || math.Abs(c-10_000) > 1 {
+		t.Errorf("CostOf(1s) = %v, %v; want 10000", c, ok)
+	}
+}
+
 func TestHistoryNewPlanLearnsItsOwnFactor(t *testing.T) {
 	var h History
 	p := mustParse(t, lookup)

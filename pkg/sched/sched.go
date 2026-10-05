@@ -496,3 +496,25 @@ func (s *Scheduler) waiting(id LaneID) int {
 	defer s.mu.Unlock()
 	return len(s.lanes[id].waiters)
 }
+
+// Transfer moves cost from one tenant to another, as from a tenant kept waiting on locks to the tenant holding them.
+func (s *Scheduler) Transfer(from, to string, cost float64) {
+	if cost <= 0 || from == to {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, t := s.budget(from), s.refresh(from)
+	if b.Rate > 0 {
+		t.tokens = min(b.Burst, t.tokens+cost)
+	}
+	t.usage = max(0, t.usage-cost)
+	b, t = s.budget(to), s.refresh(to)
+	if b.Rate > 0 {
+		t.tokens -= cost
+	}
+	t.usage += cost
+	if len(s.tenants) > maxTenants {
+		s.forgetIdle()
+	}
+}

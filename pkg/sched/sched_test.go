@@ -169,6 +169,23 @@ func TestRefundGivesBackACharge(t *testing.T) {
 	})
 }
 
+func TestTransferMovesCostBetweenTenants(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Budgets: map[string]Budget{"holder": {Rate: 1, Burst: 100, WhenOver: Reject}, "waiter": {Rate: 1, Burst: 100, WhenOver: Reject}}})
+		s.Charge("waiter", 120)
+
+		// The waiter gets back more than it owes; the holder pays from its 100.
+		s.Transfer("waiter", "holder", 50)
+		if s.Spent("waiter") || s.Spent("holder") {
+			t.Errorf("after 50: waiter spent %v, holder spent %v; want neither", s.Spent("waiter"), s.Spent("holder"))
+		}
+		s.Transfer("waiter", "holder", 60)
+		if s.Spent("waiter") || !s.Spent("holder") {
+			t.Errorf("after 110: waiter spent %v, holder spent %v; want only the holder", s.Spent("waiter"), s.Spent("holder"))
+		}
+	})
+}
+
 func TestSpentReportsDebt(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := New(Config{Budgets: map[string]Budget{"acme": {Rate: 10, Burst: 10}}})

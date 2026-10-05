@@ -231,6 +231,34 @@ CREATE ROLE queryguard_catalog LOGIN PASSWORD '…' IN ROLE pg_monitor;
 A reading that fails is logged and skipped, and the connection is opened
 again for the next one.
 
+### DDL that waits on a lock
+
+`ALTER TABLE` needs an `ACCESS EXCLUSIVE` lock. Behind a long transaction it
+waits, and every statement on the table that comes after it queues behind its
+request, so one migration can stop a whole application. With server activity
+on, QueryGuard cancels its own sessions' DDL that waits on a lock while other
+backends wait behind it, or that waits longer than `lock_timeout` (2s) with
+no one behind it:
+
+```json
+"ddl_guard": {"mode": "enforce", "lock_timeout": "2s"}
+```
+
+The client gets SQLSTATE `55P03` (`lock_not_available`), the error of
+PostgreSQL's own `lock_timeout`, which migration tools know to retry. `warn`
+only logs what would be cancelled, as does a tenant in warn mode; `off` turns
+the guard off. Readings come once a second, so a statement may wait up to
+about a second behind the DDL before it is cancelled.
+
+### Blocker pays
+
+Time a tenant's statements spend waiting on another tenant's locks is
+charged to the tenant holding them, and given back to the one waiting:
+each second of waiting costs what a second of running does on this server,
+learned from how statements run. A wait on several backends is split among
+them. Only QueryGuard's own sessions are charged; `"blocker_pays": "off"`
+under `scheduler` turns it off.
+
 ## Tenants, budgets and the scheduler
 
 A tenant is the database role by default. Roles listed in `trusted_roles`,
