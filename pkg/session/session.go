@@ -66,6 +66,8 @@ type Admission struct {
 	Ran func(took time.Duration, finished bool)
 	// Settled is called once the session is next idle outside a transaction, so what the statement did is committed or undone.
 	Settled func()
+	// Idle is called once the server is next idle, whether or not the statement ran, as after a Bind without an Execute.
+	Idle func()
 }
 
 // Explain gets the plan of the statement about to run.
@@ -211,6 +213,7 @@ type session struct {
 	idleGen     int           // bumped by each client message, so an idle timer firing late does nothing
 	interrupted *Interruption // why the proxy cancelled the running statement, so Postgres's cancel error says so
 	settled     []func()      // from admissions, called once the session is idle outside a transaction
+	idle        []func()      // what admitted statements want called once the server is next idle
 
 	// Only fromClient uses these.
 	inBatch    bool                      // extended-protocol messages went to the server since the last Sync
@@ -556,6 +559,9 @@ func (s *session) admit(gate Gate, on byte, e Explain) *pgproto3.ErrorResponse {
 	if a.Settled != nil {
 		s.settled = append(s.settled, a.Settled)
 	}
+	if a.Idle != nil {
+		s.idle = append(s.idle, a.Idle)
+	}
 	if a.Timeout > 0 {
 		if s.stmtTimer == nil {
 			s.stmtTimer = time.AfterFunc(a.Timeout, s.statementTimedOut)
@@ -651,6 +657,10 @@ func (s *session) becameIdle() {
 		return
 	}
 	s.freeSlot()
+	for _, f := range s.idle {
+		f()
+	}
+	s.idle = nil
 	if s.status == 'I' {
 		s.settle()
 	}

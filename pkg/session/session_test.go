@@ -455,6 +455,21 @@ func TestInterruptCancelsWithItsOwnError(t *testing.T) {
 		&pgproto3.ReadyForQuery{TxStatus: 'I'})
 }
 
+func TestIdleIsCalledOnceTheServerIsIdleEvenIfTheStatementNeverRan(t *testing.T) {
+	a := newAdmitter()
+	h := start(t, fakeChecker{admit: a})
+
+	// A Bind without an Execute passes the gate, but Postgres never runs the statement, so it never reports how it ran.
+	h.send(&pgproto3.Parse{Name: "s1", Query: "select slot"}, &pgproto3.Bind{PreparedStatement: "s1"}, &pgproto3.Sync{})
+	h.serverGets(&pgproto3.Parse{Name: "s1", Query: "select slot"}, &pgproto3.Bind{PreparedStatement: "s1"}, &pgproto3.Sync{})
+	expect(t, a.running, false)
+	expectNone(t, a.idled, "called Idle while the server was busy")
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	expect(t, a.idled, struct{}{})
+	expectNone(t, a.ran, "reported a run of a statement never executed")
+}
+
 func TestInterruptLeavesAnIdleSessionAlone(t *testing.T) {
 	h := start(t, fakeChecker{})
 
@@ -764,6 +779,7 @@ type admitter struct {
 	waited        chan error    // gets why each "wait" statement's wait ended
 	ran           chan run      // gets how each admitted statement ran
 	settled       chan struct{} // gets a value when an admitted statement's transaction has ended
+	idled         chan struct{} // gets a value when the server is idle after an admitted statement
 }
 
 // run is what a session reports of a statement once it ends.
@@ -774,7 +790,7 @@ type run struct {
 
 func newAdmitter() *admitter {
 	return &admitter{running: make(chan bool, 10), released: make(chan struct{}, 10), waited: make(chan error, 10), ran: make(chan run, 10),
-		settled: make(chan struct{}, 10)}
+		settled: make(chan struct{}, 10), idled: make(chan struct{}, 10)}
 }
 
 func (c fakeChecker) Check(sql string, set Settings) (*pgproto3.ErrorResponse, Gate) {
@@ -795,7 +811,7 @@ func (c fakeChecker) Check(sql string, set Settings) (*pgproto3.ErrorResponse, G
 			c.admit.running <- running
 			a := Admission{Timeout: c.admit.timeout, IdleInTransaction: c.admit.idle, Ran: func(took time.Duration, finished bool) {
 				c.admit.ran <- run{took, finished}
-			}, Settled: func() { c.admit.settled <- struct{}{} }}
+			}, Settled: func() { c.admit.settled <- struct{}{} }, Idle: func() { c.admit.idled <- struct{}{} }}
 			if !running {
 				a.Release = sync.OnceFunc(func() { c.admit.released <- struct{}{} })
 			}
