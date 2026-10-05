@@ -2105,3 +2105,20 @@ func TestMetricsCountStatementsAndOpenSessions(t *testing.T) {
 		}
 	}
 }
+
+func TestListenWithReusePortSharesTheAddress(t *testing.T) {
+	first, err := Listen(t.Context(), "127.0.0.1:0", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := Listen(t.Context(), first.Addr().String(), true)
+	if err != nil {
+		t.Fatalf("a second listener on %s with reuse-port: %v", first.Addr(), err)
+	}
+	second.Close()
+	if third, err := Listen(t.Context(), first.Addr().String(), false); err == nil {
+		third.Close()
+		t.Error("a listener without reuse-port shared the address")
+	}
+}

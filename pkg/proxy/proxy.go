@@ -143,6 +143,21 @@ type Monitor interface {
 	Run(ctx context.Context, report func(plan.Activity))
 }
 
+// Listen listens on addr; with reusePort, other processes may listen on it too, so a new one can take connections while an old one drains.
+func Listen(ctx context.Context, addr string, reusePort bool) (net.Listener, error) {
+	var lc net.ListenConfig
+	if reusePort {
+		lc.Control = func(_, _ string, raw syscall.RawConn) error {
+			var err error
+			if cerr := raw.Control(func(fd uintptr) { err = setReusePort(fd) }); cerr != nil {
+				return cerr
+			}
+			return err
+		}
+	}
+	return lc.Listen(ctx, "tcp", addr)
+}
+
 // Serve accepts on ln until ctx is cancelled, then drains sessions for up to ShutdownTimeout.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	log := cmp.Or(s.Logger, slog.Default())
