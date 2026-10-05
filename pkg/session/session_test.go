@@ -1360,6 +1360,39 @@ func TestCancelsAReadPastItsRowCap(t *testing.T) {
 	}
 }
 
+func TestCancelsAPreparedReadPastItsRowCap(t *testing.T) {
+	a := newAdmitter()
+	a.maxRows = 2
+	h := start(t, fakeChecker{admit: a})
+	row := &pgproto3.DataRow{Values: [][]byte{[]byte("x")}}
+	parse := &pgproto3.Parse{Name: "s1", Query: "select slot from big"}
+
+	h.send(parse, &pgproto3.Bind{PreparedStatement: "s1"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	h.serverGets(parse, &pgproto3.Bind{PreparedStatement: "s1"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, row, row, row)
+
+	expect(t, h.cancels, struct{}{})
+}
+
+func TestLeavesAReadAfterAnotherInTheSameSyncUncut(t *testing.T) {
+	a := newAdmitter()
+	a.maxRows = 2
+	h := start(t, fakeChecker{admit: a})
+	row := &pgproto3.DataRow{Values: [][]byte{[]byte("x")}}
+	p1, p2 := &pgproto3.Parse{Name: "a", Query: "update orders set n = 1"}, &pgproto3.Parse{Name: "b", Query: "select slot from big"}
+
+	// Both run in one implicit transaction, so cancelling the read would roll back the update.
+	h.send(p1, &pgproto3.Bind{PreparedStatement: "a"}, &pgproto3.Execute{}, &pgproto3.Flush{})
+	h.serverGets(p1, &pgproto3.Bind{PreparedStatement: "a"}, &pgproto3.Execute{}, &pgproto3.Flush{})
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, &pgproto3.CommandComplete{CommandTag: []byte("UPDATE 1")})
+	h.clientGets(&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, &pgproto3.CommandComplete{CommandTag: []byte("UPDATE 1")})
+	h.send(p2, &pgproto3.Bind{PreparedStatement: "b"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	h.serverGets(p2, &pgproto3.Bind{PreparedStatement: "b"}, &pgproto3.Execute{}, &pgproto3.Sync{})
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, row, row, row)
+
+	expectNone(t, h.cancels, "cancel of a read sharing its implicit transaction with an update")
+}
+
 func TestLeavesAReadInATransactionUncut(t *testing.T) {
 	a := newAdmitter()
 	a.maxRows = 2

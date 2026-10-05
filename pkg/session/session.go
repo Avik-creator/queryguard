@@ -256,6 +256,7 @@ type session struct {
 
 	// Only fromClient uses these.
 	inBatch    bool                 // extended-protocol messages went to the server since the last Sync
+	batchRan   bool                 // an Execute went since the last Sync, so a later one shares its implicit transaction
 	discard    untilSync            // what to do with client messages after a rejected Parse
 	statements map[string]statement // prepared statements with a cost check, by name
 	record     func(Finished)       // from Options
@@ -1137,7 +1138,14 @@ func (s *session) track(typ byte, how answer) {
 	// Postgres sends a pipeline's answers together at Sync, so a statement behind another running one can't be timed on its own.
 	timed := (m.ran != nil && m.ran.ran != nil) || (m.sql != "" && (typ == 'Q' || typ == 'E'))
 	// A statement in a transaction isn't cut short, since cancelling it would roll back what the transaction already did.
-	m.capped = m.ran != nil && len(s.pending) == 0 && s.status == 'I'
+	m.capped = m.ran != nil && s.status == 'I' && !s.batchRan &&
+		!slices.ContainsFunc(s.pending, func(p sent) bool { return p.typ == 'Q' || p.typ == 'E' || p.typ == 'S' })
+	switch typ {
+	case 'E':
+		s.batchRan = true
+	case 'S':
+		s.batchRan = false
+	}
 	if timed && !slices.ContainsFunc(s.pending, func(p sent) bool { return p.typ == 'Q' || p.typ == 'E' }) {
 		m.start = time.Now()
 	}
