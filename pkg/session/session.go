@@ -1358,7 +1358,7 @@ func (s *session) answered(typ byte, n int, r reply) answer {
 	if !head.start.IsZero() && !(head.typ == 'E' && executesBeforeSync(s.pending)) {
 		took = time.Since(head.start)
 	}
-	// A suspended portal or an empty query ran nothing that says how its plan does.
+	// A suspended portal or an empty query ran nothing that says how its plan does; the hookless Executes that finish a portal go uncounted.
 	if h := head.ran; h != nil && typ != 's' {
 		if h.ran != nil && typ != 'I' {
 			h.ran(took, !head.failed && typ != 'E')
