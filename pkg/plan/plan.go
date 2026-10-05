@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Avik-creator/queryguard/internal/safe"
+	"github.com/Avik-creator/queryguard/pkg/stats"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -466,14 +467,14 @@ type Catalog struct {
 	Log      *slog.Logger  // nil means slog.Default()
 
 	// load reads one database's table sizes; nil reads them from Postgres at DSN.
-	load func(ctx context.Context, database string) (map[Table]stats, error)
+	load func(ctx context.Context, database string) (map[Table]tableStats, error)
 
 	mu        sync.Mutex
 	databases map[string]*sizes
 }
 
-// stats are one table's planner statistics.
-type stats struct {
+// tableStats are one table's planner statistics.
+type tableStats struct {
 	rows     float64 // pg_class.reltuples, -1 until the table is first analyzed
 	modified float64 // n_mod_since_analyze: rows inserted, updated or deleted since
 }
@@ -482,7 +483,7 @@ type stats struct {
 type sizes struct {
 	first     func() // loads the sizes on the first call only
 	mu        sync.Mutex
-	tables    map[Table]stats
+	tables    map[Table]tableStats
 	loaded    time.Time
 	reloading bool
 }
@@ -501,7 +502,7 @@ func (c *Catalog) Stale(database string, t Table) bool {
 }
 
 // lookup returns t's statistics in database, as Rows describes, waiting for the first load only if wait is set.
-func (c *Catalog) lookup(database string, t Table, wait bool) (stats, bool) {
+func (c *Catalog) lookup(database string, t Table, wait bool) (tableStats, bool) {
 	c.mu.Lock()
 	if c.databases == nil {
 		c.databases = map[string]*sizes{}
@@ -522,7 +523,7 @@ func (c *Catalog) lookup(database string, t Table, wait bool) (stats, bool) {
 	if s.loaded.IsZero() {
 		// Only a lookup that doesn't wait gets here before the first load has ended.
 		go s.first()
-		return stats{}, false
+		return tableStats{}, false
 	}
 	if !s.reloading && time.Since(s.loaded) > cmp.Or(c.Interval, DefaultCatalogInterval) {
 		s.reloading = true
@@ -541,7 +542,7 @@ func (c *Catalog) reload(database string, s *sizes) {
 		load = c.query
 	}
 	// A panic in the load is a failed load, so the statements waiting on it go on without sizes.
-	tables, err := func() (_ map[Table]stats, err error) {
+	tables, err := func() (_ map[Table]tableStats, err error) {
 		defer safe.Recover(func(p error) { err = p })
 		return load(ctx, database)
 	}()
@@ -558,7 +559,7 @@ func (c *Catalog) reload(database string, s *sizes) {
 }
 
 // query reads every table's row count in database from pg_class, and its changes since it was analyzed from pg_stat_all_tables.
-func (c *Catalog) query(ctx context.Context, database string) (map[Table]stats, error) {
+func (c *Catalog) query(ctx context.Context, database string) (map[Table]tableStats, error) {
 	cfg, err := pgx.ParseConfig(c.DSN)
 	if err != nil {
 		return nil, err
@@ -577,9 +578,9 @@ func (c *Catalog) query(ctx context.Context, database string) (map[Table]stats, 
 	if err != nil {
 		return nil, err
 	}
-	tables := map[Table]stats{}
+	tables := map[Table]tableStats{}
 	var t Table
-	var st stats
+	var st tableStats
 	_, err = pgx.ForEachRow(rows, []any{&t.Schema, &t.Name, &st.rows, &st.modified}, func() error {
 		tables[t] = st
 		return nil
@@ -590,15 +591,22 @@ func (c *Catalog) query(ctx context.Context, database string) (map[Table]stats, 
 // DefaultMonitorInterval is how often a Monitor reads the server's activity when its Interval is zero.
 const DefaultMonitorInterval = time.Second
 
+// DefaultStatementsInterval is how often a Monitor reads pg_stat_statements when its StatementsEvery is zero; it can hold thousands of rows.
+const DefaultStatementsInterval = 10 * time.Second
+
 // Monitor reads what the whole server is doing over its own connection, for signals no single session sees.
 type Monitor struct {
 	DSN      string         // connection string for a role in pg_monitor; watched tables are in its database
 	Interval time.Duration  // how often it reads; 0 means DefaultMonitorInterval
 	Watch    func() []Table // tables whose dead tuples are reported; nil watches none
 	Log      *slog.Logger   // nil means slog.Default()
+	// StatementsEvery is how often pg_stat_statements is read, when installed in DSN's database; 0 means DefaultStatementsInterval.
+	StatementsEvery time.Duration
 
 	// read reads the activity once; nil reads it from Postgres at DSN.
 	read func(ctx context.Context, watch []Table) (Activity, error)
+	// readStatements reads pg_stat_statements once, nil when it isn't installed; nil reads it from Postgres at DSN.
+	readStatements func(ctx context.Context) ([]stats.Counters, error)
 }
 
 // Activity is what the server was doing at one reading.
@@ -608,6 +616,7 @@ type Activity struct {
 	Horizon        Snapshot          // the backend holding back the MVCC horizon most; PID 0 when none
 	DeadTuples     map[Table]float64 // of the watched tables
 	FinishedWaits  float64           // sessions that waited on locks, on average, in waits that ended since the last reading (PG19)
+	Statements     []stats.Counters  // pg_stat_statements' entries, at the readings that read them; nil at the others
 	finishedWaitMS float64           // pg_stat_lock's total wait_time, in milliseconds
 }
 
@@ -632,15 +641,19 @@ const staleReads = 3
 // Run reads the activity every Interval and passes each reading to report, until ctx ends; a failed reading is logged and
 // skipped, and after staleReads of them in a row an empty Activity is reported.
 func (m *Monitor) Run(ctx context.Context, report func(Activity)) {
-	read := m.read
+	var r activityReader
+	defer r.close()
+	read, readStatements := m.read, m.readStatements
 	if read == nil {
-		var r activityReader
-		defer r.close()
 		read = func(ctx context.Context, watch []Table) (Activity, error) { return r.read(ctx, m.DSN, watch) }
+	}
+	if readStatements == nil {
+		readStatements = func(ctx context.Context) ([]stats.Counters, error) { return r.statements(ctx, m.DSN) }
 	}
 	var last Activity
 	var lastAt time.Time
 	failed := 0
+	statementsAt, statementsErr := time.Now(), ""
 	tick := time.Tick(cmp.Or(m.Interval, DefaultMonitorInterval))
 	for {
 		select {
@@ -672,6 +685,27 @@ func (m *Monitor) Run(ctx context.Context, report func(Activity)) {
 			a.FinishedWaits = (a.finishedWaitMS - last.finishedWaitMS) / float64(time.Since(lastAt).Milliseconds())
 		}
 		last, lastAt = a, time.Now()
+		if time.Since(statementsAt) >= cmp.Or(m.StatementsEvery, DefaultStatementsInterval) {
+			statementsAt = time.Now()
+			rctx, cancel := context.WithTimeout(ctx, catalogTimeout)
+			cs, err := readStatements(rctx)
+			cancel()
+			switch {
+			case err != nil:
+				// A server without pg_stat_statements in shared_preload_libraries fails every read, so the same error is logged once.
+				if err.Error() != statementsErr && ctx.Err() == nil {
+					cmp.Or(m.Log, slog.Default()).Warn("read pg_stat_statements", "err", err)
+				}
+				statementsErr = err.Error()
+			default:
+				statementsErr = ""
+				// An empty reading still says what pg_stat_statements no longer has.
+				a.Statements = cs
+				if cs == nil {
+					a.Statements = []stats.Counters{}
+				}
+			}
+		}
 		report(a)
 	}
 }
@@ -679,29 +713,78 @@ func (m *Monitor) Run(ctx context.Context, report func(Activity)) {
 // activityReader reads the activity over one connection, opened on first use and again after a failure.
 type activityReader struct {
 	conn    *pgx.Conn
-	version int // server_version_num
+	version int    // server_version_num
+	pgss    string // the schema of pg_stat_statements, once found
 }
 
 // pg19 is the first server_version_num with pg_stat_lock.
 const pg19 = 190000
 
 func (r *activityReader) read(ctx context.Context, dsn string, watch []Table) (Activity, error) {
-	if r.conn == nil {
-		conn, err := pgx.Connect(ctx, dsn)
-		if err != nil {
-			return Activity{}, err
-		}
-		if err := conn.QueryRow(ctx, "select current_setting('server_version_num')::int").Scan(&r.version); err != nil {
-			conn.Close(context.Background())
-			return Activity{}, err
-		}
-		r.conn = conn
+	if err := r.connect(ctx, dsn); err != nil {
+		return Activity{}, err
 	}
 	a, err := r.query(ctx, watch)
 	if err != nil {
 		r.close()
 	}
 	return a, err
+}
+
+// connect opens the connection when there is none.
+func (r *activityReader) connect(ctx context.Context, dsn string) error {
+	if r.conn != nil {
+		return nil
+	}
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	if err := conn.QueryRow(ctx, "select current_setting('server_version_num')::int").Scan(&r.version); err != nil {
+		conn.Close(context.Background())
+		return err
+	}
+	r.conn = conn
+	return nil
+}
+
+// statements reads every top-level pg_stat_statements entry whose text the role may see; nil when the extension isn't installed.
+func (r *activityReader) statements(ctx context.Context, dsn string) ([]stats.Counters, error) {
+	if err := r.connect(ctx, dsn); err != nil {
+		return nil, err
+	}
+	// The view lives in the schema the extension was created in, and is looked for each time until it is.
+	if r.pgss == "" {
+		err := r.conn.QueryRow(ctx, `select n.nspname from pg_extension e join pg_namespace n on n.oid = e.extnamespace
+			where e.extname = 'pg_stat_statements'`).Scan(&r.pgss)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Without pg_read_all_stats, other roles' entries have no text and no query ID.
+	rows, err := r.conn.Query(ctx, `select d.datname, u.rolname, s.queryid, s.query, s.calls, s.shared_blks_hit, s.shared_blks_read,
+		s.temp_blks_read, s.temp_blks_written, s.wal_bytes::float8
+		from `+pgx.Identifier{r.pgss, "pg_stat_statements"}.Sanitize()+` s
+		join pg_database d on d.oid = s.dbid join pg_roles u on u.oid = s.userid
+		where s.toplevel and s.queryid is not null`)
+	if err != nil {
+		r.pgss = ""
+		return nil, err
+	}
+	var c stats.Counters
+	var out []stats.Counters
+	_, err = pgx.ForEachRow(rows, []any{&c.Database, &c.Role, &c.QueryID, &c.Query, &c.Calls, &c.SharedHit, &c.SharedRead,
+		&c.TempRead, &c.TempWritten, &c.WALBytes}, func() error {
+		out = append(out, c)
+		return nil
+	})
+	if err != nil {
+		r.pgss = ""
+	}
+	return out, err
 }
 
 func (r *activityReader) close() {

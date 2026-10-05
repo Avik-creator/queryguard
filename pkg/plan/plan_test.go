@@ -14,6 +14,8 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/Avik-creator/queryguard/pkg/stats"
 )
 
 // update and count are trimmed from EXPLAIN (FORMAT JSON, VERBOSE) on Postgres 18 over the test schema.
@@ -127,9 +129,9 @@ func TestCacheStaysWithinSize(t *testing.T) {
 func TestCatalogLoadsOnFirstUseAndRefreshesInBackground(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var loads atomic.Int32
-		c := &Catalog{Interval: time.Minute, load: func(_ context.Context, database string) (map[Table]stats, error) {
+		c := &Catalog{Interval: time.Minute, load: func(_ context.Context, database string) (map[Table]tableStats, error) {
 			n := loads.Add(1)
-			return map[Table]stats{{"public", database}: {rows: float64(n * 100)}}, nil
+			return map[Table]tableStats{{"public", database}: {rows: float64(n * 100)}}, nil
 		}}
 		orders := Table{"public", "shop"}
 
@@ -153,8 +155,8 @@ func TestCatalogLoadsOnFirstUseAndRefreshesInBackground(t *testing.T) {
 }
 
 func TestCatalogKeepsDatabasesApart(t *testing.T) {
-	c := &Catalog{load: func(_ context.Context, database string) (map[Table]stats, error) {
-		return map[Table]stats{{"public", "t"}: {rows: float64(len(database))}}, nil
+	c := &Catalog{load: func(_ context.Context, database string) (map[Table]tableStats, error) {
+		return map[Table]tableStats{{"public", "t"}: {rows: float64(len(database))}}, nil
 	}}
 	a, _ := c.Rows("ab", Table{"public", "t"})
 	b, _ := c.Rows("abcd", Table{"public", "t"})
@@ -164,7 +166,7 @@ func TestCatalogKeepsDatabasesApart(t *testing.T) {
 }
 
 func TestCatalogWithoutSizesAfterFailedLoad(t *testing.T) {
-	c := &Catalog{load: func(context.Context, string) (map[Table]stats, error) { return nil, errors.New("refused") }}
+	c := &Catalog{load: func(context.Context, string) (map[Table]tableStats, error) { return nil, errors.New("refused") }}
 	if rows, ok := c.Rows("shop", Table{"public", "orders"}); ok {
 		t.Errorf("Rows = %v after a failed load; want unknown", rows)
 	}
@@ -173,7 +175,7 @@ func TestCatalogWithoutSizesAfterFailedLoad(t *testing.T) {
 func TestCatalogWithoutSizesAfterALoadPanics(t *testing.T) {
 	var logs bytes.Buffer
 	c := &Catalog{Log: slog.New(slog.NewTextHandler(&logs, nil)),
-		load: func(context.Context, string) (map[Table]stats, error) { panic("bug") }}
+		load: func(context.Context, string) (map[Table]tableStats, error) { panic("bug") }}
 
 	if rows, ok := c.Rows("shop", Table{"public", "orders"}); ok {
 		t.Errorf("Rows = %v after a load panicked; want unknown", rows)
@@ -521,9 +523,9 @@ func TestCacheForget(t *testing.T) {
 func TestCatalogStaleNeverWaitsForAFirstLoad(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		release := make(chan struct{})
-		c := &Catalog{load: func(context.Context, string) (map[Table]stats, error) {
+		c := &Catalog{load: func(context.Context, string) (map[Table]tableStats, error) {
 			<-release
-			return map[Table]stats{{"public", "t"}: {rows: 10, modified: 1000}}, nil
+			return map[Table]tableStats{{"public", "t"}: {rows: 10, modified: 1000}}, nil
 		}}
 
 		// It answers while a session waits on it, so it reports nothing until the sizes arrive.
@@ -539,8 +541,8 @@ func TestCatalogStaleNeverWaitsForAFirstLoad(t *testing.T) {
 }
 
 func TestCatalogStaleTables(t *testing.T) {
-	c := &Catalog{load: func(context.Context, string) (map[Table]stats, error) {
-		return map[Table]stats{
+	c := &Catalog{load: func(context.Context, string) (map[Table]tableStats, error) {
+		return map[Table]tableStats{
 			{"public", "fresh"}:   {rows: 10_000, modified: 1000},
 			{"public", "stale"}:   {rows: 10_000, modified: 5000},
 			{"public", "new"}:     {rows: -1, modified: 100},
@@ -694,4 +696,76 @@ func TestHistoryKeepsTheTimingOfBoundedTenants(t *testing.T) {
 	if n := len(h.tenants); n > maxTenants {
 		t.Errorf("History keeps %d tenants' timing; want at most %d", n, maxTenants)
 	}
+}
+
+func TestMonitorReadsStatementCountersLessOften(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		counters := []stats.Counters{{Database: "shop", Role: "app", QueryID: 1, Query: "select $1", Calls: 3}}
+		m := &Monitor{
+			read:           func(context.Context, []Table) (Activity, error) { return Activity{}, nil },
+			readStatements: func(context.Context) ([]stats.Counters, error) { return counters, nil },
+		}
+		var mu sync.Mutex
+		var with []int
+		ticks := 0
+		go m.Run(t.Context(), func(a Activity) {
+			mu.Lock()
+			defer mu.Unlock()
+			ticks++
+			if a.Statements != nil {
+				with = append(with, ticks)
+			}
+		})
+
+		time.Sleep(25*DefaultMonitorInterval + time.Millisecond)
+
+		mu.Lock()
+		defer mu.Unlock()
+		if !slices.Equal(with, []int{10, 20}) {
+			t.Errorf("statement counters came with readings %v; want every tenth, 10 and 20", with)
+		}
+	})
+}
+
+func TestMonitorLogsAStatementCounterErrorOnceWhileItLasts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var logs lockedBuffer
+		m := &Monitor{
+			StatementsEvery: DefaultMonitorInterval,
+			Log:             slog.New(slog.NewTextHandler(&logs, nil)),
+			read:            func(context.Context, []Table) (Activity, error) { return Activity{}, nil },
+			readStatements: func(context.Context) ([]stats.Counters, error) {
+				return nil, errors.New("pg_stat_statements must be loaded via shared_preload_libraries")
+			},
+		}
+		var reports atomic.Int32
+		go m.Run(t.Context(), func(a Activity) { reports.Add(1) })
+
+		time.Sleep(5*DefaultMonitorInterval + time.Millisecond)
+
+		if n := strings.Count(logs.String(), "shared_preload_libraries"); n != 1 {
+			t.Errorf("logged the error %d times; want once:\n%s", n, logs.String())
+		}
+		if n := reports.Load(); n != 5 {
+			t.Errorf("%d reports; want the activity still reported every interval, 5", n)
+		}
+	})
+}
+
+// lockedBuffer is a bytes.Buffer a logger can write while a test reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
