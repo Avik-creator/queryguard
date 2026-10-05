@@ -6,7 +6,9 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"io"
 	"log/slog"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -403,5 +405,40 @@ func TestCertificateReloadKeepsTheOldOneOnError(t *testing.T) {
 	writeFile(t, keyFile, []byte("not a key"))
 	if err := certs.reload(); err == nil || !bytes.Equal(offered(), second.Certificate[0]) {
 		t.Errorf("reload of a bad key = %v; want an error and the certificate in force kept", err)
+	}
+}
+
+func TestDecisionLogGetsOnlyRuleRecordsAndMetricsCountThem(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "decisions.jsonl")
+	var console bytes.Buffer
+	log, metrics, decisions, err := newLogger(options{decisionLog: path, metricsListen: "127.0.0.1:0"}, &console)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer decisions.Close()
+
+	log.Info("queryguard started")
+	log.Warn("rejected statement", "rule", "budget", "tenant", "acme")
+
+	got, _ := os.ReadFile(path)
+	if lines := strings.Count(string(got), "\n"); lines != 1 || !strings.Contains(string(got), `"rule":"budget"`) {
+		t.Errorf("decision log holds %q; want the one rejection as JSON", got)
+	}
+	if !strings.Contains(console.String(), "queryguard started") {
+		t.Errorf("console lost the other line: %q", console.String())
+	}
+	rec := httptest.NewRecorder()
+	metrics.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	for _, want := range []string{`queryguard_decisions_total{rule="budget",message="rejected statement"} 1`, `queryguard_build_info{version="dev"} 1`} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("metrics lack %s", want)
+		}
+	}
+}
+
+func TestNoTelemetryFlagsKeepJustTheConsole(t *testing.T) {
+	log, metrics, decisions, err := newLogger(options{}, io.Discard)
+	if err != nil || log == nil || metrics != nil || decisions != nil {
+		t.Errorf("got %v, %v, %v, %v; want a console logger only", log, metrics, decisions, err)
 	}
 }

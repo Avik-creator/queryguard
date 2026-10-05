@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"maps"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -32,6 +33,7 @@ import (
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/proxy"
 	"github.com/Avik-creator/queryguard/pkg/stats"
+	"github.com/Avik-creator/queryguard/pkg/telemetry"
 	"github.com/Avik-creator/queryguard/pkg/wire"
 	"github.com/jackc/pgx/v5"
 )
@@ -62,6 +64,8 @@ type options struct {
 	adminAuthDB     string
 	allowlistFile   string
 	trafficLog      string
+	metricsListen   string
+	decisionLog     string
 }
 
 func main() {
@@ -107,6 +111,10 @@ func main() {
 		"JSON file the learned allowlist is read from at start and saved to as it learns")
 	flag.StringVar(&opts.trafficLog, "traffic-log", "",
 		"JSON-lines file of every statement, without its values, kept for a day or two, for queryguard simulate; needs -stats-max above 0")
+	flag.StringVar(&opts.metricsListen, "metrics-listen", "",
+		"address to serve Prometheus metrics on at /metrics, such as 127.0.0.1:9187; empty serves none")
+	flag.StringVar(&opts.decisionLog, "decision-log", "",
+		"JSON-lines file of every decision a rule made, such as a rejected statement; reopened on SIGHUP for log rotation")
 	flag.DurationVar(&opts.shutdownTimeout, "shutdown-timeout", proxy.DefaultShutdownTimeout,
 		"how long open sessions may continue after a shutdown signal")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -117,14 +125,45 @@ func main() {
 		return
 	}
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	if err := run(opts, log); err != nil {
+	log, metrics, decisions, err := newLogger(opts, os.Stderr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "queryguard:", err)
+		os.Exit(1)
+	}
+	err = run(opts, log, metrics, decisions)
+	if decisions != nil {
+		decisions.Close()
+	}
+	if err != nil {
 		log.Error("queryguard stopped", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(opts options, log *slog.Logger) error {
+// newLogger returns the logger, writing to console, with the metrics registry and decision log the flags ask for; each may be nil.
+func newLogger(opts options, console io.Writer) (*slog.Logger, *telemetry.Registry, *telemetry.File, error) {
+	var metrics *telemetry.Registry
+	if opts.metricsListen != "" {
+		metrics = &telemetry.Registry{}
+		metrics.Gauge("queryguard_build_info", "Always 1, labelled with the running version.", func(emit func(float64, ...string)) { emit(1, version) }, "version")
+	}
+	var decisions *telemetry.File
+	var decisionLog slog.Handler
+	if opts.decisionLog != "" {
+		f, err := telemetry.OpenFile(opts.decisionLog)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("-decision-log: %w", err)
+		}
+		decisions, decisionLog = f, slog.NewJSONHandler(f, nil)
+	}
+	handler := slog.Handler(slog.NewTextHandler(console, nil))
+	if metrics != nil || decisionLog != nil {
+		handler = telemetry.NewDecisions(handler, metrics, decisionLog)
+	}
+	return slog.New(handler), metrics, decisions, nil
+}
+
+func run(opts options, log *slog.Logger, metrics *telemetry.Registry, decisions *telemetry.File) error {
 	certs, err := loadCertificates(opts.tlsCert, opts.tlsKey, opts.requireTLS)
 	if err != nil {
 		return err
@@ -161,6 +200,14 @@ func run(opts options, log *slog.Logger) error {
 	for _, w := range tlsWarnings(opts) {
 		log.Warn(w)
 	}
+	if metrics != nil {
+		stopMetrics, err := serveMetrics(opts.metricsListen, metrics, log)
+		if err != nil {
+			ln.Close()
+			return err
+		}
+		defer stopMetrics()
+	}
 	log.Info("queryguard started", "version", version, "listen", ln.Addr(), "upstream", opts.upstream,
 		"tls", tlsConfig != nil, "require_client_tls", opts.requireTLS, "upstream_sslmode", opts.upstreamSSL, "config", opts.config)
 
@@ -179,6 +226,7 @@ func run(opts options, log *slog.Logger) error {
 		Fleet:               fl,
 		ShutdownTimeout:     opts.shutdownTimeout,
 		Logger:              log,
+		Metrics:             metrics,
 	}
 	if fl != nil {
 		fl.Log = log
@@ -206,13 +254,31 @@ func run(opts options, log *slog.Logger) error {
 		}()
 	}
 	s.Monitor = newMonitor(catalog, s, log)
-	stopHangup := onHangup(log, func() { hangup(s, opts.config, catalog, certs, log) })
+	stopHangup := onHangup(log, func() { hangup(s, opts.config, catalog, certs, decisions, log) })
 	defer stopHangup()
 	if err := s.Serve(ctx, ln); err != nil {
 		return err
 	}
 	log.Info("queryguard stopped cleanly")
 	return nil
+}
+
+// serveMetrics serves metrics at /metrics on addr until stop is called.
+func serveMetrics(addr string, metrics *telemetry.Registry, log *slog.Logger) (stop func(), err error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("-metrics-listen: %w", err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", metrics)
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+			log.Error("metrics server stopped", "err", err)
+		}
+	}()
+	log.Info("serving metrics", "addr", ln.Addr())
+	return func() { srv.Close() }, nil
 }
 
 // loadPolicy reads the policy file, or returns nil when there is none.
@@ -611,11 +677,17 @@ func onHangup(log *slog.Logger, f func()) (stop func()) {
 	})
 }
 
-// hangup reloads the client TLS certificate and the policy file, whichever QueryGuard has, each keeping the one in force when it fails.
-func hangup(s *proxy.Server, config string, catalog *plan.Catalog, certs *certificates, log *slog.Logger) {
-	if certs == nil && config == "" {
-		log.Info("SIGHUP ignored: no -config or -tls-cert to reload")
+// hangup reopens the decision log and reloads the client TLS certificate and the policy file, whichever QueryGuard has,
+// each keeping the one in force when it fails.
+func hangup(s *proxy.Server, config string, catalog *plan.Catalog, certs *certificates, decisions *telemetry.File, log *slog.Logger) {
+	if certs == nil && config == "" && decisions == nil {
+		log.Info("SIGHUP ignored: no -config, -tls-cert or -decision-log to reload")
 		return
+	}
+	if decisions != nil {
+		if err := decisions.Reopen(); err != nil {
+			log.Error("decision log not reopened; the old file stays", "err", err)
+		}
 	}
 	if certs != nil {
 		if err := certs.reload(); err != nil {
