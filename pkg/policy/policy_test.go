@@ -1560,6 +1560,25 @@ func TestDenyFunctionsBlocksSideEffectsEvenInASelect(t *testing.T) {
 	}
 }
 
+func TestReadOnlyRefusesAnythingButReading(t *testing.T) {
+	c := mustParse(t, `{"rules": [{"check": "read_only"}]}`).Checker("agent", discard)
+	for sql, blocked := range map[string]bool{
+		"select * from orders where id = 1":       false,
+		"begin read only":                         false,
+		"show search_path":                        false,
+		"commit; drop table orders":               true,
+		"begin read write":                        true,
+		"set default_transaction_read_only = off": true,
+		"select nextval('orders_id_seq')":         true,
+		"insert into orders values (1)":           true,
+	} {
+		rej, _ := c.Check(sql, standard)
+		if got := ruleOf(rej) == "read_only"; got != blocked {
+			t.Errorf("Check(%q) = %v; want blocked %v", sql, rej, blocked)
+		}
+	}
+}
+
 func TestDenyFunctionsTakesItsOwnList(t *testing.T) {
 	c := mustParse(t, `{"rules": [{"check": "deny_functions", "functions": ["Upper", "billing.wipe"]}]}`).Checker("alice", discard)
 	for sql, blocked := range map[string]bool{

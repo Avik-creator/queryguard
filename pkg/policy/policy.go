@@ -564,6 +564,11 @@ var checks = map[string]check{
 		violatedBy: func(q sqlparse.Query, _ Rule) bool { return q.DDL || q.Opaque },
 		hint:       "Schema changes, DO blocks and procedure calls are not allowed for this role.",
 	},
+	"read_only": {
+		violatedBy: func(q sqlparse.Query, _ Rule) bool { return q.Writes },
+		hint: "This role may only read: SELECT, SHOW, EXPLAIN, cursors and transactions that stay read only. " +
+			"Give it a read-only database role as well.",
+	},
 	"require_where": {
 		violatedBy: func(q sqlparse.Query, _ Rule) bool { return q.ChangesEveryRow },
 		hint:       "Add a WHERE clause. WHERE true changes every row on purpose; TRUNCATE is blocked too.",
