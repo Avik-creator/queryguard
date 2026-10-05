@@ -821,13 +821,16 @@ type fakeChecker struct {
 
 // admitter admits statements with a slot and limits, recording each gate's running and each release.
 type admitter struct {
-	timeout, idle time.Duration
-	running       chan bool     // gets running from each gate
-	released      chan struct{} // gets a value when a slot is freed
-	waited        chan error    // gets why each "wait" statement's wait ended
-	ran           chan run      // gets how each admitted statement ran
-	settled       chan struct{} // gets a value when an admitted statement's transaction has ended
-	idled         chan struct{} // gets a value when the server is idle after an admitted statement
+	timeout, idle, tx time.Duration
+	maxRows, maxBytes int64
+	returned          chan [2]int64 // gets the rows and bytes each admitted statement returned
+	broke             chan string   // gets the code of each limit an admitted statement broke
+	running           chan bool     // gets running from each gate
+	released          chan struct{} // gets a value when a slot is freed
+	waited            chan error    // gets why each "wait" statement's wait ended
+	ran               chan run      // gets how each admitted statement ran
+	settled           chan struct{} // gets a value when an admitted statement's transaction has ended
+	idled             chan struct{} // gets a value when the server is idle after an admitted statement
 }
 
 // run is what a session reports of a statement once it ends.
@@ -838,7 +841,8 @@ type run struct {
 
 func newAdmitter() *admitter {
 	return &admitter{running: make(chan bool, 10), released: make(chan struct{}, 10), waited: make(chan error, 10), ran: make(chan run, 10),
-		settled: make(chan struct{}, 10), idled: make(chan struct{}, 10)}
+		settled: make(chan struct{}, 10), idled: make(chan struct{}, 10), returned: make(chan [2]int64, 10),
+		broke: make(chan string, 10)}
 }
 
 func (c fakeChecker) Check(sql string, set Settings) (*pgproto3.ErrorResponse, Gate) {
@@ -857,9 +861,12 @@ func (c fakeChecker) Check(sql string, set Settings) (*pgproto3.ErrorResponse, G
 	case strings.Contains(sql, "slot"):
 		return nil, func(_ context.Context, _ Explain, running bool) Admission {
 			c.admit.running <- running
-			a := Admission{Timeout: c.admit.timeout, IdleInTransaction: c.admit.idle, Ran: func(took time.Duration, finished bool) {
-				c.admit.ran <- run{took, finished}
-			}, Settled: func() { c.admit.settled <- struct{}{} }, Idle: func() { c.admit.idled <- struct{}{} }}
+			a := Admission{Timeout: c.admit.timeout, IdleInTransaction: c.admit.idle, TransactionTimeout: c.admit.tx,
+				MaxRows: c.admit.maxRows, MaxBytes: c.admit.maxBytes, Returned: func(rows, bytes int64) { c.admit.returned <- [2]int64{rows, bytes} },
+				Broke: func(i Interruption) { c.admit.broke <- i.Code },
+				Ran: func(took time.Duration, finished bool) {
+					c.admit.ran <- run{took, finished}
+				}, Settled: func() { c.admit.settled <- struct{}{} }, Idle: func() { c.admit.idled <- struct{}{} }}
 			if !running {
 				a.Release = sync.OnceFunc(func() { c.admit.released <- struct{}{} })
 			}
@@ -1286,4 +1293,129 @@ func TestRecordsTheErrorPostgresGaveTheCostChecksExplain(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEndsATransactionPastItsTimeoutEvenWhileAStatementRuns(t *testing.T) {
+	a := newAdmitter()
+	a.tx = 100 * time.Millisecond
+	h := start(t, fakeChecker{admit: a})
+
+	h.send(&pgproto3.Query{String: "begin slot"})
+	h.serverGets(&pgproto3.Query{String: "begin slot"})
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("BEGIN")}, &pgproto3.ReadyForQuery{TxStatus: 'T'})
+	h.clientGets(&pgproto3.CommandComplete{CommandTag: []byte("BEGIN")}, &pgproto3.ReadyForQuery{TxStatus: 'T'})
+	h.send(&pgproto3.Query{String: "select slot, pg_sleep(60)"})
+	h.serverGets(&pgproto3.Query{String: "select slot, pg_sleep(60)"})
+
+	// Postgres 17's transaction_timeout ends the session with this code; closing the connection rolls the transaction back.
+	h.clientGets(&pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "25P04",
+		Message: "queryguard: terminating connection due to transaction timeout"})
+	select {
+	case <-h.done:
+		if !errors.Is(h.err, ErrTransactionTimeout) {
+			t.Errorf("Relay returned %v; want ErrTransactionTimeout", h.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Relay did not end the session")
+	}
+}
+
+func TestATransactionThatEndsInTimeKeepsItsSession(t *testing.T) {
+	a := newAdmitter()
+	a.tx = 100 * time.Millisecond
+	h := start(t, fakeChecker{admit: a})
+
+	h.send(&pgproto3.Query{String: "begin slot"})
+	h.serverGets(&pgproto3.Query{String: "begin slot"})
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("BEGIN")}, &pgproto3.ReadyForQuery{TxStatus: 'T'})
+	h.send(&pgproto3.Query{String: "commit"})
+	h.serverGets(&pgproto3.Query{String: "commit"})
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("COMMIT")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.CommandComplete{CommandTag: []byte("BEGIN")}, &pgproto3.ReadyForQuery{TxStatus: 'T'},
+		&pgproto3.CommandComplete{CommandTag: []byte("COMMIT")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	time.Sleep(200 * time.Millisecond)
+	h.serverGetsNothingBefore(&pgproto3.Query{String: "select 'still here'"})
+}
+
+func TestCancelsAReadPastItsRowCap(t *testing.T) {
+	a := newAdmitter()
+	a.maxRows = 2
+	h := start(t, fakeChecker{admit: a})
+	row := &pgproto3.DataRow{Values: [][]byte{[]byte("x")}}
+
+	h.send(&pgproto3.Query{String: "select slot from big"})
+	h.serverGets(&pgproto3.Query{String: "select slot from big"})
+	h.reply(row, row, row)
+
+	expect(t, h.cancels, struct{}{})
+	h.reply(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "57014", Message: "canceling statement due to user request"},
+		&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(row, row, row, &pgproto3.ErrorResponse{Severity: "ERROR", Code: "54000",
+		Message: "queryguard: canceling statement that returned more than 2 rows", Hint: "Add a LIMIT, or page through the rows."},
+		&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	rowBytes, _ := row.Encode(nil)
+	if got := <-a.returned; got != [2]int64{3, 3 * int64(len(rowBytes)-5)} {
+		t.Errorf("returned %v; want 3 rows and their bytes", got)
+	}
+}
+
+func TestLeavesAReadInATransactionUncut(t *testing.T) {
+	a := newAdmitter()
+	a.maxRows = 2
+	h := start(t, fakeChecker{admit: a})
+	h.begin()
+	row := &pgproto3.DataRow{Values: [][]byte{[]byte("x")}}
+
+	// Cancelling it would roll back the transaction's writes too.
+	h.send(&pgproto3.Query{String: "select slot from big"})
+	h.serverGets(&pgproto3.Query{String: "select slot from big"})
+	h.reply(row, row, row, &pgproto3.CommandComplete{CommandTag: []byte("SELECT 3")}, &pgproto3.ReadyForQuery{TxStatus: 'T'})
+
+	h.clientGets(row, row, row, &pgproto3.CommandComplete{CommandTag: []byte("SELECT 3")}, &pgproto3.ReadyForQuery{TxStatus: 'T'})
+	expectNone(t, h.cancels, "cancel of a statement in a transaction")
+	if got := <-a.returned; got[0] != 3 {
+		t.Errorf("returned %v; want 3 rows", got)
+	}
+}
+
+func TestCancelsAReadPastItsByteCap(t *testing.T) {
+	a := newAdmitter()
+	a.maxBytes = 100
+	h := start(t, fakeChecker{admit: a})
+	row := &pgproto3.DataRow{Values: [][]byte{make([]byte, 80)}}
+
+	h.send(&pgproto3.Query{String: "select slot from big"})
+	h.serverGets(&pgproto3.Query{String: "select slot from big"})
+	h.reply(row, row)
+
+	expect(t, h.cancels, struct{}{})
+}
+
+func TestTellsTheAdmissionWhichLimitItsStatementBroke(t *testing.T) {
+	a := newAdmitter()
+	a.timeout = 50 * time.Millisecond
+	h := start(t, fakeChecker{admit: a})
+
+	h.send(&pgproto3.Query{String: "select slot, pg_sleep(60)"})
+	h.serverGets(&pgproto3.Query{String: "select slot, pg_sleep(60)"})
+	expect(t, h.cancels, struct{}{})
+	h.reply(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "57014", Message: "canceling statement due to user request"},
+		&pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	expect(t, a.broke, "57014")
+}
+
+func TestASessionsOwnCancelBreaksNoLimit(t *testing.T) {
+	a := newAdmitter()
+	h := start(t, fakeChecker{admit: a})
+
+	h.send(&pgproto3.Query{String: "select slot, pg_sleep(60)"})
+	h.serverGets(&pgproto3.Query{String: "select slot, pg_sleep(60)"})
+	h.reply(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "57014", Message: "canceling statement due to user request"},
+		&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "57014", Message: "canceling statement due to user request"},
+		&pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	expectNone(t, a.broke, "a limit broken by a client's own cancel")
 }

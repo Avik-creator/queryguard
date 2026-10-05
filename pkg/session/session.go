@@ -67,9 +67,17 @@ type Admission struct {
 	Release           func()                  // frees the slot it took, once the server is idle; nil when it took none
 	Timeout           time.Duration           // how long it may run before the proxy cancels it; 0 means no limit
 	IdleInTransaction time.Duration           // how long the session may then sit idle in a transaction; 0 means no limit
+	// TransactionTimeout is how long a transaction the statement is in, or opens, may last, idle or not; 0 means no limit.
+	TransactionTimeout time.Duration
 	// Ran is called once Postgres has answered the statement, with how long it took and whether it ended without an error; nil skips it.
 	// took is 0 when another statement shares its Sync, since Postgres holds a pipeline's answers until then.
 	Ran func(took time.Duration, finished bool)
+	// MaxRows and MaxBytes cancel the statement, when it runs outside a transaction, once it has returned more rows or bytes of rows; 0 means no cap.
+	MaxRows, MaxBytes int64
+	// Returned is called once the statement ends with the rows and bytes of row data it returned; nil skips it.
+	Returned func(rows, bytes int64)
+	// Broke is called when the proxy cancelled the statement, for its timeout, a cap or another reason i gives; nil skips it.
+	Broke func(i Interruption)
 	// Settled is called once the session is next idle outside a transaction, so what the statement did is committed or undone.
 	Settled func()
 	// Idle is called once the server is next idle, whether or not the statement ran, as after a Bind without an Execute.
@@ -129,6 +137,9 @@ type Interruption struct {
 
 // ErrIdleInTransaction ends a session left idle in a transaction past its limit.
 var ErrIdleInTransaction = errors.New("session idle in a transaction past its limit")
+
+// ErrTransactionTimeout ends a session whose transaction lasted past its limit, as transaction_timeout does in Postgres 17.
+var ErrTransactionTimeout = errors.New("transaction past its limit")
 
 // Waits for the client to hang up: after watchDelay, a waiting statement checks the client every watchPoll.
 const (
@@ -220,48 +231,63 @@ type session struct {
 	serverIn   *bufio.Reader
 	serverOut  *bufio.Writer // only fromClient writes to the server
 
-	mu          sync.Mutex
-	clientOut   *bufio.Writer // both loops write to the client, so only under mu
-	status      byte          // transaction status from the last ReadyForQuery; 0 until login ends
-	pending     []sent        // messages the server has yet to finish answering, oldest first
-	skipping    bool          // the server ignores everything up to the next Sync after an extended-protocol error
-	reported    Settings      // as last reported by the server
-	explaining  *explanation  // the proxy's EXPLAIN in flight, if any
-	slot        func()        // frees the slot the session holds, if any
-	admitting   bool          // a gate is running, so the server going idle keeps the slot the statement will need
-	timeout     time.Duration // how long the running statements may take
-	idleLimit   time.Duration // how long the session may sit idle in a transaction
-	stmtTimer   *time.Timer   // cancels the running statement at its timeout
-	idleTimer   *time.Timer   // ends the session idle in a transaction too long
-	idleGen     int           // bumped by each client message, so an idle timer firing late does nothing
-	interrupted *Interruption // why the proxy cancelled the running statement, so Postgres's cancel error says so
-	settled     []func()      // from admissions, called once the session is idle outside a transaction
-	idle        []func()      // what admitted statements want called once the server is next idle
+	mu             sync.Mutex
+	clientOut      *bufio.Writer // both loops write to the client, so only under mu
+	status         byte          // transaction status from the last ReadyForQuery; 0 until login ends
+	pending        []sent        // messages the server has yet to finish answering, oldest first
+	skipping       bool          // the server ignores everything up to the next Sync after an extended-protocol error
+	reported       Settings      // as last reported by the server
+	explaining     *explanation  // the proxy's EXPLAIN in flight, if any
+	slot           func()        // frees the slot the session holds, if any
+	admitting      bool          // a gate is running, so the server going idle keeps the slot the statement will need
+	timeout        time.Duration // how long the running statements may take
+	idleLimit      time.Duration // how long the session may sit idle in a transaction
+	stmtTimer      *time.Timer   // cancels the running statement at its timeout
+	idleTimer      *time.Timer   // ends the session idle in a transaction too long
+	txLimit        time.Duration // how long a transaction may last
+	txTimer        *time.Timer   // ends the session whose transaction lasts too long
+	txGen          int           // bumped as each transaction ends, so a transaction timer firing late does nothing
+	batchSent      time.Time     // when the first message since the server was last idle went, which is when a transaction it opens began
+	idleGen        int           // bumped by each client message, so an idle timer firing late does nothing
+	interrupted    *Interruption // why the proxy cancelled the running statement, so Postgres's cancel error says so
+	interruptedRan *hooks        // that statement's admission, told once the cancel lands
+	settled        []func()      // from admissions, called once the session is idle outside a transaction
+	idle           []func()      // what admitted statements want called once the server is next idle
 
 	// Only fromClient uses these.
-	inBatch    bool                      // extended-protocol messages went to the server since the last Sync
-	discard    untilSync                 // what to do with client messages after a rejected Parse
-	statements map[string]statement      // prepared statements with a cost check, by name
-	record     func(Finished)            // from Options
-	text       string                    // the statement text of the client message being handled, when recording
-	rejecting  bool                      // the message being sent is the proxy's rejection of text
-	texts      map[string]string         // every prepared statement's text, by name, when recording
-	portals    map[string]string         // the text of each portal's statement, by portal name, when recording
-	ran        func(time.Duration, bool) // from the last admission, for the message that runs its statement
-	ranOn      byte                      // that message: Q for a simple query, E for a bound statement
-	ranPortal  string                    // the portal an E must name to run it
+	inBatch    bool                 // extended-protocol messages went to the server since the last Sync
+	discard    untilSync            // what to do with client messages after a rejected Parse
+	statements map[string]statement // prepared statements with a cost check, by name
+	record     func(Finished)       // from Options
+	text       string               // the statement text of the client message being handled, when recording
+	rejecting  bool                 // the message being sent is the proxy's rejection of text
+	texts      map[string]string    // every prepared statement's text, by name, when recording
+	portals    map[string]string    // the text of each portal's statement, by portal name, when recording
+	ran        *hooks               // from the last admission, for the message that runs its statement
+	ranOn      byte                 // that message: Q for a simple query, E for a bound statement
+	ranPortal  string               // the portal an E must name to run it
 }
 
 // sent is a message the server will answer.
 type sent struct {
 	typ      byte
 	how      answer
-	ran      func(time.Duration, bool) // reports how the statement it runs went, if anyone asked
-	start    time.Time                 // when it went to the server, if it is timed and nothing ran ahead of it
-	failed   bool                      // Postgres answered with an error
-	sql      string                    // the statement it belongs to, when recording
-	rejected bool                      // it is the proxy's rejection of sql
-	reply    reply                     // what Postgres's answers to it said so far
+	ran      *hooks    // what the admission of the statement it runs asked for, if anything
+	capped   bool      // ran's caps apply, since it went outside a transaction with nothing ahead of it
+	data     [2]int64  // the rows and bytes of row data answered so far
+	start    time.Time // when it went to the server, if it is timed and nothing ran ahead of it
+	failed   bool      // Postgres answered with an error
+	sql      string    // the statement it belongs to, when recording
+	rejected bool      // it is the proxy's rejection of sql
+	reply    reply     // what Postgres's answers to it said so far
+}
+
+// hooks are what an admission asks of the message that runs its statement.
+type hooks struct {
+	ran               func(time.Duration, bool)
+	returned          func(rows, bytes int64)
+	broke             func(Interruption)
+	maxRows, maxBytes int64
 }
 
 // reply is what a recorded message's answers said.
@@ -683,8 +709,11 @@ func (s *session) admit(gate Gate, on byte, e Explain) *pgproto3.ErrorResponse {
 		}
 		return a.Reject
 	}
-	s.timeout, s.idleLimit = a.Timeout, a.IdleInTransaction
-	s.ran, s.ranOn = a.Ran, on
+	s.timeout, s.idleLimit, s.txLimit = a.Timeout, a.IdleInTransaction, a.TransactionTimeout
+	s.ran, s.ranOn = nil, on
+	if a.Ran != nil || a.Returned != nil || a.Broke != nil || a.MaxRows > 0 || a.MaxBytes > 0 {
+		s.ran = &hooks{ran: a.Ran, returned: a.Returned, broke: a.Broke, maxRows: a.MaxRows, maxBytes: a.MaxBytes}
+	}
 	if a.Settled != nil {
 		s.settled = append(s.settled, a.Settled)
 	}
@@ -762,13 +791,23 @@ func (s *session) interrupt(i Interruption) bool {
 	s.mu.Lock()
 	busy := len(s.pending) > 0 && s.cancel != nil
 	if busy {
-		s.interrupted = &i
+		s.interrupted, s.interruptedRan = &i, s.running()
 	}
 	s.mu.Unlock()
 	if busy {
 		s.cancel()
 	}
 	return busy
+}
+
+// running returns the admission hooks of the statement Postgres runs now, the first Query or Execute in flight; the caller holds mu.
+func (s *session) running() *hooks {
+	for _, p := range s.pending {
+		if p.typ == 'Q' || p.typ == 'E' {
+			return p.ran
+		}
+	}
+	return nil
 }
 
 // clientSent stops the idle-in-transaction timer, since the client has sent something.
@@ -841,9 +880,43 @@ func (s *session) freeSlot() {
 	}
 }
 
+// transaction starts the transaction timer as one opens and stops it as one ends, given the status in a ReadyForQuery; the caller holds mu.
+func (s *session) transaction(status byte) {
+	switch {
+	case status == 'I' && s.status != 'I':
+		s.txGen++
+		if s.txTimer != nil {
+			s.txTimer.Stop()
+			s.txTimer = nil
+		}
+	case status != 'I' && s.status == 'I' && s.txLimit > 0:
+		gen := s.txGen
+		s.txTimer = time.AfterFunc(s.txLimit-time.Since(s.batchSent), func() {
+			defer safe.Recover(s.stop)
+			s.transactionTimedOut(gen)
+		})
+	}
+}
+
+// transactionTimedOut ends the session as transaction_timeout does, unless its transaction has ended since.
+func (s *session) transactionTimedOut(gen int) {
+	s.mu.Lock()
+	if gen != s.txGen || s.status == 'I' {
+		s.mu.Unlock()
+		return
+	}
+	// Closing the server connection makes Postgres roll the transaction back, and stops a statement still running in it.
+	if writeMessages(s.clientOut, &pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "25P04",
+		Message: "queryguard: terminating connection due to transaction timeout"}) == nil {
+		s.clientOut.Flush()
+	}
+	s.mu.Unlock()
+	s.stop(ErrTransactionTimeout)
+}
+
 // stopTimers stops the session's timers; the caller holds mu.
 func (s *session) stopTimers() {
-	for _, t := range []*time.Timer{s.stmtTimer, s.idleTimer} {
+	for _, t := range []*time.Timer{s.stmtTimer, s.idleTimer, s.txTimer} {
 		if t != nil {
 			t.Stop()
 		}
@@ -1058,8 +1131,13 @@ func (s *session) track(typ byte, how answer) {
 	} else if s.skipping {
 		return
 	}
+	if len(s.pending) == 0 && s.status == 'I' {
+		s.batchSent = time.Now()
+	}
 	// Postgres sends a pipeline's answers together at Sync, so a statement behind another running one can't be timed on its own.
-	timed := m.ran != nil || (m.sql != "" && (typ == 'Q' || typ == 'E'))
+	timed := (m.ran != nil && m.ran.ran != nil) || (m.sql != "" && (typ == 'Q' || typ == 'E'))
+	// A statement in a transaction isn't cut short, since cancelling it would roll back what the transaction already did.
+	m.capped = m.ran != nil && len(s.pending) == 0 && s.status == 'I'
 	if timed && !slices.ContainsFunc(s.pending, func(p sent) bool { return p.typ == 'Q' || p.typ == 'E' }) {
 		m.start = time.Now()
 	}
@@ -1102,6 +1180,7 @@ func (s *session) relayAnswer(typ byte, n int) error {
 		if err != nil {
 			return unexpected(err)
 		}
+		s.transaction(status[0])
 		s.status = status[0]
 	}
 	// A longer ParameterStatus can't be one of the short settings report looks for.
@@ -1121,7 +1200,7 @@ func (s *session) relayAnswer(typ byte, n int) error {
 			r = readReply(typ, body)
 		}
 	}
-	switch how := s.answered(typ, r); {
+	switch how := s.answered(typ, n, r); {
 	case how == captured:
 		return s.capture(typ, n)
 	case how == hidden && typ != 'E':
@@ -1146,8 +1225,11 @@ func (s *session) relayInterrupted(n int) error {
 		_, err := s.clientOut.Write(body)
 		return err
 	}
-	i := s.interrupted
-	s.interrupted = nil
+	i, h := s.interrupted, s.interruptedRan
+	s.interrupted, s.interruptedRan = nil, nil
+	if h != nil && h.broke != nil {
+		h.broke(*i)
+	}
 	e.Code, e.Message, e.Hint = i.Code, i.Message, cmp.Or(i.Hint, e.Hint)
 	return writeMessages(s.clientOut, &e)
 }
@@ -1189,7 +1271,7 @@ func (s *session) endExplaining() {
 }
 
 // answered matches a server message to the oldest pending message and returns where it goes.
-func (s *session) answered(typ byte, r reply) answer {
+func (s *session) answered(typ byte, n int, r reply) answer {
 	// Notices, parameter changes and notifications can arrive at any time.
 	if len(s.pending) == 0 || typ == 'N' || typ == 'S' || typ == 'A' {
 		return relayed
@@ -1199,6 +1281,9 @@ func (s *session) answered(typ byte, r reply) answer {
 		// A simple query's error comes before its ReadyForQuery.
 		s.pending[0].failed = s.pending[0].failed || typ == 'E'
 		s.pending[0].reply.add(r)
+		if typ == 'D' {
+			s.returnedRow(&s.pending[0], n)
+		}
 		return head.how
 	}
 	s.pending = s.pending[1:]
@@ -1209,8 +1294,13 @@ func (s *session) answered(typ byte, r reply) answer {
 		took = time.Since(head.start)
 	}
 	// A suspended portal or an empty query ran nothing that says how its plan does.
-	if head.ran != nil && typ != 's' && typ != 'I' {
-		head.ran(took, !head.failed && typ != 'E')
+	if h := head.ran; h != nil && typ != 's' {
+		if h.ran != nil && typ != 'I' {
+			h.ran(took, !head.failed && typ != 'E')
+		}
+		if h.returned != nil {
+			h.returned(head.data[0], head.data[1])
+		}
 	}
 	if head.sql != "" && s.record != nil {
 		s.recordAnswer(head, typ, took)
@@ -1229,6 +1319,33 @@ func (s *session) answered(typ byte, r reply) answer {
 		}
 	}
 	return head.how
+}
+
+// returnedRow counts a row of n bytes answering p, and cancels p's statement once it is past a cap; the caller holds mu.
+func (s *session) returnedRow(p *sent, n int) {
+	p.data[0]++
+	p.data[1] += int64(n)
+	h := p.ran
+	if h == nil || !p.capped || s.cancel == nil || s.interrupted != nil {
+		return
+	}
+	var i Interruption
+	switch {
+	case h.maxRows > 0 && p.data[0] > h.maxRows:
+		i = Interruption{Code: "54000", Message: fmt.Sprintf("queryguard: canceling statement that returned more than %d rows", h.maxRows)}
+	case h.maxBytes > 0 && p.data[1] > h.maxBytes:
+		i = Interruption{Code: "54000", Message: fmt.Sprintf("queryguard: canceling statement that returned more than %d bytes", h.maxBytes)}
+	default:
+		return
+	}
+	i.Hint = "Add a LIMIT, or page through the rows."
+	p.capped = false
+	s.interrupted, s.interruptedRan = &i, p.ran
+	// The cancel opens a connection to Postgres, which mustn't hold up the rows still arriving.
+	go func() {
+		defer safe.Recover(s.stop)
+		s.cancel()
+	}()
 }
 
 // recordAnswer records the statement head belongs to, now answered by a message of type typ; the caller holds mu.
