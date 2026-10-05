@@ -12,6 +12,7 @@ import (
 	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/proxy"
+	"github.com/Avik-creator/queryguard/pkg/sqlparse"
 )
 
 func TestRequireClientTLSNeedsCertificate(t *testing.T) {
@@ -242,6 +243,25 @@ func TestSimulateSkipsALineCutShortByACrash(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "3 statements") || !strings.Contains(errs.String(), "skipped 1") {
 		t.Errorf("printed %q and %q; want the 3 whole records replayed and the bad line reported", out.String(), errs.String())
+	}
+}
+
+func TestSimulateChecksTheLearnedAllowlist(t *testing.T) {
+	dir := t.TempDir()
+	traffic := filepath.Join(dir, "traffic.jsonl")
+	writeFile(t, traffic, []byte(`{"at":"2026-10-05T12:00:00Z","database":"shop","role":"agent","tenant":"agent","query":"select $1"}`+"\n"+
+		`{"at":"2026-10-05T12:00:01Z","database":"shop","role":"agent","tenant":"agent","query":"delete from orders"}`+"\n"))
+	list := filepath.Join(dir, "allowlist.json")
+	writeFile(t, list, []byte(`{"agent": {"`+sqlparse.Fingerprint("select $1")+`": "select $1"}}`))
+	config := filepath.Join(dir, "new.json")
+	writeFile(t, config, []byte(`{"allowlist": {"mode": "enforce", "roles": ["agent"]}}`))
+	var out, errs strings.Builder
+
+	if code := simulateCLI([]string{"-config", config, "-traffic", traffic, "-allowlist", list}, &out, &errs); code != 0 {
+		t.Fatalf("exit %d: %s", code, errs.String())
+	}
+	if !strings.Contains(out.String(), "allowlist") || !strings.Contains(out.String(), "newly rejected: 1") {
+		t.Errorf("printed %q; want the delete refused by the allowlist", out.String())
 	}
 }
 

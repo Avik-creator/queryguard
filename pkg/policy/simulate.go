@@ -47,9 +47,16 @@ type bucket struct {
 // readingAsRecorded are the settings recorded statements are read under: their text is Postgres's normalized form, in UTF-8.
 var readingAsRecorded = session.Settings{StandardConformingStrings: "on", ClientEncoding: "UTF8"}
 
-// Simulate replays recorded statements, in time order, against p: its rules, allowlist checks and budgets.
-func Simulate(p *Policy, records []stats.Record) Simulation {
+// Simulate replays recorded statements, in time order, against p: its rules, budgets and, with the learned list, its allowlist.
+func Simulate(p *Policy, list *Allowlist, records []stats.Record) Simulation {
 	sim := Simulation{Rules: map[string]*SimulatedRule{}, Budgets: map[string]*SimulatedBudget{}}
+	if p.cfg.Allowlist.Mode == "enforce" && list == nil {
+		sim.NotSimulated = append(sim.NotSimulated, "the allowlist, without the learned list to check against")
+	}
+	if list != nil {
+		// Replaying in learn mode mustn't change the list it was given.
+		list = list.clone()
+	}
 	if p.costRules {
 		sim.NotSimulated = append(sim.NotSimulated, "cost rules (max_cost, max_scan_rows), which need each statement's plan")
 	}
@@ -75,7 +82,7 @@ func Simulate(p *Policy, records []stats.Record) Simulation {
 		c := checkers[rec.Database+"\x00"+rec.Role]
 		if c == nil {
 			c = p.Checker(rec.Role, quiet)
-			c.Env = Env{Database: rec.Database}
+			c.Env = Env{Database: rec.Database, Allowlist: list}
 			checkers[rec.Database+"\x00"+rec.Role] = c
 		}
 		refused := false

@@ -331,6 +331,7 @@ func simulateCLI(args []string, stdout, stderr io.Writer) int {
 	flags.SetOutput(stderr)
 	config := flags.String("config", "", "the config to try")
 	traffic := flags.String("traffic", "", "QueryGuard's -traffic-log; the file before it, with .1 added, is read too")
+	allowlist := flags.String("allowlist", "", "QueryGuard's -allowlist-file, to replay the allowlist against")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -364,7 +365,15 @@ func simulateCLI(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "no traffic log at %s\n", *traffic)
 		return 1
 	}
-	sim := policy.Simulate(p, records)
+	var list *policy.Allowlist
+	if *allowlist != "" {
+		list = &policy.Allowlist{}
+		if err := loadAllowlist(list, *allowlist); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+	}
+	sim := policy.Simulate(p, list, records)
 
 	fmt.Fprintf(stdout, "%d statements from %s to %s\n\n", sim.Statements, sim.From.Format(time.RFC3339), sim.To.Format(time.RFC3339))
 	var rules [][]string

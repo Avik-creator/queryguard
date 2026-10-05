@@ -736,13 +736,14 @@ moves to `traffic.jsonl.1` once it holds a day, so the log keeps one to two
 days. `queryguard simulate` replays both files against another config:
 
 ```
-queryguard simulate -config new.json -traffic traffic.jsonl
+queryguard simulate -config new.json -traffic traffic.jsonl -allowlist allowlist.json
 ```
 
 It prints the statements each rule would refuse, with a few examples, what
 each tenant's budget would have refused or delayed, and how many statements
-the new config refuses that ran, and the other way round. Rules, the
-allowlist and fixed-rate budgets are replayed; cost rules need each
+the new config refuses that ran, and the other way round. Rules and
+fixed-rate budgets are replayed, and the allowlist too when `-allowlist`
+names the learned list (the `-allowlist-file`); cost rules need each
 statement's plan, and slots and budgets by capacity need the live server, so
 the report says when those are in the config and left out.
 

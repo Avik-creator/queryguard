@@ -246,6 +246,17 @@ type Allowlist struct {
 	dirty bool
 }
 
+// clone returns a copy of a that learns apart from it.
+func (a *Allowlist) clone() *Allowlist {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	c := &Allowlist{roles: make(map[string]map[string]string, len(a.roles))}
+	for role, prints := range a.roles {
+		c.roles[role] = maps.Clone(prints)
+	}
+	return c
+}
+
 // AllowlistEntry is one learned statement.
 type AllowlistEntry struct{ Role, Fingerprint, Query string }
 

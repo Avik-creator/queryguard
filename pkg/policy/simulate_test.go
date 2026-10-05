@@ -1,9 +1,12 @@
 package policy
 
 import (
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/Avik-creator/queryguard/pkg/sqlparse"
 	"github.com/Avik-creator/queryguard/pkg/stats"
 )
 
@@ -22,7 +25,7 @@ func TestSimulateReplaysRulesAndBudgets(t *testing.T) {
 		{At: at, Database: "shop", Role: "batch", Tenant: "batch", Query: "select count(*) from orders", Units: 30},
 	}
 
-	r := Simulate(p, recs)
+	r := Simulate(p, nil, recs)
 
 	if r.Statements != 6 || !r.From.Equal(at) {
 		t.Errorf("replayed %d from %v; want 6 from %v", r.Statements, r.From, at)
@@ -47,9 +50,31 @@ func TestSimulateSaysWhatItCannotReplay(t *testing.T) {
 	p := mustParse(t, `{"rules": [{"check": "max_cost", "cost": 1000}], "scheduler": {"max_active": 4},
 		"tenant_defaults": {"budget": {"capacity": 0.5}}}`)
 
-	r := Simulate(p, nil)
+	r := Simulate(p, nil, nil)
 
 	if len(r.NotSimulated) < 2 {
 		t.Errorf("not simulated %q; want cost rules and capacity budgets named", r.NotSimulated)
+	}
+}
+
+func TestSimulateReplaysTheAllowlist(t *testing.T) {
+	p := mustParse(t, `{"allowlist": {"mode": "enforce", "roles": ["agent"]}}`)
+	const known = "select * from orders where id = $1"
+	list := &Allowlist{}
+	list.learn("agent", sqlparse.Fingerprint(known), known)
+	at := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	recs := []stats.Record{
+		{At: at, Database: "shop", Role: "agent", Tenant: "agent", Query: known},
+		{At: at, Database: "shop", Role: "agent", Tenant: "agent", Query: "delete from orders"},
+	}
+
+	r := Simulate(p, list, recs)
+	if got := r.Rules["allowlist"]; got == nil || got.Count != 1 || got.Examples[0] != "delete from orders" {
+		t.Errorf("allowlist %+v; want the delete refused", got)
+	}
+
+	// Without the learned list there is nothing to replay against.
+	if r := Simulate(p, nil, recs); !slices.ContainsFunc(r.NotSimulated, func(n string) bool { return strings.Contains(n, "allowlist") }) {
+		t.Errorf("not simulated %q; want the allowlist named", r.NotSimulated)
 	}
 }
