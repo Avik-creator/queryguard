@@ -1,0 +1,17 @@
+{
+  "unchecked": "reject",
+  "rules": [
+    {"check": "read_only"},
+    {"check": "deny_functions"},
+    {"check": "max_cost", "cost": 1000000}
+  ],
+  "tenant_defaults": {
+    "statement_timeout": "15s",
+    "idle_in_transaction_timeout": "30s",
+    "transaction_timeout": "1m",
+    "max_rows": 1000,
+    "max_bytes": 1048576
+  },
+  "allowlist": {"mode": "learn"},
+  "login_throttle": {"failures": 5, "window": "1m", "cool_off": "5m"}
+}

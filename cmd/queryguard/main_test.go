@@ -502,3 +502,11 @@ func TestTestCLIWithoutACorpusOnlyValidatesTheConfig(t *testing.T) {
 		t.Errorf("exit %d, stdout %q; want the config found valid", code, stdout.String())
 	}
 }
+
+func TestShippedAIAgentPresetRejectsItsBypassCorpus(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := testCLI([]string{"-config", "../../presets/ai-agent.json", "../../presets/ai-agent-bypass.sql"}, &stdout, &stderr)
+	if code != 0 {
+		t.Errorf("exit %d:\n%s%s", code, stdout.String(), stderr.String())
+	}
+}
