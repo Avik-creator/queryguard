@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Avik-creator/queryguard/internal/safe"
 	"github.com/Avik-creator/queryguard/pkg/fleet"
 	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
@@ -140,7 +141,7 @@ func run(opts options, log *slog.Logger) error {
 	}
 	s.Monitor = newMonitor(catalog, s, log)
 	if opts.config != "" {
-		go reloadOnHangup(ctx, s, opts.config, catalog, log)
+		go safe.Loop(ctx, log, "config reload", func(ctx context.Context) { reloadOnHangup(ctx, s, opts.config, catalog, log) })
 	}
 	if err := s.Serve(ctx, ln); err != nil {
 		return err
