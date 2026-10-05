@@ -121,6 +121,8 @@ type Options struct {
 	Interrupt func(interrupt func(i Interruption) bool)
 	// Record gets each statement once it is answered; it runs with the session's lock held, so it must not block. nil records nothing.
 	Record func(Finished)
+	// Drain, once closed, ends the session as soon as it is idle outside a transaction, telling the client to connect again; nil never does.
+	Drain <-chan struct{}
 }
 
 // Finished is a statement Postgres, or the proxy, has answered.
@@ -140,6 +142,9 @@ type Interruption struct {
 	Message string
 	Hint    string // "" keeps Postgres's
 }
+
+// ErrDrained ends a session that went idle while the proxy was draining.
+var ErrDrained = errors.New("session drained for a restart")
 
 // ErrIdleInTransaction ends a session left idle in a transaction past its limit.
 var ErrIdleInTransaction = errors.New("session idle in a transaction past its limit")
@@ -183,6 +188,21 @@ func Relay(client, server net.Conn, opts Options) error {
 	stop := s.stop
 	if opts.Interrupt != nil {
 		opts.Interrupt(s.interrupt)
+	}
+	finished := make(chan struct{})
+	defer close(finished)
+	if opts.Drain != nil {
+		go func() {
+			select {
+			case <-opts.Drain:
+			case <-finished:
+				return
+			}
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.draining = true
+			s.endIfDrained()
+		}()
 	}
 	var loops sync.WaitGroup
 	// A panic in either loop, or in anything they call, ends this session alone.
@@ -259,6 +279,7 @@ type session struct {
 	interrupted    *Interruption // why the proxy cancelled the running statement, so Postgres's cancel error says so
 	interruptedRan *hooks        // that statement's admission, told once the cancel lands
 	cancelling     chan struct{} // closed once the proxy's own cancel request is done; nil when none is in flight
+	draining       bool          // the proxy is draining, so the session ends once it is idle outside a transaction
 	settled        []func()      // from admissions, called once the session is idle outside a transaction
 	idle           []func()      // what admitted statements want called once the server is next idle
 
@@ -356,6 +377,7 @@ func (s *session) loggedIn() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.status = 'I'
+	s.endIfDrained()
 }
 
 // awaitLogin waits for the login to end, first sending Postgres a password that came in the same write as the statement.
@@ -857,6 +879,17 @@ func (s *session) clientSent() {
 	}
 }
 
+// endIfDrained ends a draining session that is idle outside a transaction, as Postgres's shutdown ends idle sessions; the caller holds mu.
+func (s *session) endIfDrained() {
+	if !s.draining || s.status != 'I' || len(s.pending) > 0 || s.batchOpen || s.admitting {
+		return
+	}
+	writeMessages(s.clientOut, &pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "57P01",
+		Message: "queryguard: terminating connection because the proxy is restarting", Hint: "Connect again; another QueryGuard process takes new connections."})
+	s.clientOut.Flush()
+	s.stop(ErrDrained)
+}
+
 // becameIdle frees the slot, stops the statement timer and starts the idle-in-transaction one; the caller holds mu.
 func (s *session) becameIdle() {
 	if s.stmtTimer != nil {
@@ -874,6 +907,7 @@ func (s *session) becameIdle() {
 	s.idle = nil
 	if s.status == 'I' {
 		s.settle()
+		s.endIfDrained()
 	}
 	if (s.status == 'T' || s.status == 'E') && s.idleLimit > 0 {
 		gen := s.idleGen

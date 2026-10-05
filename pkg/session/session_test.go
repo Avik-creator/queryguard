@@ -1585,3 +1585,51 @@ func TestRemembersNoMoreThanItsMaxOfStatementTexts(t *testing.T) {
 		t.Error("the latest statement's text was forgotten")
 	}
 }
+
+// drainedError is what a drained session tells its client before closing.
+var drainedError = &pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "57P01",
+	Message: "queryguard: terminating connection because the proxy is restarting", Hint: "Connect again; another QueryGuard process takes new connections."}
+
+func TestDrainEndsAnIdleSessionAtOnce(t *testing.T) {
+	drain := make(chan struct{})
+	h := startWith(t, Options{Drain: drain})
+	h.serverGetsNothingBefore(&pgproto3.Query{String: "select 1"})
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	close(drain)
+
+	h.clientGets(drainedError)
+	<-h.done
+	if !errors.Is(h.err, ErrDrained) {
+		t.Errorf("Relay returned %v; want ErrDrained", h.err)
+	}
+}
+
+func TestDrainWaitsForTheTransactionToEnd(t *testing.T) {
+	drain := make(chan struct{})
+	h := startWith(t, Options{Drain: drain})
+	h.begin()
+
+	close(drain)
+	h.serverGetsNothingBefore(&pgproto3.Query{String: "commit"})
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("COMMIT")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	h.clientGets(&pgproto3.CommandComplete{CommandTag: []byte("COMMIT")}, &pgproto3.ReadyForQuery{TxStatus: 'I'}, drainedError)
+	<-h.done
+	if !errors.Is(h.err, ErrDrained) {
+		t.Errorf("Relay returned %v; want ErrDrained", h.err)
+	}
+}
+
+func TestDrainEndsASessionThatLogsInWhileDraining(t *testing.T) {
+	drain := make(chan struct{})
+	close(drain)
+	h := startWith(t, Options{Drain: drain})
+
+	h.clientGets(drainedError)
+	<-h.done
+	if !errors.Is(h.err, ErrDrained) {
+		t.Errorf("Relay returned %v; want ErrDrained", h.err)
+	}
+}
