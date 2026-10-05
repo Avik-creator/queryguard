@@ -17,6 +17,7 @@ import (
 
 	"github.com/Avik-creator/queryguard/pkg/fleet"
 	"github.com/Avik-creator/queryguard/pkg/proxy"
+	"github.com/jackc/pgx/v5"
 )
 
 func TestPostgresStoreSharesCapacity(t *testing.T) {
@@ -60,16 +61,27 @@ func TestPostgresStoreSharesCapacity(t *testing.T) {
 func stateDSN(t testing.TB) string {
 	t.Helper()
 	dsn := catalogDSN(t)
-	admin := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
-	var exists bool
-	if err := admin.QueryRow(t.Context(), "select exists (select from pg_database where datname = 'queryguard_state')").Scan(&exists); err != nil {
+	if err := freshState(); err != nil {
 		t.Fatal(err)
-	}
-	if !exists {
-		mustExec(t, admin, "create database queryguard_state")
 	}
 	return dsn + " dbname=queryguard_state"
 }
+
+// freshState makes the store's database anew once per run, so tables a past run made with another layout don't linger.
+var freshState = sync.OnceValue(func() error {
+	ctx := context.Background()
+	host, port, _ := net.SplitHostPort(os.Getenv("QG_TEST_UPSTREAM"))
+	admin, err := pgx.Connect(ctx, fmt.Sprintf("host=%s port=%s user=postgres password=%s dbname=postgres sslmode=disable", host, port, password()))
+	if err != nil {
+		return err
+	}
+	defer admin.Close(ctx)
+	if _, err := admin.Exec(ctx, "drop database if exists queryguard_state with (force)"); err != nil {
+		return err
+	}
+	_, err = admin.Exec(ctx, "create database queryguard_state")
+	return err
+})
 
 func TestFleetHoldsATenantToOneRate(t *testing.T) {
 	if os.Getenv("QG_TEST_UPSTREAM") == "" {

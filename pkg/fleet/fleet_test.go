@@ -1,11 +1,14 @@
 package fleet
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -114,6 +117,132 @@ func TestInstancesGetDistinctIDsAndKnowEachOther(t *testing.T) {
 			t.Errorf("a's peer %d is %q, %v; want b's address", b.ID(), addr, ok)
 		}
 	})
+}
+
+func TestWarnsWhenMoreInstancesRunThanTheFallbackShareAllowsFor(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var logs lockedBuffer
+		store := &Memory{}
+		log := slog.New(slog.NewTextHandler(&logs, nil))
+		a := &Fleet{Store: store, Name: "a", MaxInstances: 1, Log: log}
+		b := &Fleet{Store: store, Name: "b", MaxInstances: 1, Log: log}
+		go a.Run(t.Context(), wanting(100, 1), nil)
+		go b.Run(t.Context(), wanting(100, 1), nil)
+
+		time.Sleep(3*DefaultInterval + time.Millisecond)
+
+		// Each falls back to capacity ÷ max_instances without the store, so more instances than that could together use more.
+		if n := strings.Count(logs.String(), "more instances than max_instances"); n != 2 {
+			t.Errorf("warned %d times; want once by each instance:\n%s", n, logs.String())
+		}
+	})
+}
+
+// lockedBuffer is a bytes.Buffer several loggers can write at once.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// ask is instance's request for wants, using the leases in applied.
+func ask(instance string, wants map[string]Want, applied map[string]int64) Request {
+	return Request{Instance: instance, MaxInstances: DefaultMaxInstances, TTL: DefaultTTL, DeadAfter: DefaultDeadAfter, Wants: wants,
+		Applied: applied}
+}
+
+func TestStoreThatLostItsTablesStillCountsTheLeasesInUse(t *testing.T) {
+	var st state
+	now := time.Now()
+	want := map[string]Want{"r": {Capacity: 100, Demand: 100}}
+
+	// a used lease 500 before the store's numbering started again; the new numbers must still count as its leases.
+	got := st.refresh(ask("a", want, map[string]int64{"r": 500}), now)
+	got = st.refresh(ask("a", want, map[string]int64{"r": got.Seq}), now.Add(time.Second))
+	b := st.refresh(ask("b", map[string]Want{"r": {Capacity: 100, Demand: 50}}, nil), now.Add(2*time.Second))
+
+	if got.Grants["r"] != 100 || b.Grants["r"] != 0 {
+		t.Errorf("a has %v and b got %v; want a's 100 counted, so 0 for b", got.Grants["r"], b.Grants["r"])
+	}
+}
+
+func TestResourceNoLongerWantedIsFreedOnceItsLeaseIsDead(t *testing.T) {
+	var st state
+	now := time.Now()
+	got := st.refresh(ask("a", map[string]Want{"r": {Capacity: 100, Demand: 100}}, nil), now)
+	applied := map[string]int64{"r": got.Seq}
+
+	// a keeps renewing, wanting nothing more of r, as when its tenant was forgotten.
+	for at := time.Second; at <= DefaultDeadAfter+time.Second; at += time.Second {
+		st.refresh(ask("a", nil, applied), now.Add(at))
+	}
+	b := st.refresh(ask("b", map[string]Want{"r": {Capacity: 100, Demand: 50}}, nil), now.Add(DefaultDeadAfter+2*time.Second))
+
+	if b.Grants["r"] != 100 {
+		t.Errorf("b got %v; want all 100, since a's lease of r is dead", b.Grants["r"])
+	}
+}
+
+func TestWholeResourcesAreLeasedInWholeUnits(t *testing.T) {
+	var st state
+	now := time.Now()
+	applied := map[string]map[string]int64{}
+	var grants map[string]float64
+	for round := range 5 {
+		grants = map[string]float64{}
+		for i, name := range []string{"a", "b", "c"} {
+			got := st.refresh(ask(name, map[string]Want{"slots": {Capacity: 2, Demand: 1, Whole: true}}, applied[name]),
+				now.Add(time.Duration(3*round+i)*time.Second))
+			applied[name] = map[string]int64{"slots": got.Seq}
+			grants[name] = got.Grants["slots"]
+		}
+	}
+
+	// Two slots among three instances can't be split evenly; two get one each, rather than all getting none.
+	var sum float64
+	ones := 0
+	for name, g := range grants {
+		if g != math.Trunc(g) {
+			t.Errorf("%s got %v; want a whole number", name, g)
+		}
+		sum += g
+		if g == 1 {
+			ones++
+		}
+	}
+	if sum > 2 || ones != 2 {
+		t.Errorf("grants %v; want two instances with one slot each", grants)
+	}
+}
+
+func TestStatementsStillRunningCountAfterALeaseShrinks(t *testing.T) {
+	var st state
+	now := time.Now()
+	slots := func(demand, using float64) map[string]Want {
+		return map[string]Want{"slots": {Capacity: 10, Demand: demand, Using: using, Whole: true}}
+	}
+	a := st.refresh(ask("a", slots(10, 0), nil), now)
+	st.refresh(ask("b", slots(0, 0), nil), now.Add(time.Second/2))
+	a = st.refresh(ask("a", slots(10, 10), map[string]int64{"slots": a.Seq}), now.Add(time.Second))
+	// a's statements end only when they end, though its demand dropped and it took a smaller lease.
+	a = st.refresh(ask("a", slots(0, 10), map[string]int64{"slots": a.Seq}), now.Add(2*time.Second))
+	a = st.refresh(ask("a", slots(0, 10), map[string]int64{"slots": a.Seq}), now.Add(3*time.Second))
+	b := st.refresh(ask("b", slots(10, 0), nil), now.Add(4*time.Second))
+
+	if a.Grants["slots"] >= 10 || b.Grants["slots"] != 0 {
+		t.Errorf("a's lease %v, b got %v; want a's lease cut and b given nothing while a's 10 statements run", a.Grants["slots"], b.Grants["slots"])
+	}
 }
 
 // TestNeverMoreThanTheTotal runs instances through store outages, cut links, slow and lost replies and deaths, checking every 50ms

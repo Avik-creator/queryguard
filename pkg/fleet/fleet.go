@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"maps"
+	"math"
 	"slices"
 	"sync"
 	"time"
@@ -50,6 +51,8 @@ type Request struct {
 type Want struct {
 	Capacity float64 // the fleet-wide limit
 	Demand   float64 // how much of it the instance would use
+	Using    float64 // how much of it the instance holds now, as statements still running; it counts until they end
+	Whole    bool    // it comes in whole units, as slots do
 }
 
 // Reply is the store's answer.
@@ -76,6 +79,7 @@ type Fleet struct {
 	reply    Reply
 	leases   map[string]held
 	capacity map[string]float64 // each resource's capacity, as last wanted
+	crowded  bool               // more instances than MaxInstances were live at the last renewal
 }
 
 // held is a lease in use.
@@ -131,6 +135,12 @@ func (f *Fleet) renew(ctx context.Context, wants map[string]Want) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if crowded := len(reply.Peers) > f.maxInstances(); crowded && !f.crowded {
+		// Without the store each falls back to capacity ÷ MaxInstances, so together they could use more than the capacity.
+		cmp.Or(f.Log, slog.Default()).Warn("more instances than max_instances share the fleet's limits", "instances", len(reply.Peers),
+			"max_instances", f.maxInstances())
+	}
+	f.crowded = len(reply.Peers) > f.maxInstances()
 	f.reply = reply
 	if f.leases == nil {
 		f.leases = map[string]held{}
@@ -221,15 +231,18 @@ type member struct {
 // row is one instance's leases of one resource.
 type row struct {
 	capacity, demand float64
-	applied          int64   // the sequence number of the lease it last said it uses; 0 for none
-	grants           []grant // leases it may still use: those since applied, and not yet ended
+	using            float64   // as last reported
+	usingUntil       time.Time // when what it reported using stops counting, if it renewed no more
+	applied          int64     // the sequence number of the lease it last said it uses; 0 for none
+	grants           []grant   // leases it may still use: those since applied, and not yet dead
 }
 
 // grant is one lease the store handed out.
 type grant struct {
 	seq     int64
 	value   float64
-	expires time.Time
+	expires time.Time // when the instance stops using all of it
+	deadAt  time.Time // when it stops using even the part that fits the fallback share
 }
 
 // refresh files req at now and returns the reply, and the rows of req's instance to keep.
@@ -249,6 +262,10 @@ func (st *state) refresh(req Request, now time.Time) Reply {
 		st.members[req.Instance] = m
 		st.rows[req.Instance] = map[string]*row{}
 	}
+	// A store that lost its tables numbers from 0 again, and its numbers must still pass those its instances use.
+	for _, applied := range req.Applied {
+		st.seq = max(st.seq, applied)
+	}
 	st.seq++
 	m.addr, m.deadAt = req.Addr, now.Add(req.DeadAfter)
 	reply := Reply{ID: m.id, Seq: st.seq, Grants: map[string]float64{}, Peers: map[int]string{}}
@@ -265,18 +282,30 @@ func (st *state) refresh(req Request, now time.Time) Reply {
 			r = &row{}
 			own[resource] = r
 		}
-		r.capacity, r.demand = want.Capacity, want.Demand
+		r.capacity, r.demand, r.using, r.usingUntil = want.Capacity, want.Demand, want.Using, m.deadAt
 		if applied := req.Applied[resource]; applied > r.applied {
 			r.applied = applied
 		}
-		g := max(0, min(st.fairShare(req.Instance, resource, want), want.Capacity-st.others(req.Instance, resource, req.MaxInstances, now)))
-		r.grants = append(r.grants, grant{seq: st.seq, value: g, expires: now.Add(req.TTL)})
+		fair, spare := st.fairShare(req.Instance, resource, want), want.Capacity-st.others(req.Instance, resource, req.MaxInstances, now)
+		if want.Whole {
+			// Rounding down alone would leave every instance nothing when there are fewer units than instances.
+			fair = math.Round(fair)
+			if fair < 1 && want.Demand > 0 {
+				fair = 1
+			}
+			spare = math.Floor(spare + 1e-9)
+		}
+		g := max(0, min(fair, spare))
+		r.grants = append(r.grants, grant{seq: st.seq, value: g, expires: now.Add(req.TTL), deadAt: m.deadAt})
 		reply.Grants[resource] = g
 	}
-	// Resources it no longer wants keep their rows until their leases end.
+	// Resources it no longer wants keep their rows until their leases are dead, asking for nothing more meanwhile.
 	for resource, r := range own {
-		if _, wanted := req.Wants[resource]; !wanted && r.counted(now, m, req.MaxInstances) == 0 {
-			delete(own, resource)
+		if _, wanted := req.Wants[resource]; !wanted {
+			r.demand, r.using = 0, 0
+			if r.counted(now, m, req.MaxInstances) == 0 {
+				delete(own, resource)
+			}
 		}
 	}
 	return reply
@@ -324,13 +353,14 @@ func (st *state) others(instance, resource string, maxInstances int, now time.Ti
 }
 
 // counted is the most of the resource the instance may be using at now, given that it uses one of the leases since the one it
-// last said it uses: that lease's grant while it lasts, and as much of it as fits the fallback share after, until it is dead.
+// last said it uses: that lease's grant while it lasts, and as much of it as fits the fallback share after, until it is dead;
+// and at least what it said it holds, until it would have renewed in time to say less.
 func (r *row) counted(now time.Time, m *member, maxInstances int) float64 {
-	if m == nil || !now.Before(m.deadAt) {
+	if m == nil {
 		return 0
 	}
-	var live, lapsed float64
-	r.grants = slices.DeleteFunc(r.grants, func(g grant) bool { return g.seq < r.applied })
+	var live, lapsed, using float64
+	r.grants = slices.DeleteFunc(r.grants, func(g grant) bool { return g.seq < r.applied || !now.Before(g.deadAt) })
 	for _, g := range r.grants {
 		if now.Before(g.expires) {
 			live = max(live, g.value)
@@ -338,7 +368,10 @@ func (r *row) counted(now time.Time, m *member, maxInstances int) float64 {
 			lapsed = max(lapsed, g.value)
 		}
 	}
-	return max(live, min(lapsed, r.capacity/float64(maxInstances)))
+	if now.Before(r.usingUntil) {
+		using = r.using
+	}
+	return max(live, min(lapsed, r.capacity/float64(maxInstances)), using)
 }
 
 // Memory is a Store in memory, for one process and for tests; its zero value is ready to use.
@@ -366,8 +399,8 @@ func (s *Memory) Release(ctx context.Context, instance string) error {
 	return nil
 }
 
-// Postgres is a Store in UNLOGGED tables of a database set aside for QueryGuard, so it needs nothing new to run; a crash of
-// that server empties them, which every instance sees as a lost store.
+// Postgres is a Store in tables of a database set aside for QueryGuard, so it needs nothing new to run. They are logged tables,
+// since a crash or failover that emptied them would let the store hand out again what instances still use.
 type Postgres struct {
 	DSN string // connection string for a role that may create tables in the database
 
@@ -378,11 +411,12 @@ type Postgres struct {
 
 // schema makes the store's tables; it runs under the store's lock, since CREATE TABLE IF NOT EXISTS can still collide.
 const schema = `
-create unlogged table if not exists queryguard_fleet (one bool primary key default true check (one), seq bigint not null);
-create unlogged table if not exists queryguard_members (instance text primary key, id int not null, addr text not null,
+create table if not exists queryguard_fleet (one bool primary key default true check (one), seq bigint not null);
+create table if not exists queryguard_members (instance text primary key, id int not null, addr text not null,
 	dead_at timestamptz not null);
-create unlogged table if not exists queryguard_leases (instance text not null, resource text not null, capacity float8 not null,
-	demand float8 not null, applied bigint not null, grants jsonb not null, primary key (instance, resource));
+create table if not exists queryguard_leases (instance text not null, resource text not null, capacity float8 not null,
+	demand float8 not null, using_now float8 not null, using_until timestamptz not null, applied bigint not null,
+	grants jsonb not null, primary key (instance, resource));
 insert into queryguard_fleet values (true, 0) on conflict do nothing`
 
 // lockKey names the advisory lock every change to the store takes, so the whole fleet changes one instance at a time.
@@ -393,6 +427,7 @@ type storedGrant struct {
 	Seq     int64     `json:"seq"`
 	Value   float64   `json:"value"`
 	Expires time.Time `json:"expires"`
+	DeadAt  time.Time `json:"dead_at"`
 }
 
 func (s *Postgres) Refresh(ctx context.Context, req Request) (Reply, error) {
@@ -419,17 +454,18 @@ func (s *Postgres) Refresh(ctx context.Context, req Request) (Reply, error) {
 		var resource string
 		var r row
 		var grants []storedGrant
-		if rows, err = tx.Query(ctx, "select instance, resource, capacity, demand, applied, grants from queryguard_leases"); err != nil {
+		if rows, err = tx.Query(ctx, `select instance, resource, capacity, demand, using_now, using_until, applied, grants
+			from queryguard_leases`); err != nil {
 			return err
 		}
-		if _, err := pgx.ForEachRow(rows, []any{&name, &resource, &r.capacity, &r.demand, &r.applied, &grants}, func() error {
+		if _, err := pgx.ForEachRow(rows, []any{&name, &resource, &r.capacity, &r.demand, &r.using, &r.usingUntil, &r.applied, &grants}, func() error {
 			// Leases of an instance that is gone are deleted below.
 			if st.rows[name] == nil {
 				return nil
 			}
-			stored := &row{capacity: r.capacity, demand: r.demand, applied: r.applied}
+			stored := &row{capacity: r.capacity, demand: r.demand, using: r.using, usingUntil: r.usingUntil, applied: r.applied}
 			for _, g := range grants {
-				stored.grants = append(stored.grants, grant{seq: g.Seq, value: g.Value, expires: g.Expires})
+				stored.grants = append(stored.grants, grant{seq: g.Seq, value: g.Value, expires: g.Expires, deadAt: g.DeadAt})
 			}
 			st.rows[name][resource] = stored
 			return nil
@@ -441,7 +477,8 @@ func (s *Postgres) Refresh(ctx context.Context, req Request) (Reply, error) {
 
 		b := &pgx.Batch{}
 		b.Queue("update queryguard_fleet set seq = $1", st.seq)
-		live := slices.Collect(maps.Keys(st.members))
+		// A nil slice is sent as NULL, which <> all() matches nothing against.
+		live := slices.AppendSeq([]string{}, maps.Keys(st.members))
 		b.Queue("delete from queryguard_members where instance <> all($1)", live)
 		b.Queue("delete from queryguard_leases where instance <> all($1)", live)
 		own := st.members[req.Instance]
@@ -449,16 +486,16 @@ func (s *Postgres) Refresh(ctx context.Context, req Request) (Reply, error) {
 			on conflict (instance) do update set id = excluded.id, addr = excluded.addr, dead_at = excluded.dead_at`,
 			req.Instance, own.id, own.addr, own.deadAt)
 		b.Queue("delete from queryguard_leases where instance = $1 and resource <> all($2)",
-			req.Instance, slices.Collect(maps.Keys(st.rows[req.Instance])))
+			req.Instance, slices.AppendSeq([]string{}, maps.Keys(st.rows[req.Instance])))
 		for resource, r := range st.rows[req.Instance] {
 			stored := []storedGrant{}
 			for _, g := range r.grants {
-				stored = append(stored, storedGrant{Seq: g.seq, Value: g.value, Expires: g.expires})
+				stored = append(stored, storedGrant{Seq: g.seq, Value: g.value, Expires: g.expires, DeadAt: g.deadAt})
 			}
-			b.Queue(`insert into queryguard_leases values ($1, $2, $3, $4, $5, $6)
+			b.Queue(`insert into queryguard_leases values ($1, $2, $3, $4, $5, $6, $7, $8)
 				on conflict (instance, resource) do update set capacity = excluded.capacity, demand = excluded.demand,
-				applied = excluded.applied, grants = excluded.grants`,
-				req.Instance, resource, r.capacity, r.demand, r.applied, stored)
+				using_now = excluded.using_now, using_until = excluded.using_until, applied = excluded.applied, grants = excluded.grants`,
+				req.Instance, resource, r.capacity, r.demand, r.using, r.usingUntil, r.applied, stored)
 		}
 		return tx.SendBatch(ctx, b).Close()
 	})
