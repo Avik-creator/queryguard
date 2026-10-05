@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -21,7 +25,7 @@ import (
 )
 
 func TestRequireClientTLSNeedsCertificate(t *testing.T) {
-	if _, err := loadTLS("", "", true); err == nil || !strings.Contains(err.Error(), "-require-client-tls") {
+	if _, err := loadCertificates("", "", true); err == nil || !strings.Contains(err.Error(), "-require-client-tls") {
 		t.Fatalf("got %v; want an error naming -require-client-tls", err)
 	}
 }
@@ -327,4 +331,77 @@ func TestAFailedAllowlistSaveIsTriedAgain(t *testing.T) {
 			t.Errorf("allowlist not saved once it could be: %v", err)
 		}
 	})
+}
+
+func TestTLSWarningsNameEachUnverifiedConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts options
+		want []string
+	}{
+		{"all verified", options{upstreamSSL: "verify-full", catalogDSN: "host=db sslmode=verify-full", stateDSN: "host=db sslmode=verify-full"}, nil},
+		{"require upstream", options{upstreamSSL: "require"}, []string{"-upstream-sslmode=require"}},
+		{"catalog without sslmode", options{upstreamSSL: "disable", catalogDSN: "host=db user=monitor"}, []string{"-catalog-dsn"}},
+		{"state with require", options{upstreamSSL: "disable", stateDSN: "postgres://qg@db/qg?sslmode=require"}, []string{"-state-dsn"}},
+		{"unix socket", options{upstreamSSL: "disable", catalogDSN: "host=/var/run/postgresql user=monitor"}, nil},
+	} {
+		var got []string
+		for _, w := range tlsWarnings(tc.opts) {
+			got = append(got, strings.Fields(w)[0])
+		}
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("%s: warnings start %q; want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestHangupWithoutConfigDoesNotStopTheProcess(t *testing.T) {
+	reloaded := make(chan struct{}, 1)
+	stop := onHangup(slog.New(slog.DiscardHandler), func() { reloaded <- struct{}{} })
+	defer stop()
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-reloaded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SIGHUP never reached the handler")
+	}
+}
+
+func TestCertificateReloadKeepsTheOldOneOnError(t *testing.T) {
+	dir := t.TempDir()
+	certFile, keyFile := filepath.Join(dir, "server.crt"), filepath.Join(dir, "server.key")
+	writePair := func(cert tls.Certificate) {
+		key, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeFile(t, certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}))
+		writeFile(t, keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}))
+	}
+	first, _ := testcert.Pair(t)
+	writePair(first)
+	certs, err := loadCertificates(certFile, keyFile, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := certs.tlsConfig()
+	offered := func() []byte {
+		c, err := cfg.GetCertificate(&tls.ClientHelloInfo{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c.Certificate[0]
+	}
+
+	second, _ := testcert.Pair(t)
+	writePair(second)
+	if err := certs.reload(); err != nil || !bytes.Equal(offered(), second.Certificate[0]) {
+		t.Fatalf("reload = %v; want the new certificate offered", err)
+	}
+	writeFile(t, keyFile, []byte("not a key"))
+	if err := certs.reload(); err == nil || !bytes.Equal(offered(), second.Certificate[0]) {
+		t.Errorf("reload of a bad key = %v; want an error and the certificate in force kept", err)
+	}
 }

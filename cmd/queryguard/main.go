@@ -20,6 +20,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -123,9 +125,13 @@ func main() {
 }
 
 func run(opts options, log *slog.Logger) error {
-	tlsConfig, err := loadTLS(opts.tlsCert, opts.tlsKey, opts.requireTLS)
+	certs, err := loadCertificates(opts.tlsCert, opts.tlsKey, opts.requireTLS)
 	if err != nil {
 		return err
+	}
+	var tlsConfig *tls.Config
+	if certs != nil {
+		tlsConfig = certs.tlsConfig()
 	}
 	upstreamTLSConfig, err := upstreamTLS(opts.upstreamSSL, opts.upstreamCA, opts.upstream)
 	if err != nil {
@@ -151,6 +157,9 @@ func run(opts options, log *slog.Logger) error {
 	ln, err := net.Listen("tcp", opts.listen)
 	if err != nil {
 		return err
+	}
+	for _, w := range tlsWarnings(opts) {
+		log.Warn(w)
 	}
 	log.Info("queryguard started", "version", version, "listen", ln.Addr(), "upstream", opts.upstream,
 		"tls", tlsConfig != nil, "require_client_tls", opts.requireTLS, "upstream_sslmode", opts.upstreamSSL, "config", opts.config)
@@ -197,9 +206,8 @@ func run(opts options, log *slog.Logger) error {
 		}()
 	}
 	s.Monitor = newMonitor(catalog, s, log)
-	if opts.config != "" {
-		go safe.Loop(ctx, log, "config reload", func(ctx context.Context) { reloadOnHangup(ctx, s, opts.config, catalog, log) })
-	}
+	stopHangup := onHangup(log, func() { hangup(s, opts.config, catalog, certs, log) })
+	defer stopHangup()
 	if err := s.Serve(ctx, ln); err != nil {
 		return err
 	}
@@ -461,8 +469,14 @@ func newMonitor(catalog *plan.Catalog, s *proxy.Server, log *slog.Logger) proxy.
 	}}
 }
 
-// loadTLS returns the client TLS config, or nil when neither file is given, which require forbids.
-func loadTLS(certFile, keyFile string, require bool) (*tls.Config, error) {
+// certificates holds the client TLS certificate, which a SIGHUP reads again from its files.
+type certificates struct {
+	certFile, keyFile string
+	current           atomic.Pointer[tls.Certificate]
+}
+
+// loadCertificates reads the client TLS certificate, or returns nil when neither file is given, which require forbids.
+func loadCertificates(certFile, keyFile string, require bool) (*certificates, error) {
 	if certFile == "" && keyFile == "" {
 		if require {
 			return nil, errors.New("-require-client-tls needs -tls-cert and -tls-key")
@@ -472,11 +486,62 @@ func loadTLS(certFile, keyFile string, require bool) (*tls.Config, error) {
 	if certFile == "" || keyFile == "" {
 		return nil, errors.New("-tls-cert and -tls-key must be given together")
 	}
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("load TLS certificate: %w", err)
+	c := &certificates{certFile: certFile, keyFile: keyFile}
+	if err := c.reload(); err != nil {
+		return nil, err
 	}
-	return wire.ServerTLSConfig(cert), nil
+	return c, nil
+}
+
+// reload reads the certificate files again, keeping the certificate in force when they don't load.
+func (c *certificates) reload() error {
+	cert, err := tls.LoadX509KeyPair(c.certFile, c.keyFile)
+	if err != nil {
+		return fmt.Errorf("load TLS certificate: %w", err)
+	}
+	c.current.Store(&cert)
+	return nil
+}
+
+// tlsConfig returns a config for client TLS that offers whichever certificate was loaded last.
+func (c *certificates) tlsConfig() *tls.Config {
+	cfg := wire.ServerTLSConfig(tls.Certificate{})
+	cfg.Certificates = nil
+	cfg.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return c.current.Load(), nil }
+	return cfg
+}
+
+// tlsWarnings names each connection to Postgres that doesn't check the server's certificate.
+func tlsWarnings(opts options) []string {
+	var warnings []string
+	if opts.upstreamSSL == "require" {
+		warnings = append(warnings, "-upstream-sslmode=require encrypts but accepts any certificate, so a man in the middle can read every login; use verify-full")
+	}
+	for _, dsn := range []struct{ flag, value string }{{"-catalog-dsn", opts.catalogDSN}, {"-state-dsn", opts.stateDSN}} {
+		if dsn.value != "" && !verifiesServer(dsn.value) {
+			warnings = append(warnings, dsn.flag+" may send its password where a man in the middle can read it; add sslmode=verify-full")
+		}
+	}
+	return warnings
+}
+
+// verifiesServer reports whether dsn reaches Postgres over a Unix socket, or only over TLS with the server's certificate and name checked.
+func verifiesServer(dsn string) bool {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil || strings.HasPrefix(cfg.Host, "/") {
+		return true
+	}
+	// Only verify-full has no plaintext fallback and leaves Go's own checks on; verify-ca turns them off for a check of its own.
+	verified := func(t *tls.Config) bool { return t != nil && !t.InsecureSkipVerify }
+	if !verified(cfg.TLSConfig) {
+		return false
+	}
+	for _, fb := range cfg.Fallbacks {
+		if !verified(fb.TLSConfig) {
+			return false
+		}
+	}
+	return true
 }
 
 // upstreamTLS returns the TLS config for connecting to Postgres; sslmode names follow libpq.
@@ -525,21 +590,45 @@ func reload(s *proxy.Server, path string, catalog *plan.Catalog) error {
 	return nil
 }
 
-// reloadOnHangup reloads the policy file at each SIGHUP until ctx ends.
-func reloadOnHangup(ctx context.Context, s *proxy.Server, path string, catalog *plan.Catalog, log *slog.Logger) {
+// onHangup runs f at each SIGHUP until stop is called; meanwhile a SIGHUP no longer ends the process, as Go's default would.
+func onHangup(log *slog.Logger, f func()) (stop func()) {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
-	defer signal.Stop(hup)
-	for {
-		select {
-		case <-ctx.Done():
+	done := make(chan struct{})
+	go safe.Loop(context.Background(), log, "SIGHUP", func(context.Context) {
+		for {
+			select {
+			case <-done:
+				return
+			case <-hup:
+				f()
+			}
+		}
+	})
+	return sync.OnceFunc(func() {
+		signal.Stop(hup)
+		close(done)
+	})
+}
+
+// hangup reloads the client TLS certificate and the policy file, whichever QueryGuard has, each keeping the one in force when it fails.
+func hangup(s *proxy.Server, config string, catalog *plan.Catalog, certs *certificates, log *slog.Logger) {
+	if certs == nil && config == "" {
+		log.Info("SIGHUP ignored: no -config or -tls-cert to reload")
+		return
+	}
+	if certs != nil {
+		if err := certs.reload(); err != nil {
+			log.Error("TLS certificate not reloaded; the one in force stays", "err", err)
+		} else {
+			log.Info("TLS certificate reloaded", "cert", certs.certFile)
+		}
+	}
+	if config != "" {
+		if err := reload(s, config, catalog); err != nil {
+			log.Error("config not reloaded; the one in force stays", "config", config, "err", err)
 			return
-		case <-hup:
 		}
-		if err := reload(s, path, catalog); err != nil {
-			log.Error("config not reloaded; the one in force stays", "config", path, "err", err)
-			continue
-		}
-		log.Info("config reloaded", "config", path)
+		log.Info("config reloaded", "config", config)
 	}
 }
