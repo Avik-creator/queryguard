@@ -15,7 +15,7 @@ import (
 // Query is what the rules need to know about one query string, gathered from every statement in it.
 type Query struct {
 	DDL                 bool     // a statement Postgres logs as DDL under log_statement = 'ddl'
-	Do                  bool     // a DO block, whose body can run anything
+	Opaque              bool     // a DO block or CALL, whose body can run anything
 	ChangesEveryRow     bool     // UPDATE or DELETE without WHERE, or TRUNCATE
 	BlockingIndexChange bool     // CREATE INDEX, DROP INDEX or REINDEX without CONCURRENTLY, which blocks writes
 	Schemas             []string // schemas named explicitly, sorted, without duplicates
@@ -100,8 +100,8 @@ func Analyze(sql string) (Query, error) {
 					add(schemaOf(obj.GetList().GetItems()))
 				}
 			}
-		case *pg_query.DoStmt:
-			q.Do = true
+		case *pg_query.DoStmt, *pg_query.CallStmt:
+			q.Opaque = true
 		case *pg_query.VacuumStmt:
 			q.Analyzes = true
 		case *pg_query.RangeVar:

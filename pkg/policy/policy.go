@@ -137,8 +137,8 @@ type check struct {
 
 var checks = map[string]check{
 	"deny_ddl": {
-		violatedBy: func(q sqlparse.Query, _ Rule) bool { return q.DDL || q.Do },
-		hint:       "Schema changes and DO blocks are not allowed for this role.",
+		violatedBy: func(q sqlparse.Query, _ Rule) bool { return q.DDL || q.Opaque },
+		hint:       "Schema changes, DO blocks and procedure calls are not allowed for this role.",
 	},
 	"require_where": {
 		violatedBy: func(q sqlparse.Query, _ Rule) bool { return q.ChangesEveryRow },

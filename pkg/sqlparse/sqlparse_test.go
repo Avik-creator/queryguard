@@ -45,7 +45,9 @@ func TestAnalyze(t *testing.T) {
 		{"vacuum orders", Query{Analyzes: true}},
 		{"analyze orders", Query{Analyzes: true}},
 		{"copy orders from stdin", Query{}},
-		{"do $$ begin drop table orders; end $$", Query{Do: true}},
+		{"do $$ begin drop table orders; end $$", Query{Opaque: true}},
+		// A procedure's body can run DDL or change every row, which its CALL doesn't show.
+		{"call billing.purge(1)", Query{Opaque: true, Schemas: []string{"billing"}}},
 		{"insert into orders (id) values (1)", Query{Explainable: true}},
 		{"merge into orders o using customers c on c.id = o.id when matched then delete", Query{Explainable: true}},
 		{"declare c cursor for select * from orders", Query{Explainable: true, Cursor: true}},

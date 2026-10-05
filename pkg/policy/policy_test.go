@@ -38,6 +38,7 @@ func TestRulesBlockStatements(t *testing.T) {
 		"select * from public.orders":                                          "",
 		"create table notes (id int)":                                          "deny_ddl",
 		"do $$ begin perform 1; end $$":                                        "deny_ddl",
+		"call purge_orders()":                                                  "deny_ddl",
 		"delete from orders":                                                   "require_where",
 		"select 1; update orders set total = 0":                                "require_where",
 		"select * from billing.invoices":                                       "schema_allowlist",

@@ -86,7 +86,7 @@ before it reaches PostgreSQL:
 
 | Check | Blocks |
 | --- | --- |
-| `deny_ddl` | Statements PostgreSQL logs as DDL under `log_statement = 'ddl'`, `SELECT INTO`, and `DO` blocks |
+| `deny_ddl` | Statements PostgreSQL logs as DDL under `log_statement = 'ddl'`, `SELECT INTO`, `DO` blocks, and `CALL`, since a procedure can run anything |
 | `require_where` | `UPDATE` or `DELETE` without `WHERE`, and `TRUNCATE`; `WHERE true` changes every row on purpose |
 | `index_concurrently` | `CREATE INDEX`, `DROP INDEX` and `REINDEX` without `CONCURRENTLY`; `CREATE INDEX ON ONLY`, the first step in indexing a partitioned table, is allowed |
 | `schema_allowlist` | Naming a schema outside `schemas`, in a statement or in `search_path`, including a `search_path` set at login; `pg_catalog`, `information_schema` and the session's temporary schema are always allowed |
