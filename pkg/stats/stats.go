@@ -546,6 +546,7 @@ func (t *Table) Minute(now time.Time) []Anomaly {
 	defer t.mu.Unlock()
 	m := t.now
 	t.now = minute{}
+	// Too few calls say nothing either way, and a server too slow to finish many mustn't look calm, so anomalies neither start nor end.
 	if m.calls < minuteCalls {
 		return nil
 	}
