@@ -13,6 +13,8 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -566,6 +568,55 @@ func TestClosesClientThatSendsNoStartup(t *testing.T) {
 	conn := dial(t, addr)
 
 	expectClosed(t, conn)
+}
+
+func TestKeepsAcceptingAfterRunningOutOfFiles(t *testing.T) {
+	s := newServer(t, startFakePostgres(t).addr)
+	emfile := &net.OpError{Op: "accept", Net: "tcp", Err: os.NewSyscallError("accept", syscall.EMFILE)}
+	addr, _ := startProxyOn(t, s, &failingListener{Listener: listen(t), errs: []error{emfile, emfile}})
+
+	startSession(t, addr)
+}
+
+func TestServeReturnsListenerFailure(t *testing.T) {
+	broken := errors.New("listener broke")
+	ln := &failingListener{Listener: listen(t), errs: []error{broken}}
+	defer ln.Close()
+
+	if err := newServer(t, startFakePostgres(t).addr).Serve(t.Context(), ln); !errors.Is(err, broken) {
+		t.Fatalf("Serve returned %v; want the listener's error", err)
+	}
+}
+
+func TestClosesConnectionsOverStartupCap(t *testing.T) {
+	s := newServer(t, startFakePostgres(t).addr)
+	s.MaxStartups = 1
+	addr, _ := startProxy(t, s)
+	silent := dial(t, addr)
+	// Accept runs in order, so once this one is refused the silent one holds the only startup slot.
+	expectClosed(t, dial(t, addr))
+
+	login(t, silent)
+	startSession(t, addr)
+}
+
+// failingListener returns errs from Accept, one per call, before accepting for real.
+type failingListener struct {
+	net.Listener
+	mu   sync.Mutex
+	errs []error
+}
+
+func (l *failingListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	if len(l.errs) > 0 {
+		err := l.errs[0]
+		l.errs = l.errs[1:]
+		l.mu.Unlock()
+		return nil, err
+	}
+	l.mu.Unlock()
+	return l.Listener.Accept()
 }
 
 func TestServeReturnsNilWhenStopped(t *testing.T) {

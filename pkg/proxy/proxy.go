@@ -33,6 +33,15 @@ const (
 	DefaultShutdownTimeout = 30 * time.Second
 )
 
+// DefaultMaxStartups is the suggested MaxStartups: it keeps file descriptors free for sessions and their upstream connections.
+const DefaultMaxStartups = 1000
+
+// Backoff after a failed Accept, as net/http does: running out of file descriptors passes once sessions end.
+const (
+	minAcceptDelay = 5 * time.Millisecond
+	maxAcceptDelay = time.Second
+)
+
 // DefaultClientCheckInterval is the suggested ClientCheckInterval; zero there means off.
 const DefaultClientCheckInterval = 2 * time.Second
 
@@ -51,6 +60,7 @@ type Server struct {
 	TLSConfig       *tls.Config   // nil means clients are told TLS is unavailable
 	StartupTimeout  time.Duration // how long a new client has to send its startup message
 	ShutdownTimeout time.Duration // how long sessions may drain after Serve stops
+	MaxStartups     int           // connections at once that have yet to send their startup message; 0 means DefaultMaxStartups
 	Logger          *slog.Logger  // nil means slog.Default()
 
 	// ClientCheckInterval is sent as client_connection_check_interval unless the client set it; 0 sends nothing.
@@ -69,6 +79,7 @@ type Server struct {
 	keys     cancelKeys
 	sessions sessionCount
 	policies policy.Holder
+	starting atomic.Int64 // connections that have yet to send their startup message
 
 	mu    sync.Mutex
 	sched *sched.Scheduler // made with the first policy and reconfigured by each one after
@@ -94,8 +105,18 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 
 	var sessions sync.WaitGroup
+	var delay time.Duration
 	for {
 		client, err := ln.Accept()
+		if err != nil && ctx.Err() == nil && temporary(err) {
+			delay = min(max(2*delay, minAcceptDelay), maxAcceptDelay)
+			log.Warn("accept failed; retrying", "err", err, "retry_in", delay)
+			select {
+			case <-ctx.Done():
+			case <-time.After(delay):
+			}
+			continue
+		}
 		if err != nil {
 			if ctx.Err() == nil {
 				// The listener failed on its own, not because we stopped it.
@@ -104,6 +125,14 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 				return err
 			}
 			break
+		}
+		delay = 0
+		// handle gives the slot back once the startup message is in.
+		if s.starting.Add(1) > int64(cmp.Or(s.MaxStartups, DefaultMaxStartups)) {
+			s.starting.Add(-1)
+			log.Warn("closed connection over the cap on connections starting up", "client", client.RemoteAddr())
+			client.Close()
+			continue
 		}
 		sessions.Go(func() { s.handle(sessionCtx, log, client) })
 	}
@@ -137,6 +166,7 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 	// The deadline covers the TLS handshake too, since the TLS connection reads through client.
 	client.SetDeadline(time.Now().Add(cmp.Or(s.StartupTimeout, DefaultStartupTimeout)))
 	conn, msg, err := wire.Negotiate(client, s.TLSConfig)
+	s.starting.Add(-1)
 	if err != nil {
 		// A client that connects and leaves without a word, like a TCP health check, is not an error.
 		if !errors.Is(err, io.EOF) {
@@ -251,6 +281,12 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	if _, refused := errors.AsType[*wire.Error](err); !refused && !errors.Is(err, wire.ErrLoginRefused) && !hungUp(err) {
 		log.Warn("session ended", "client", client.RemoteAddr(), "err", err)
 	}
+}
+
+// temporary reports whether a failed Accept may work if tried again, as after running out of file descriptors.
+func temporary(err error) bool {
+	errno, ok := errors.AsType[syscall.Errno](err)
+	return ok && errno.Temporary()
 }
 
 // hungUp reports whether err only says that one side closed the connection, which is how every session ends.
