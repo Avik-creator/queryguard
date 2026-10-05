@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -261,5 +262,30 @@ func TestRelayAuthRepliesStopsAtTheFirstOtherMessage(t *testing.T) {
 	}
 	if rest, _ := io.ReadAll(client); !bytes.Equal(rest, query) {
 		t.Errorf("left %q unread; want the query", rest)
+	}
+}
+
+func TestRelayStartupExplainsAChannelBindingRefusal(t *testing.T) {
+	refusal := &pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "08P01", Message: "SCRAM channel binding negotiation error"}
+	for _, binding := range []bool{false, true} {
+		server := bytes.NewReader(concat(
+			encode(t, &pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"}}),
+			encode(t, refusal)))
+		var client bytes.Buffer
+
+		if err := RelayStartup(&client, server, StartupOptions{ChannelBinding: binding}); !errors.Is(err, ErrLoginRefused) {
+			t.Fatalf("binding %v: got %v; want the login refused", binding, err)
+		}
+
+		frontend := pgproto3.NewFrontend(&client, io.Discard)
+		frontend.Receive()
+		msg, err := frontend.Receive()
+		e, ok := msg.(*pgproto3.ErrorResponse)
+		if err != nil || !ok {
+			t.Fatalf("binding %v: client got %#v, %v; want the ErrorResponse", binding, msg, err)
+		}
+		if hinted := strings.Contains(e.Hint, "channel_binding=disable"); hinted == binding || e.Message != refusal.Message {
+			t.Errorf("binding %v: client got %q with hint %q; want a hint only when the proxy hid -PLUS", binding, e.Message, e.Hint)
+		}
 	}
 }

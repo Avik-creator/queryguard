@@ -69,6 +69,7 @@ func RelayAuthReplies(client *bufio.Reader, server io.Writer) error {
 
 // RelayStartup copies server messages to client until ReadyForQuery, or an ErrorResponse that refuses the login, reading nothing past it.
 func RelayStartup(client io.Writer, server io.Reader, opts StartupOptions) error {
+	hidBinding := false
 	for {
 		var head [5]byte
 		if _, err := io.ReadFull(server, head[:]); err != nil {
@@ -82,13 +83,15 @@ func RelayStartup(client io.Writer, server io.Reader, opts StartupOptions) error
 		var err error
 		switch {
 		case typ == authRequestType:
-			err = relayAuth(client, server, head, size, opts)
+			var hid bool
+			hid, err = relayAuth(client, server, head, size, opts)
+			hidBinding = hidBinding || hid
 		case typ == backendKeyDataType && opts.IssueKey != nil:
 			err = relayKey(client, server, size, opts.IssueKey)
 		case typ == parameterStatusType && opts.Report != nil:
 			err = relayParameter(client, server, head, size, opts.Report)
 		case typ == errorResponseType && size <= maxPacketLen:
-			return relayRefusal(client, server, head, size)
+			return relayRefusal(client, server, head, size, hidBinding)
 		default:
 			err = forward(client, server, head[:], size)
 		}
@@ -111,59 +114,73 @@ func (e *LoginRefusedError) Error() string { return ErrLoginRefused.Error() + ":
 
 func (e *LoginRefusedError) Is(target error) bool { return target == ErrLoginRefused }
 
-// relayRefusal forwards the ErrorResponse that ends a login and returns it as a LoginRefusedError.
-func relayRefusal(client io.Writer, server io.Reader, head [5]byte, size int64) error {
+// bindingHint explains Postgres's refusal of a client that saw no -PLUS mechanism but could have bound to the proxy's TLS session.
+const bindingHint = "QueryGuard ends TLS, so SCRAM channel binding can't reach Postgres: connect with channel_binding=disable, " +
+	"or give QueryGuard Postgres's own certificate and key."
+
+// relayRefusal forwards the ErrorResponse that ends a login, with a hint when hidBinding led to a protocol violation, and returns it as a LoginRefusedError.
+func relayRefusal(client io.Writer, server io.Reader, head [5]byte, size int64, hidBinding bool) error {
 	body := make([]byte, size)
 	if _, err := io.ReadFull(server, body); err != nil {
 		return unexpected(err)
 	}
-	if _, err := client.Write(append(head[:], body...)); err != nil {
-		return err
-	}
 	var e pgproto3.ErrorResponse
 	if err := e.Decode(body); err != nil {
+		if _, err := client.Write(append(head[:], body...)); err != nil {
+			return err
+		}
 		return ErrLoginRefused
+	}
+	// Postgres over TLS refuses SCRAM's "y" flag, which libpq sends over TLS when it is offered no -PLUS mechanism.
+	if hidBinding && e.Code == "08P01" && e.Hint == "" {
+		e.Hint = bindingHint
+		if err := writeMessage(client, &e); err != nil {
+			return err
+		}
+	} else if _, err := client.Write(append(head[:], body...)); err != nil {
+		return err
 	}
 	return &LoginRefusedError{Code: e.Code}
 }
 
 // relayAuth forwards an authentication request of size bytes, removing -PLUS mechanisms from AuthenticationSASL
-// unless opts allow channel binding, and runs opts.Authenticated after AuthenticationOk.
-func relayAuth(client io.Writer, server io.Reader, head [5]byte, size int64, opts StartupOptions) error {
+// unless opts allow channel binding, and runs opts.Authenticated after AuthenticationOk; it reports whether it removed any.
+func relayAuth(client io.Writer, server io.Reader, head [5]byte, size int64, opts StartupOptions) (bool, error) {
 	if size < 4 {
-		return fmt.Errorf("authentication message too short")
+		return false, fmt.Errorf("authentication message too short")
 	}
 	body := make([]byte, 4, min(size, maxPacketLen))
 	if _, err := io.ReadFull(server, body); err != nil {
-		return unexpected(err)
+		return false, unexpected(err)
 	}
 	switch code := binary.BigEndian.Uint32(body); {
 	case code == authOK && opts.Authenticated != nil:
 		if err := forward(client, server, append(head[:], body...), size-4); err != nil {
-			return err
+			return false, err
 		}
 		if e := opts.Authenticated(); e != nil {
-			return fail(client, e.Code, e.Message)
+			return false, fail(client, e.Code, e.Message)
 		}
-		return nil
+		return false, nil
 	case code != authSASL || opts.ChannelBinding:
-		return forward(client, server, append(head[:], body...), size-4)
+		return false, forward(client, server, append(head[:], body...), size-4)
 	}
 
 	if size > maxPacketLen {
-		return fmt.Errorf("AuthenticationSASL of %d bytes is too long", size)
+		return false, fmt.Errorf("AuthenticationSASL of %d bytes is too long", size)
 	}
 	body = body[:size]
 	if _, err := io.ReadFull(server, body[4:]); err != nil {
-		return unexpected(err)
+		return false, unexpected(err)
 	}
 	var msg pgproto3.AuthenticationSASL
 	if err := msg.Decode(body); err != nil {
-		return fmt.Errorf("invalid AuthenticationSASL: %w", err)
+		return false, fmt.Errorf("invalid AuthenticationSASL: %w", err)
 	}
 	// Channel binding ties SCRAM to the TLS session, which ends at the proxy; SASL names such mechanisms with -PLUS.
+	n := len(msg.AuthMechanisms)
 	msg.AuthMechanisms = slices.DeleteFunc(msg.AuthMechanisms, func(m string) bool { return strings.HasSuffix(m, "-PLUS") })
-	return writeMessage(client, &msg)
+	return len(msg.AuthMechanisms) < n, writeMessage(client, &msg)
 }
 
 // relayKey replaces a BackendKeyData message of size bytes with the key data issueKey returns.
