@@ -12,6 +12,7 @@ import (
 	"maps"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -346,4 +347,63 @@ func TestRollingRestartDropsNoBusySession(t *testing.T) {
 		t.Error("no transaction committed through the new process")
 	}
 	t.Logf("committed %d, reconnected %d, dropped mid-transaction %d; old process drained in %v", committed.Load(), reconnects.Load(), dropped.Load(), drained)
+}
+
+func TestChannelBindingWithTLSOnBothSides(t *testing.T) {
+	upstreamTLS := func(s *proxy.Server) {
+		s.Upstream = proxy.Dialer{Addr: os.Getenv("QG_TEST_UPSTREAM"), TLSConfig: &tls.Config{InsecureSkipVerify: true}, KeepAlive: proxy.DefaultKeepAlive}
+	}
+	qg := startProxyWith(t, upstreamTLS)
+	for opts, wantErr := range map[string]string{
+		"sslmode=disable":                         "",
+		"sslmode=require channel_binding=disable": "",
+		// libpq and pgx send SCRAM's "y" flag over TLS when offered no -PLUS, which Postgres over TLS refuses.
+		"sslmode=require channel_binding=prefer":  "channel_binding=disable",
+		"sslmode=require channel_binding=require": "SCRAM-SHA-256-PLUS",
+	} {
+		conn, err := pgx.Connect(t.Context(), fmt.Sprintf("host=127.0.0.1 port=%s user=postgres password=%s dbname=queryguard %s", port(qg), password(), opts))
+		if err == nil {
+			conn.Close(context.Background())
+		}
+		var hint string
+		if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
+			hint = pgErr.Hint
+		}
+		switch {
+		case wantErr == "" && err != nil:
+			t.Errorf("%s: %v", opts, err)
+		case wantErr != "" && (err == nil || !strings.Contains(err.Error()+hint, wantErr)):
+			t.Errorf("%s: got %v (hint %q); want an error mentioning %q", opts, err, hint, wantErr)
+		}
+	}
+
+	// With Postgres's own certificate the proxy passes -PLUS through, and binding holds end to end.
+	cert, key := postgresCertificate(t)
+	pair, err := tls.X509KeyPair(cert, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	same := startProxyWith(t, func(s *proxy.Server) {
+		upstreamTLS(s)
+		s.TLSConfig = wire.ServerTLSConfig(pair)
+	})
+	conn, err := pgx.Connect(t.Context(), fmt.Sprintf("host=127.0.0.1 port=%s user=postgres password=%s dbname=queryguard sslmode=require channel_binding=require", port(same), password()))
+	if err != nil {
+		t.Fatalf("channel_binding=require through a proxy with Postgres's certificate: %v", err)
+	}
+	conn.Close(context.Background())
+}
+
+// postgresCertificate reads the test server's certificate and key out of its container, skipping the test without docker.
+func postgresCertificate(t *testing.T) (cert, key []byte) {
+	t.Helper()
+	service := "pg" + port(&queryGuard{addr: os.Getenv("QG_TEST_UPSTREAM")})[2:]
+	read := func(path string) []byte {
+		out, err := exec.Command("docker", "compose", "exec", "-T", service, "cat", path).Output()
+		if err != nil {
+			t.Skipf("read %s from %s: %v", path, service, err)
+		}
+		return out
+	}
+	return read("/etc/ssl/certs/ssl-cert-snakeoil.pem"), read("/etc/ssl/private/ssl-cert-snakeoil.key")
 }

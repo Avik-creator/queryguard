@@ -15,6 +15,13 @@ x-postgres: &postgres
     - shared_preload_libraries=pg_stat_statements
     - -c
     - track_io_timing=on
+    # TLS with the image's self-signed certificate, for the tests of QueryGuard's TLS to Postgres and channel binding.
+    - -c
+    - ssl=on
+    - -c
+    - ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem
+    - -c
+    - ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
   # Parallel query workers share memory through /dev/shm. Docker's 64 MB
   # default is too small for parallel hash joins over the 10M-row test tables.
   shm_size: 256mb
