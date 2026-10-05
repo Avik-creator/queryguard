@@ -5,13 +5,15 @@ speaks the Postgres wire protocol. It estimates what each query will cost before
 it runs and gives every tenant a budget, so one tenant's expensive queries can't
 starve everyone else.
 
-> **Status:** early development. Milestones M1 to M6 are done: QueryGuard
+> **Status:** early development. Milestones M1 to M7 are done: QueryGuard
 > relays sessions, cancel requests and TLS; blocks statements by rule or by
 > their planned cost; gives each tenant a cost budget, a fair share of the
 > server and time limits; learns from how long statements take, to correct
-> their costs and to catch plans that suddenly get worse; and adapts to the
+> their costs and to catch plans that suddenly get worse; adapts to the
 > server's load, cancels DDL stuck in a lock queue, and shares its limits
-> across instances.
+> across instances; and keeps query stats, flags anomalies and runaway
+> statements, and has an admin console with a kill switch, a learned
+> allowlist and a policy simulator.
 
 ## Planned features
 
@@ -90,6 +92,11 @@ before it reaches PostgreSQL:
 | `require_where` | `UPDATE` or `DELETE` without `WHERE`, and `TRUNCATE`; `WHERE true` changes every row on purpose |
 | `index_concurrently` | `CREATE INDEX`, `DROP INDEX` and `REINDEX` without `CONCURRENTLY`; `CREATE INDEX ON ONLY`, the first step in indexing a partitioned table, is allowed |
 | `schema_allowlist` | Naming a schema outside `schemas`, in a statement or in `search_path`, including a `search_path` set at login; `pg_catalog`, `information_schema` and the session's temporary schema are always allowed |
+| `deny_functions` | Calling a function in `functions`, by name with or without its schema, even in a `SELECT`; without `functions`, the built-ins with effects beyond the statement: ending sessions (`pg_terminate_backend`), the server's files (`pg_read_file`, `lo_export`), other servers (`dblink_exec`), settings and roles (`set_config`), WAL control and session advisory locks |
+
+`deny_functions` sees the calls written in the statement. A function, view or
+trigger that calls one in turn, or `EXECUTE` of text built at run time, is
+out of its sight; for those, revoke `EXECUTE` in PostgreSQL itself.
 
 Every statement in a query string is checked, including those inside CTEs,
 `EXPLAIN` and `PREPARE`. A rule, or a tenant, in `warn` mode only logs what it
@@ -340,7 +347,19 @@ depends on `when_over`:
 | `slow` | Runs in the slow lane |
 | `reject` | Fails at once |
 
-A statement that fails this way gets SQLSTATE `53000` (`insufficient_resources`).
+A statement that fails this way gets SQLSTATE `53000` (`insufficient_resources`),
+with a hint saying how long until the tenant owes nothing, plus up to half
+again at random so that clients turned away together don't all come back at
+once (`Retry in about 2.6s`). A statement turned away for want of a slot is
+told to retry in about a second, the same way.
+
+A budget can be a share of what the server can do rather than a fixed rate:
+`{"budget": {"capacity": 0.2}}` gives a tenant a fifth. QueryGuard measures
+the capacity every 10 seconds as `max_active` statements at the server's
+average time per cost unit (see [calibrated costs](#calibrated-costs)), so
+it needs `scheduler.max_active`, and it follows the server as it gets
+faster or slower. Until statements have been timed the capacity isn't known
+and such a budget doesn't limit.
 The budget is looked at before `EXPLAIN`, the costliest step, and charged
 once the cost is known, in one step, so statements that arrive together can't
 all spend the same budget. Statements `EXPLAIN` can't plan, such as `BEGIN` or
@@ -508,6 +527,45 @@ key, at its `-advertise-addr` (by default `-listen`).
   client can't lift it with `SET`, as it could PostgreSQL's own.
 - `idle_in_transaction_timeout`: a session left idle in a transaction longer
   is ended with `FATAL 25P03`, and PostgreSQL rolls the transaction back.
+- `transaction_timeout`: a session whose transaction lasts longer, idle or
+  not, is ended with `FATAL 25P04`, as PostgreSQL 17's setting of the same
+  name does, but on every version and per tenant. It counts from when the
+  statements that opened the transaction were sent.
+- `max_rows` and `max_bytes`: a read (`SELECT` or `VALUES` without `INTO`,
+  `FOR UPDATE` or a CTE that changes rows) is cancelled once it has returned
+  more rows, or more bytes of row data, and the client gets SQLSTATE `54000`
+  after the rows it already has. Only reads run outside a transaction are cut
+  short: cancelling a statement in a transaction would roll back what the
+  transaction already did.
+
+```json
+{"tenant_defaults": {"statement_timeout": "30s", "transaction_timeout": "5m", "max_rows": 100000, "max_bytes": 104857600}}
+```
+
+### Learned timeouts
+
+With `learned_timeouts` on, each statement's timeout is a multiple of its own
+p99 from the [query stats](#query-stats), never below `floor` and never above
+its tenant's `statement_timeout`. A statement that usually takes 20 ms then
+can't run for 30 s because its plan went wrong.
+
+```json
+{"learned_timeouts": {"mode": "on", "multiple": 10, "min_runs": 100, "floor": "1s"}}
+```
+
+### Runaway statements
+
+A statement cancelled for breaking its timeout or a row cap goes on a watch
+list, by fingerprint, for `watch` (10 minutes). Each time it runs again,
+`action` decides: `log` (the default) logs its first run back, `slow` runs it
+in the slow lane, and `reject` turns it away with SQLSTATE `53000` and a hint
+saying when the watch ends. A statement cancelled for another reason, such as
+the DDL guard's lock timeout, isn't watched. The admin console's `SHOW WATCH`
+lists the watch and `UNWATCH` ends one early.
+
+```json
+{"runaway": {"action": "slow", "watch": "10m"}}
+```
 - A client that disconnects mid-statement has its statement cancelled, and
   one that disconnects while its statement waits for a slot or a budget never
   has it run.
@@ -547,8 +605,15 @@ n / (n + `credibility`) after n runs, as in Bühlmann's credibility formula.
 The factor stays between 1/100 and 100, and `max_cost` still judges the
 planner's own cost, the number `EXPLAIN` shows.
 
+Two things `EXPLAIN` doesn't show are charged on top. A statement pays
+`returned_mb` (128) units for each MB of rows it returns, what reading them
+in order from disk would cost. A write pays `wal_mb` (128) units for each MB
+of WAL its statement usually writes, as `pg_stat_statements` counts it, since
+the plan leaves out triggers, foreign key checks and index upkeep. Both are
+off with `calibration.mode` `off`.
+
 ```json
-{"calibration": {"mode": "on", "credibility": 10}}
+{"calibration": {"mode": "on", "credibility": 10, "returned_mb": 128, "wal_mb": 128}}
 ```
 
 When a timed statement ends, its charge is trued up to what it took: the
@@ -644,6 +709,102 @@ QueryGuard reads it every 10 seconds and matches its entries by
 fingerprinting their text, so a statement need not be explained to be
 matched. `pg_stat_statements` counts by role, not tenant, so tenants that
 share a trusted role see that role's buffers.
+
+### Anomalies
+
+Each minute with at least 20 statements is judged on three signals: its p99,
+the share of statements that failed, and the share that ran over ten times
+their own statement's median and at least 100 ms. Each signal has a baseline
+averaged over about 30 minutes, which an anomalous minute doesn't join. A
+minute is anomalous when a signal is above three mean deviations of its
+baseline, twice the baseline, and a floor (50 ms, 2% or 5%). Two such minutes
+in a row start an anomaly and two normal ones end it, so one spike raises
+nothing. The log names what is behind it: the statements with the most slow
+runs or errors that minute, the plans that flipped, and the most sessions
+waiting on locks at once.
+
+```
+level=WARN msg=anomaly signal=p99 value=2.1 baseline=0.012 statements="[select * from orders where note like $1]" flips=[] lock_waits=7
+```
+
+### Recorded traffic and the policy simulator
+
+With `-traffic-log traffic.jsonl` QueryGuard writes a line for each
+statement: its time, database, role, tenant, fingerprint, text with the
+constants replaced by `$1`, time taken, cost units, rows and error. A file
+moves to `traffic.jsonl.1` once it holds a day, so the log keeps one to two
+days. `queryguard simulate` replays both files against another config:
+
+```
+queryguard simulate -config new.json -traffic traffic.jsonl
+```
+
+It prints the statements each rule would refuse, with a few examples, what
+each tenant's budget would have refused or delayed, and how many statements
+the new config refuses that ran, and the other way round. Rules, the
+allowlist and fixed-rate budgets are replayed; cost rules need each
+statement's plan, and slots and budgets by capacity need the live server, so
+the report says when those are in the config and left out.
+
+## Admin console
+
+`psql -d queryguard_admin` (the name is `-admin-db`; empty turns it off)
+opens QueryGuard's console instead of a database. PostgreSQL checks the
+password, against the database `-admin-auth-db` (`postgres`), and only
+superusers and roles in `admin_roles` get in.
+
+| Command | Does |
+| --- | --- |
+| `SHOW TENANTS` | Each tenant's budget left, rate, recent use and running statements |
+| `SHOW STATS [n]` | The n statements with the most total time (20), with their fingerprints |
+| `SHOW ANOMALIES`, `SHOW FLIPS` | Anomalies and plan flips lately seen |
+| `SHOW WATCH`, `UNWATCH db fingerprint` | The runaway watch list |
+| `KILL TENANT name [FOR '10m']`, `KILL STATEMENT fingerprint [FOR '10m']` | The kill switch: refuse a tenant's statements, or a statement, for a while (an hour by default) with SQLSTATE `53000` |
+| `UNKILL TENANT name`, `UNKILL STATEMENT fingerprint` | Lift a kill |
+| `SHOW KILLS`, `SHOW ALLOWLIST` | Kills in force, and each role's learned statements |
+| `RELOAD` | Read `-config` again, as `SIGHUP` does |
+
+It takes simple queries only, as psql sends. The same commands run from the
+command line:
+
+```
+PGPASSWORD=... queryguard admin -addr 127.0.0.1:6543 -user postgres kill tenant acme for 10m
+```
+
+Kills, the watch list and the stats live in memory, so a restart clears
+them, and each instance of a fleet has its own.
+
+## Learned allowlist
+
+For a role that should only ever run a known set of statements, such as an
+AI agent's or a reporting tool's, run the allowlist in `learn` mode while it
+does its usual work, then switch to `enforce`: from then on a statement whose
+fingerprint wasn't learned for that role is refused with SQLSTATE `42501`.
+Constants don't change a fingerprint, so a learned statement runs with any
+values.
+
+```json
+{"allowlist": {"mode": "enforce", "roles": ["agent"]}}
+```
+
+With `-allowlist-file allowlist.json` the learned statements are read at
+start and saved as they are learned; the file is JSON, role to fingerprint
+to the statement's text, so it can be reviewed or edited. Without `roles`
+the allowlist applies to every role.
+
+## Failed logins
+
+An address that fails to log in as one role 10 times in a minute (SQLSTATE
+`28P01`, a wrong password, or `28000`, refused by `pg_hba.conf`) is refused at
+the proxy for a minute with `FATAL 28000`, before it can hold a PostgreSQL
+connection. Counting by role as well as address keeps one misconfigured app
+behind a NAT from locking out the others.
+
+```json
+{"login_throttle": {"failures": 10, "window": "1m", "cool_off": "1m"}}
+```
+
+`"mode": "off"` turns it off.
 
 ## Connection caps
 
