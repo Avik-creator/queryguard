@@ -423,9 +423,12 @@ func TestRuleMatch(t *testing.T) {
 		{`{"clients": ["10.0.0.0/8"]}`, "alice", "172.16.0.1", "", "delete from orders", false},
 		{`{"tags": {"route": "/admin"}}`, "alice", "10.1.2.3", "", "delete from orders /*route='%2Fadmin'*/", true},
 		{`{"tags": {"route": "/admin"}}`, "alice", "10.1.2.3", "", "delete from orders /*route='%2Fshop'*/", false},
+		// bob isn't trusted to tag statements, so dropping or changing a tag can't take his statements out of a rule.
+		{`{"tags": {"route": "/admin"}}`, "bob", "10.1.2.3", "", "delete from orders /*route='%2Fshop'*/", true},
+		{`{"tags": {"route": "/admin"}}`, "bob", "10.1.2.3", "", "delete from orders", true},
 		{`{"roles": ["alice"], "application_names": ["batch"]}`, "alice", "10.1.2.3", "web", "delete from orders", false},
 	} {
-		c := mustParse(t, `{"rules": [{"check": "require_where", "match": `+tc.match+`}]}`).Checker(tc.role, discard)
+		c := mustParse(t, `{"trusted_roles": ["alice"], "rules": [{"check": "require_where", "match": `+tc.match+`}]}`).Checker(tc.role, discard)
 		c.Env.Client = netip.MustParseAddr(tc.client)
 		set := standard
 		set.ApplicationName = tc.app
@@ -750,24 +753,25 @@ func TestParseRejectsBadConfig(t *testing.T) {
 		`{"tenants": {"alice": {"mode": "loud"}}}`:                            "loud",
 		`{"max_connections": -1}`:                                             "max_connections",
 		`{"tenants": {"alice": {"max_connections": -1}}}`:                     "max_connections",
-		`{"rule": []}`:                                                              "rule",
-		`{"rules": [{"check": "max_cost"}]}`:                                        "cost",
-		`{"rules": [{"check": "max_cost", "cost": -1}]}`:                            "cost",
-		`{"rules": [{"check": "max_scan_rows"}]}`:                                   "rows",
-		`{"rules": [{"check": "require_where", "cost": 5}]}`:                        "cost",
-		`{"rules": [{"check": "max_cost", "cost": 5, "rows": 5}]}`:                  "rows",
-		`{"tenants": {"a": {"budget": {"rate": -1}}}}`:                              "rate",
-		`{"tenants": {"a": {"budget": {"rate": 10, "when_over": "later"}}}}`:        "later",
-		`{"tenants": {"a": {"budget": {"burst": 10}}}}`:                             "burst",
-		`{"tenant_defaults": {"statement_timeout": "soon"}}`:                        "soon",
-		`{"tenant_defaults": {"statement_timeout": "-1s"}}`:                         "statement_timeout",
-		`{"tenant_defaults": {"mode": "warn"}}`:                                     "tenant_defaults",
-		`{"scheduler": {"max_active": -1}}`:                                         "max_active",
-		`{"rules": [{"check": "deny_ddl", "match": {"clients": ["10.0.0.0/33"]}}]}`: "10.0.0.0/33",
-		`{"calibration": {"mode": "maybe"}}`:                                        "maybe",
-		`{"calibration": {"credibility": -1}}`:                                      "credibility",
-		`{"plan_flips": {"mode": "loud"}}`:                                          "loud",
-		`{"plan_flips": {"quarantine": "-1m"}}`:                                     "quarantine",
+		`{"rule": []}`:                                                               "rule",
+		`{"rules": [{"check": "max_cost"}]}`:                                         "cost",
+		`{"rules": [{"check": "max_cost", "cost": -1}]}`:                             "cost",
+		`{"rules": [{"check": "max_scan_rows"}]}`:                                    "rows",
+		`{"rules": [{"check": "require_where", "cost": 5}]}`:                         "cost",
+		`{"rules": [{"check": "max_cost", "cost": 5, "rows": 5}]}`:                   "rows",
+		`{"tenants": {"a": {"budget": {"rate": -1}}}}`:                               "rate",
+		`{"tenants": {"a": {"budget": {"rate": 10, "when_over": "later"}}}}`:         "later",
+		`{"tenants": {"a": {"budget": {"burst": 10}}}}`:                              "burst",
+		`{"tenant_defaults": {"statement_timeout": "soon"}}`:                         "soon",
+		`{"tenant_defaults": {"statement_timeout": "-1s"}}`:                          "statement_timeout",
+		`{"tenant_defaults": {"mode": "warn"}}`:                                      "tenant_defaults",
+		`{"scheduler": {"max_active": -1}}`:                                          "max_active",
+		`{"rules": [{"check": "deny_ddl", "match": {"clients": ["10.0.0.0/33"]}}]}`:  "10.0.0.0/33",
+		`{"calibration": {"mode": "maybe"}}`:                                         "maybe",
+		`{"calibration": {"credibility": -1}}`:                                       "credibility",
+		`{"plan_flips": {"mode": "loud"}}`:                                           "loud",
+		`{"plan_flips": {"quarantine": "-1m"}}`:                                      "quarantine",
+		`{"rules": [{"check": "deny_ddl", "match": {"tags": {"route": "/admin"}}}]}`: "trusted_roles",
 	} {
 		if _, err := Parse([]byte(config)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("Parse(%s) = %v; want an error mentioning %q", config, err, want)

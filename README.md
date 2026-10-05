@@ -106,7 +106,12 @@ rule without one applies to everyone:
 ```
 
 `application_name` and tags are set by the client, so they only label a
-statement; they are not a way to tell who sent it.
+statement; they are not a way to tell who sent it. A client can change
+`application_name` to leave a rule narrowed by it, so use it to aim `warn`
+rules, not to limit anyone. Tags narrow a rule only for roles in
+`trusted_roles` (see "Tenants, budgets and the scheduler"), which a config
+with tag matches must set; for any other role such a rule applies whatever
+tags its statements carry, since the client could drop them.
 
 A rejected statement fails with SQLSTATE `42501` and a hint, and the
 connection stays usable. Outside a transaction QueryGuard answers it itself;

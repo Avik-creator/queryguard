@@ -61,7 +61,7 @@ type Match struct {
 	Tenants          []string          `json:"tenants"`
 	ApplicationNames []string          `json:"application_names"` // application_name is set by the client, so only a label
 	Clients          []string          `json:"clients"`           // client addresses or CIDR prefixes
-	Tags             map[string]string `json:"tags"`              // sqlcommenter tags, all of which must be on the statement
+	Tags             map[string]string `json:"tags"`              // sqlcommenter tags, all of which must be on a trusted role's statement
 }
 
 // Tenant holds the settings for one tenant.
@@ -261,6 +261,9 @@ func (p *Policy) compile() error {
 			errs = append(errs, fmt.Errorf("check %s: %w", r.Check, err))
 		}
 		p.clients = append(p.clients, prefixes)
+		if len(r.Match.Tags) > 0 && len(c.TrustedRoles) == 0 {
+			errs = append(errs, fmt.Errorf("check %s: match tags narrow a rule only for trusted_roles, and none are set", r.Check))
+		}
 		p.costRules = p.costRules || checks[r.Check].overBy != nil
 	}
 	if c.TenantDefaults.Mode != "" || c.TenantDefaults.MaxConnections != 0 {
@@ -443,7 +446,11 @@ type subject struct {
 	role, tenant, app string
 	client            netip.Addr
 	tags              map[string]string
+	trusted           bool // the role is trusted to tag its statements
 }
+
+// trusted reports whether role's tags can be believed: they name its statements' tenant and narrow rules.
+func (p *Policy) trusted(role string) bool { return slices.Contains(p.cfg.TrustedRoles, role) }
 
 // Check returns the error to send instead of running sql, or nil, and the gate it passes just before it executes, if any.
 func (c *Checker) Check(sql string, set session.Settings) (*pgproto3.ErrorResponse, session.Gate) {
@@ -452,7 +459,7 @@ func (c *Checker) Check(sql string, set session.Settings) (*pgproto3.ErrorRespon
 		return nil, nil
 	}
 	tags := sqlparse.Tags(sql)
-	who := subject{role: c.role, tenant: c.tenant(p, tags), app: set.ApplicationName, client: c.Env.Client, tags: tags}
+	who := subject{role: c.role, tenant: c.tenant(p, tags), app: set.ApplicationName, client: c.Env.Client, tags: tags, trusted: p.trusted(c.role)}
 	warn := p.cfg.Tenants[who.tenant].Mode == Warn
 
 	reason := misread(sql, set)
@@ -496,7 +503,7 @@ func (c *Checker) tenant(p *Policy, tags map[string]string) string {
 	switch {
 	case name == "":
 		return c.role
-	case slices.Contains(p.cfg.TrustedRoles, c.role):
+	case p.trusted(c.role):
 		return name
 	}
 	if !c.warnedTag {
@@ -703,7 +710,7 @@ func (c *Checker) plans() *plan.Cache {
 // CheckStartup checks the settings a client asks for at login, which no statement shows; it returns a FATAL error to refuse the login.
 func (c *Checker) CheckStartup(settings iter.Seq2[string, string]) *pgproto3.ErrorResponse {
 	p := c.policy()
-	who := subject{role: c.role, tenant: c.role, client: c.Env.Client}
+	who := subject{role: c.role, tenant: c.role, client: c.Env.Client, trusted: p.trusted(c.role)}
 	warn := p.cfg.Tenants[c.role].Mode == Warn
 	all := maps.Collect(settings)
 	who.app = all["application_name"]
@@ -752,8 +759,9 @@ func (p *Policy) matches(i int, who subject) bool {
 	m := p.cfg.Rules[i].Match
 	listed := func(list []string, v string) bool { return len(list) == 0 || slices.Contains(list, v) }
 	client := len(p.clients[i]) == 0 || slices.ContainsFunc(p.clients[i], func(pr netip.Prefix) bool { return pr.Contains(who.client.Unmap()) })
+	// An untrusted client could drop or change a tag to leave a rule, so tags narrow rules only for trusted roles.
 	for k, v := range m.Tags {
-		if who.tags[k] != v {
+		if who.trusted && who.tags[k] != v {
 			return false
 		}
 	}
