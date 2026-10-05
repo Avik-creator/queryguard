@@ -187,6 +187,11 @@ How QueryGuard gets the plan:
   statement's fingerprint. Every minute QueryGuard logs the cache's hit rate
   and the average time spent explaining, which is the latency the cost check
   adds.
+- A session that may switch roles, with `SET ROLE`, `SET SESSION
+  AUTHORIZATION` or `set_config` of `role` or of a name known only when it
+  runs, has every statement explained from then on. Row-level security can
+  give the new role another plan for the same text, so such a session never
+  reads or fills the shared cache, and its history is kept apart.
 - If PostgreSQL refuses the `EXPLAIN`, say because a column doesn't exist, the
   client gets that error as its statement's answer, since the statement would
   have failed the same way. Inside a transaction this fails the transaction,
@@ -299,7 +304,8 @@ A tenant is the database role by default. Roles listed in `trusted_roles`,
 such as an application's one shared role, can name the tenant of each
 statement with a [sqlcommenter](https://google.github.io/sqlcommenter/) tag,
 `/*tenant='acme'*/` (the key is `tenant_tag`). A tag from any other role is
-ignored and logged.
+ignored and logged. Rules, tenant and budget follow the role a session logged
+in as; a later `SET ROLE` changes none of them.
 
 ```json
 {

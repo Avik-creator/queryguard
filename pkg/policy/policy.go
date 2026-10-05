@@ -607,6 +607,7 @@ type Checker struct {
 	log           *slog.Logger
 	warnedTag     bool          // the role sent a tenant tag it isn't trusted to send, which was logged once
 	clientTimeout time.Duration // statement_timeout as the client set it at login; 0 when it set none
+	roleChanged   bool          // the session may run as another role than it logged in as, so its plans are its own and never cached
 }
 
 // subject is who a statement runs for and where it comes from, as rules match it.
@@ -637,6 +638,10 @@ func (c *Checker) Check(sql string, set session.Settings) (*pgproto3.ErrorRespon
 	// Without a Backend to tell, nothing needs DDL found, so a policy with nothing else to check needn't parse the statement.
 	guardsDDL := p.guardsDDL && c.Env.Backend != nil
 	if len(p.cfg.Rules) == 0 && !p.gated && !guardsDDL {
+		// Nothing is parsed, but a policy loaded later must still know the role may have changed.
+		if mayChangeRole(sql) {
+			c.changedRole()
+		}
 		return nil, nil
 	}
 	tags := sqlparse.Tags(sql)
@@ -655,6 +660,9 @@ func (c *Checker) Check(sql string, set session.Settings) (*pgproto3.ErrorRespon
 	if q.ChangesTimeout {
 		// The new value is known only once the statement runs, if it does, so the client's wait is no longer known.
 		c.clientTimeout = 0
+	}
+	if q.ChangesRole || reason != "" {
+		c.changedRole()
 	}
 	if reason != "" {
 		// A statement that can't be read can still be scheduled, though it can't be explained or judged.
@@ -924,13 +932,21 @@ func (c *Checker) plan(p *Policy, sql, fingerprint string, who subject, warn boo
 		h := sha256.Sum256([]byte(sql))
 		key += "\x00" + string(h[:]) + e.Values
 	}
-	pl, err := c.plans().Get(key, func() (plan.Plan, error) {
+	explain := func() (plan.Plan, error) {
 		out, err := e.Run()
 		if err != nil {
 			return plan.Plan{}, err
 		}
 		return plan.Parse(out)
-	})
+	}
+	var pl plan.Plan
+	var err error
+	if c.roleChanged {
+		// Row-level security can plan the same text differently for each role the session switches to.
+		pl, err = explain()
+	} else {
+		pl, err = c.plans().Get(key, explain)
+	}
 	switch {
 	case errors.Is(err, session.ErrNoPlan):
 		return plan.Plan{}, nil, false
@@ -1027,7 +1043,27 @@ func (c *Checker) stale(pl plan.Plan) []any {
 
 // statementKey names a statement in the plan cache and history: plans differ by database and, through row-level security, by role.
 func (c *Checker) statementKey(fingerprint string) string {
-	return strings.Join([]string{c.Env.Database, c.role, fingerprint}, "\x00")
+	role := c.role
+	if c.roleChanged {
+		// The role it runs as is not known, so its history is kept apart from every other session's.
+		role += fmt.Sprintf("\x00%p", c)
+	}
+	return strings.Join([]string{c.Env.Database, role, fingerprint}, "\x00")
+}
+
+// changedRole notes that the session may now run as another role than it logged in as.
+func (c *Checker) changedRole() {
+	if !c.roleChanged {
+		c.log.Info("session may have changed its role; its plans are no longer cached or shared", "role", c.role)
+	}
+	c.roleChanged = true
+}
+
+// mayChangeRole is a quick look, without parsing, for anything that could change a statement's role.
+func mayChangeRole(sql string) bool {
+	sql = strings.ToLower(sql)
+	return strings.Contains(sql, "role") || strings.Contains(sql, "authorization") || strings.Contains(sql, "set_config") ||
+		strings.Contains(sql, "pg_settings")
 }
 
 // plans returns the plan cache, making one of the Checker's own when it has none.

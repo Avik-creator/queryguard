@@ -333,6 +333,53 @@ func TestCostCheckUsesCachedPlans(t *testing.T) {
 	}
 }
 
+func TestSessionThatChangesItsRoleExplainsEveryStatement(t *testing.T) {
+	for _, set := range []string{"set role reporting", "select set_config('role', 'reporting', true)"} {
+		c := costChecker(t, costRules, nil, discard)
+		const sql = "select * from orders where id = 1"
+		if got := costOf(gateOf(t, c, sql), costing(8)); got != nil {
+			t.Fatalf("cheap statement got %v", got)
+		}
+
+		c.Check(set, standard)
+
+		// Row-level security can give the new role another plan for the same text.
+		if got := costOf(gateOf(t, c, sql), costing(5000)); ruleOf(got) != "max_cost" {
+			t.Errorf("after %q, costly plan got %v; want max_cost, not the plan cached for the login role", set, got)
+		}
+	}
+}
+
+func TestRoleChangedUnderAPolicyThatParsesNothingIsRemembered(t *testing.T) {
+	current := mustParse(t, `{}`)
+	c := newChecker(func() *Policy { return current }, "alice", discard)
+	c.Env = Env{Database: "shop", Plans: &plan.Cache{RefreshOneIn: -1}}
+	const sql = "select * from orders where id = 1"
+
+	c.Check("SET ROLE reporting", standard)
+	// A reload brings in cost rules after the role changed.
+	current = mustParse(t, costRules)
+	costOf(gateOf(t, c, sql), costing(8))
+
+	if got := costOf(gateOf(t, c, sql), costing(5000)); ruleOf(got) != "max_cost" {
+		t.Errorf("costly plan got %v; want max_cost, not a cached plan", got)
+	}
+}
+
+func TestPlansCachedAfterARoleChangeStayOutOfOtherSessions(t *testing.T) {
+	c := costChecker(t, costRules, nil, discard)
+	other := costChecker(t, costRules, nil, discard)
+	other.Env.Plans = c.Env.Plans
+	const sql = "select * from orders where id = 1"
+
+	c.Check("set role reporting", standard)
+	costOf(gateOf(t, c, sql), costing(8))
+
+	if got := costOf(gateOf(t, other, sql), costing(5000)); ruleOf(got) != "max_cost" {
+		t.Errorf("another session got %v; want its own plan, not one made under the changed role", got)
+	}
+}
+
 func TestEnforcedCostRulesJudgeEachValuesOwnPlan(t *testing.T) {
 	c := costChecker(t, costRules, nil, discard)
 	// A rare status gets an index lookup; a common one, with the same fingerprint, reads most of the table.
