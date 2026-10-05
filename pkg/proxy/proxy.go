@@ -465,7 +465,7 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 			s.count(role, f)
 		}
 	}
-	err = session.Relay(client, server, session.Options{Check: check, Cancel: cancel, Record: record,
+	err = session.Relay(client, server, session.Options{Check: check, Cancel: cancel, Record: record, Drain: s.draining(),
 		Interrupt: func(interrupt func(session.Interruption) bool) {
 			if running != nil {
 				running.setInterrupt(interrupt)
@@ -488,7 +488,7 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	switch _, refused := errors.AsType[*wire.Error](err); {
 	case isPanic(err):
 		logPanic(log, client, err)
-	case !refused && !errors.Is(err, wire.ErrLoginRefused) && !hungUp(err):
+	case !refused && !errors.Is(err, wire.ErrLoginRefused) && !errors.Is(err, session.ErrDrained) && !hungUp(err):
 		log.Warn("session ended", "client", client.RemoteAddr(), "err", err)
 	}
 }
@@ -898,6 +898,16 @@ func (s *Server) SetPolicy(p *policy.Policy) {
 		s.sched.Configure(s.schedConfig(p))
 	}
 	s.policies.Store(p)
+}
+
+// draining returns a channel closed once Serve stops accepting, when sessions are to end as soon as they are idle.
+func (s *Server) draining() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.serving == nil {
+		return nil
+	}
+	return s.serving.Done()
 }
 
 // ActivePolicy returns the policy in force.

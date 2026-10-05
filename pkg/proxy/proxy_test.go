@@ -1370,6 +1370,23 @@ func TestShutdownWaitsForOpenSessions(t *testing.T) {
 	}
 }
 
+func TestShutdownEndsIdleSessionsAtOnce(t *testing.T) {
+	s := newServer(t, startFakePostgres(t).addr)
+	s.ShutdownTimeout = 5 * time.Second
+	addr, stop := startProxy(t, s)
+	conn := startSession(t, addr)
+
+	start := time.Now()
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Serve took %v to return; want the idle session ended at once", elapsed)
+	}
+	expectFatal(t, conn, "57P01")
+}
+
 func TestShutdownClosesSessionsAfterTimeout(t *testing.T) {
 	s := newServer(t, startFakePostgres(t).addr)
 	s.ShutdownTimeout = 100 * time.Millisecond
