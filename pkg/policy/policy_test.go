@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"math"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1915,5 +1917,36 @@ func TestAllowlistSavesAndLoads(t *testing.T) {
 	}
 	if !b.allowed("agent", "fp1") || b.allowed("agent", "fp2") {
 		t.Errorf("loaded allowlist %+v; want fp1 only", b.List())
+	}
+}
+
+func TestAllowlistStopsLearningWhenFull(t *testing.T) {
+	var list Allowlist
+	for i := range maxAllowlisted {
+		list.learn("agent", strconv.Itoa(i), "select $1")
+	}
+	if learned, full := list.learn("agent", "one more", "select $1"); learned || !full {
+		t.Errorf("learn when full = %v, %v; want it refused and the list said full", learned, full)
+	}
+	if _, full := list.learn("agent", "and another", "select $1"); full {
+		t.Error("full reported twice; want it once, so it is logged once")
+	}
+}
+
+func TestAllowlistSaveDoesNotHoldUpChecks(t *testing.T) {
+	var list Allowlist
+	list.learn("agent", "fp", "select $1")
+	r, w := io.Pipe()
+	defer r.Close()
+	go list.Save(w)
+	time.Sleep(10 * time.Millisecond)
+
+	// The file is written slowly, as on a busy disk; sessions must still check against the list meanwhile.
+	checked := make(chan bool)
+	go func() { checked <- list.allowed("agent", "fp") }()
+	select {
+	case <-checked:
+	case <-time.After(time.Second):
+		t.Fatal("allowed waited for Save to write")
 	}
 }

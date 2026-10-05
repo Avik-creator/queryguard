@@ -243,14 +243,19 @@ func (a AllowlistConfig) applies(role string) bool {
 type Allowlist struct {
 	mu    sync.Mutex
 	roles map[string]map[string]string // role to fingerprint to the statement's text, with its constants as $1, $2…
+	n     int                          // statements in roles
 	dirty bool
+	full  bool // a statement was turned away for want of room
 }
+
+// maxAllowlisted is how many statements the allowlist learns, so a client sending generated SQL can't grow it without end.
+const maxAllowlisted = 10000
 
 // clone returns a copy of a that learns apart from it.
 func (a *Allowlist) clone() *Allowlist {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	c := &Allowlist{roles: make(map[string]map[string]string, len(a.roles))}
+	c := &Allowlist{roles: make(map[string]map[string]string, len(a.roles)), n: a.n}
 	for role, prints := range a.roles {
 		c.roles[role] = maps.Clone(prints)
 	}
@@ -260,22 +265,27 @@ func (a *Allowlist) clone() *Allowlist {
 // AllowlistEntry is one learned statement.
 type AllowlistEntry struct{ Role, Fingerprint, Query string }
 
-// learn records a role's statement and reports whether it is new.
-func (a *Allowlist) learn(role, fingerprint, query string) bool {
+// learn records a role's statement, reporting whether it is new, and full the first time the list has no room for one.
+func (a *Allowlist) learn(role, fingerprint, query string) (learned, full bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if _, ok := a.roles[role][fingerprint]; ok {
+		return false, false
+	}
+	if a.n >= maxAllowlisted {
+		full, a.full = !a.full, true
+		return false, full
+	}
 	if a.roles == nil {
 		a.roles = map[string]map[string]string{}
 	}
 	if a.roles[role] == nil {
 		a.roles[role] = map[string]string{}
 	}
-	if _, ok := a.roles[role][fingerprint]; ok {
-		return false
-	}
 	a.roles[role][fingerprint] = query
+	a.n++
 	a.dirty = true
-	return true
+	return true, false
 }
 
 // allowed reports whether a role's statement was learned.
@@ -314,8 +324,14 @@ func (a *Allowlist) Changed() bool {
 // Save writes the allowlist as JSON: role to fingerprint to the statement's text.
 func (a *Allowlist) Save(w io.Writer) error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	return json.MarshalWrite(w, a.roles, jsontext.WithIndent("  "))
+	b, err := json.Marshal(a.roles, jsontext.WithIndent("  "))
+	a.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	// Sessions check against the list, so it is written to w, which may be slow, without holding them up.
+	_, err = w.Write(b)
+	return err
 }
 
 // Load replaces the allowlist with one Save wrote.
@@ -326,7 +342,10 @@ func (a *Allowlist) Load(r io.Reader) error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.roles = roles
+	a.roles, a.n = roles, 0
+	for _, prints := range roles {
+		a.n += len(prints)
+	}
 	return nil
 }
 
@@ -1111,8 +1130,11 @@ func (c *Checker) check(sql string, set session.Settings) (*pgproto3.ErrorRespon
 		fp := sqlparse.Fingerprint(sql)
 		switch {
 		case l.Mode == "learn" && fp != "" && !c.Env.Allowlist.allowed(c.role, fp):
-			if c.Env.Allowlist.learn(c.role, fp, sqlparse.Normalize(sql)) {
+			switch learned, full := c.Env.Allowlist.learn(c.role, fp, sqlparse.Normalize(sql)); {
+			case learned:
 				c.log.Info("learned a statement for the allowlist", "query", sqlparse.Normalize(sql))
+			case full:
+				c.log.Warn("the allowlist is full, so it learns no more statements", "max", maxAllowlisted)
 			}
 		case l.Mode == "enforce" && !c.Env.Allowlist.allowed(c.role, fp):
 			c.log.Warn("rejected statement", "rule", "allowlist", "query", sqlparse.Normalize(sql))
