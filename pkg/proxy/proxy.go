@@ -865,10 +865,10 @@ func (s *Server) fleetWants() map[string]fleet.Want {
 
 // applyFleet puts the instance's new shares in force.
 func (s *Server) applyFleet() {
-	p := s.ActivePolicy()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.sched != nil && p != nil {
+	// Read under mu, which SetPolicy holds, so a reload can't be undone by the policy it replaced.
+	if p := s.ActivePolicy(); s.sched != nil && p != nil {
 		s.sched.Configure(s.schedConfig(p))
 	}
 }
@@ -916,7 +916,8 @@ func (s *Server) applyCapacity() {
 	s.capacity.Store(math.Float64bits(capacity))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.sched != nil {
+	// Read again under mu, which SetPolicy holds, so a reload can't be undone by the policy it replaced.
+	if p := s.ActivePolicy(); s.sched != nil && p != nil {
 		s.sched.Configure(s.schedConfig(p))
 	}
 }
