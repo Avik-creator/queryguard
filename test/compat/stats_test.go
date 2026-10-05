@@ -1,9 +1,11 @@
 package compat
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/proxy"
 	"github.com/Avik-creator/queryguard/pkg/sqlparse"
 	"github.com/Avik-creator/queryguard/pkg/stats"
@@ -60,4 +62,33 @@ func TestStatsCountEveryQueryModeByTenant(t *testing.T) {
 	if r, _ := byFingerprint("select 1/0 as stats_probe", "postgres"); r.Errors["22012"] != 1 {
 		t.Errorf("error row %+v; want one division by zero", r)
 	}
+}
+
+func TestStatsTakeBuffersAndTempSpillsFromPgStatStatements(t *testing.T) {
+	table := &stats.Table{}
+	qg := startProxyWith(t, func(s *proxy.Server) {
+		s.Stats = table
+		s.Monitor = &plan.Monitor{DSN: catalogDSN(t), StatementsEvery: 100 * time.Millisecond, Interval: 100 * time.Millisecond}
+	})
+	admin, err := pgx.Connect(t.Context(), catalogDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(context.Background())
+	mustExec(t, admin, "create extension if not exists pg_stat_statements")
+	conn := qg.connect(t, "")
+
+	// A sort bigger than work_mem spills to temporary files.
+	mustExec(t, conn, "set work_mem = '64kB'")
+	const spill = "select g from generate_series(1, 200000) g order by g desc limit 1"
+	mustExec(t, conn, spill)
+
+	waitFor(t, 10*time.Second, func() bool {
+		for _, r := range table.Rows() {
+			if r.Fingerprint == sqlparse.Fingerprint(spill) && r.Buffers.Calls > 0 && r.Buffers.TempWritten > 0 {
+				return true
+			}
+		}
+		return false
+	})
 }

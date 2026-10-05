@@ -495,6 +495,9 @@ var lockTimeout = session.Interruption{Code: "55P03", Message: "queryguard: canc
 
 // observe acts on one reading of the server's activity.
 func (s *Server) observe(a plan.Activity) {
+	if a.Statements != nil && s.Stats != nil {
+		s.Stats.Counters(a.Statements)
+	}
 	now := time.Now()
 	elapsed := min(now.Sub(s.observed), maxObserveGap)
 	if s.observed.IsZero() {

@@ -26,6 +26,7 @@ import (
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/sched"
 	"github.com/Avik-creator/queryguard/pkg/session"
+	"github.com/Avik-creator/queryguard/pkg/stats"
 	"github.com/Avik-creator/queryguard/pkg/wire"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -713,6 +714,21 @@ func (m *panickyMonitor) Run(ctx context.Context, _ func(plan.Activity)) {
 		panic("bug")
 	}
 	<-ctx.Done()
+}
+
+func TestMonitorsStatementCountersReachTheStats(t *testing.T) {
+	s := newServer(t, startFakePostgres(t).addr)
+	s.Stats = &stats.Table{}
+	s.Monitor = fakeMonitor{plan.Activity{Statements: []stats.Counters{{Database: "shop", Role: "alice", QueryID: 1,
+		Query: "select * from orders where id = $1", Calls: 4, TempWritten: 9}}}}
+	startProxy(t, s)
+
+	s.Stats.Record(stats.Statement{Database: "shop", Role: "alice", SQL: "select * from orders where id = 7"})
+
+	waitUntil(t, func() bool {
+		rows := s.Stats.Rows()
+		return len(rows) == 1 && rows[0].Buffers.TempWritten == 9 && rows[0].Buffers.Calls == 4
+	})
 }
 
 // panicOnce panics in its first Acquire, as a bug in a session would.
@@ -1605,4 +1621,15 @@ func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// waitUntil polls cond for up to 2s.
+func waitUntil(t *testing.T, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if cond() {
+			return
+		}
+	}
+	t.Fatal("condition not met within 2s")
 }
