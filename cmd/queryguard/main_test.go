@@ -1,17 +1,22 @@
 package main
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/Avik-creator/queryguard/internal/testcert"
 	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/proxy"
+	"github.com/Avik-creator/queryguard/pkg/session"
 	"github.com/Avik-creator/queryguard/pkg/sqlparse"
 )
 
@@ -292,4 +297,34 @@ func TestSimulateReadsBothTrafficFilesAndPrintsWhatChanges(t *testing.T) {
 			t.Errorf("printed %q; want %q", out.String(), want)
 		}
 	}
+}
+
+func TestAFailedAllowlistSaveIsTriedAgain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var list policy.Allowlist
+		p, err := policy.Parse([]byte(`{"allowlist": {"mode": "learn"}}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := p.Checker("agent", slog.New(slog.DiscardHandler))
+		c.Env = policy.Env{Database: "shop", Allowlist: &list}
+		c.Check("select 1", session.Settings{StandardConformingStrings: "on", ClientEncoding: "UTF8"})
+		dir := filepath.Join(t.TempDir(), "later")
+		path := filepath.Join(dir, "allowlist.json")
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		go saveAllowlistEvery(ctx, &list, path, slog.New(slog.DiscardHandler))
+
+		// Its directory isn't there yet, so the first save fails.
+		time.Sleep(allowlistSaveInterval + time.Second)
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(allowlistSaveInterval)
+		synctest.Wait()
+
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("allowlist not saved once it could be: %v", err)
+		}
+	})
 }

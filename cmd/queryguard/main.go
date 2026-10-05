@@ -252,19 +252,22 @@ func saveAllowlist(list *policy.Allowlist, path string) error {
 // allowlistSaveInterval is how often a changed allowlist is saved.
 const allowlistSaveInterval = 10 * time.Second
 
-// saveAllowlistEvery saves the allowlist whenever it has learned something, until ctx ends.
+// saveAllowlistEvery saves the allowlist whenever it has learned something, until ctx ends; a failed save is tried again.
 func saveAllowlistEvery(ctx context.Context, list *policy.Allowlist, path string, log *slog.Logger) {
 	tick := time.Tick(allowlistSaveInterval)
+	unsaved := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick:
 		}
-		if list.Changed() {
+		if unsaved = list.Changed() || unsaved; unsaved {
 			if err := saveAllowlist(list, path); err != nil {
 				log.Error("save allowlist", "file", path, "err", err)
+				continue
 			}
+			unsaved = false
 		}
 	}
 }
