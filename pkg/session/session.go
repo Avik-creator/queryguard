@@ -26,6 +26,9 @@ import (
 // maxCheckedLen caps the Query and Parse messages read whole for checking; longer ones go to CheckTooLong.
 const maxCheckedLen = 16 << 20
 
+// maxMessageLen is Postgres's own cap on a message, MaxAllocSize - 1; a longer length is a broken or hostile peer.
+const maxMessageLen = 0x3ffffffe
+
 // bufSize matches Postgres's own 8 KB send buffer.
 const bufSize = 8 << 10
 
@@ -1150,6 +1153,9 @@ func readHeader(r *bufio.Reader) (typ byte, n int, err error) {
 	size := binary.BigEndian.Uint32(head[1:])
 	if size < 4 {
 		return 0, 0, fmt.Errorf("message %q has length %d, below 4", head[0], size)
+	}
+	if size > maxMessageLen {
+		return 0, 0, fmt.Errorf("message %q has length %d, above Postgres's limit of %d", head[0], size, maxMessageLen)
 	}
 	typ = head[0]
 	r.Discard(5)

@@ -1,6 +1,8 @@
 package session
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -993,4 +995,13 @@ func tcpPair(t *testing.T) (net.Conn, net.Conn) {
 		b.Close()
 	})
 	return a, b
+}
+
+func TestRefusesAMessageLongerThanPostgresTakes(t *testing.T) {
+	// A length near 4 GB would wrap to a negative int on a 32-bit build.
+	head := []byte{'Q', 0xff, 0xff, 0xff, 0xf0}
+
+	if _, n, err := readHeader(bufio.NewReader(bytes.NewReader(head))); err == nil {
+		t.Fatalf("readHeader read a body of %d bytes; want an error", n)
+	}
 }
