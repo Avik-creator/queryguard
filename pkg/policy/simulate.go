@@ -68,6 +68,12 @@ func Simulate(p *Policy, list *Allowlist, records []stats.Record) Simulation {
 	if p.cfg.Scheduler.MaxActive > 0 {
 		sim.NotSimulated = append(sim.NotSimulated, "slots and the queue for them, which depend on how long statements overlap")
 	}
+	if slices.ContainsFunc(p.cfg.Rules, func(r Rule) bool { return r.Check == "schema_allowlist" }) {
+		sim.NotSimulated = append(sim.NotSimulated, "schema_allowlist's search_path values, which the log records as $1, $2…, so it may count refusals that weren't")
+	}
+	if slices.ContainsFunc(p.cfg.Rules, func(r Rule) bool { return len(r.Match.Clients) > 0 || len(r.Match.ApplicationNames) > 0 }) {
+		sim.NotSimulated = append(sim.NotSimulated, "rules matching clients or application_names, which the log doesn't record, so they match nothing")
+	}
 
 	records = slices.Clone(records)
 	slices.SortStableFunc(records, func(a, b stats.Record) int { return a.At.Compare(b.At) })
@@ -95,6 +101,8 @@ func Simulate(p *Policy, list *Allowlist, records []stats.Record) Simulation {
 			}
 			refused = true
 		} else if !rec.NotRun {
+			// Rules go by the tenant the new config names, so budgets do too.
+			rec.Tenant = p.TenantOf(rec.Role, rec.Query)
 			refused = sim.spend(p, buckets, rec)
 		}
 		switch {
@@ -103,6 +111,10 @@ func Simulate(p *Policy, list *Allowlist, records []stats.Record) Simulation {
 		case !refused && rec.Rejected:
 			sim.NoLongerRejected++
 		}
+	}
+	if sim.NoLongerRejected > 0 {
+		sim.NotSimulated = append(sim.NotSimulated,
+			"kills, the runaway watch, slots and deadlines, so statements they refused when recorded count as no longer rejected")
 	}
 	return sim
 }

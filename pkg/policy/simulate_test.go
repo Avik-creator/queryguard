@@ -106,3 +106,30 @@ func TestSimulateRefusesAWaitPastTheQueueTimeout(t *testing.T) {
 		t.Errorf("budget %+v, newly rejected %d; want the second refused, not waiting 19s", b, r.NewlyRejected)
 	}
 }
+
+func TestSimulateChargesTheTenantTheNewConfigNames(t *testing.T) {
+	p := mustParse(t, `{"trusted_roles": ["app"], "tenants": {"acme": {"budget": {"rate": 10, "when_over": "reject"}}}}`)
+	at := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	// Recorded before app was trusted, so under its role; the new config believes the tag.
+	rec := stats.Record{At: at, Database: "shop", Role: "app", Tenant: "app", Query: "select $1 /*tenant='acme'*/", Units: 100}
+
+	r := Simulate(p, nil, []stats.Record{rec, rec})
+
+	if b := r.Budgets["acme"]; b == nil || b.Rejected != 1 {
+		t.Errorf("budgets %+v; want acme's second statement refused", r.Budgets)
+	}
+}
+
+func TestSimulateNamesRulesItCannotJudgeFromTheLog(t *testing.T) {
+	p := mustParse(t, `{"rules": [{"check": "schema_allowlist", "schemas": ["public"]},
+		{"check": "deny_ddl", "match": {"clients": ["10.0.0.0/8"]}}]}`)
+	at := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+
+	r := Simulate(p, nil, []stats.Record{{At: at, Database: "shop", Role: "app", Tenant: "app", Query: "select $1", Rejected: true}})
+
+	for _, want := range []string{"search_path", "clients", "no longer rejected"} {
+		if !slices.ContainsFunc(r.NotSimulated, func(n string) bool { return strings.Contains(n, want) }) {
+			t.Errorf("not simulated %q; want %q named", r.NotSimulated, want)
+		}
+	}
+}
