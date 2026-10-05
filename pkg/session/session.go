@@ -281,6 +281,7 @@ type sent struct {
 	start    time.Time // when it went to the server, if it is timed and nothing ran ahead of it
 	batch    time.Time // when the first message of its batch, up to a Query or Sync, went
 	failed   bool      // Postgres answered with an error
+	worked   bool      // Postgres answered with more than an EmptyQueryResponse, so a statement ran
 	sql      string    // the statement it belongs to, when recording
 	rejected bool      // it is the proxy's rejection of sql
 	reply    reply     // what Postgres's answers to it said so far
@@ -1304,6 +1305,7 @@ func (s *session) answered(typ byte, n int, r reply) answer {
 	if !finishes(head.typ, typ) {
 		// A simple query's error comes before its ReadyForQuery.
 		s.pending[0].failed = s.pending[0].failed || typ == 'E'
+		s.pending[0].worked = s.pending[0].worked || typ != 'I'
 		s.pending[0].reply.add(r)
 		if typ == 'D' {
 			s.returnedRow(&s.pending[0], n)
@@ -1312,6 +1314,10 @@ func (s *session) answered(typ byte, n int, r reply) answer {
 	}
 	s.pending = s.pending[1:]
 	head.reply.add(r)
+	if head.typ == 'Q' && !head.worked {
+		// A query of only semicolons or comments ran nothing, which its ReadyForQuery doesn't say.
+		typ = 'I'
+	}
 	var took time.Duration
 	// A pipeline's answers all arrive at its Sync, so a statement sharing one has no time of its own.
 	if !head.start.IsZero() && !(head.typ == 'E' && executesBeforeSync(s.pending)) {

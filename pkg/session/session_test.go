@@ -1139,6 +1139,21 @@ func TestRecordsASimpleQueryWithItsRowsAndTime(t *testing.T) {
 	}
 }
 
+func TestRecordsNothingForAQueryWithNoStatements(t *testing.T) {
+	rec := make(chan Finished, 4)
+	a := newAdmitter()
+	h := startWith(t, Options{Check: fakeChecker{admit: a}, Record: func(f Finished) { rec <- f }})
+
+	// The comment is "slot" to the fake checker, which admits it with a Ran hook.
+	h.send(&pgproto3.Query{String: "; /* slot */"})
+	h.serverGets(&pgproto3.Query{String: "; /* slot */"})
+	h.reply(&pgproto3.EmptyQueryResponse{}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.EmptyQueryResponse{}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	expectNone(t, rec, "a record of an empty query")
+	expectNone(t, a.ran, "a run of an empty query")
+}
+
 func TestRecordsAQuerysErrorCode(t *testing.T) {
 	rec := make(chan Finished, 10)
 	h := startWith(t, Options{Record: func(f Finished) { rec <- f }})
