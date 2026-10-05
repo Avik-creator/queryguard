@@ -794,7 +794,8 @@ values.
 With `-allowlist-file allowlist.json` the learned statements are read at
 start and saved as they are learned; the file is JSON, role to fingerprint
 to the statement's text, so it can be reviewed or edited. Without `roles`
-the allowlist applies to every role.
+the allowlist applies to every role. It learns up to 10,000 statements, and
+logs once when it is full.
 
 ## Failed logins
 
