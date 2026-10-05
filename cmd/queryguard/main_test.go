@@ -88,6 +88,8 @@ func TestLoadPolicy(t *testing.T) {
 	// Without a config the policy checks nothing, but the kill switch still has a checker to act through.
 	if p, err := loadPolicy(""); p == nil || err != nil || p.NeedsCatalog() {
 		t.Errorf("no -config gave %v, %v; want an empty policy", p, err)
+	} else if g := p.DDLGuard(); g.Mode != "off" {
+		t.Errorf("no -config guards DDL in mode %q; want off, as no config means no checks", g.Mode)
 	}
 
 	good := filepath.Join(t.TempDir(), "good.json")

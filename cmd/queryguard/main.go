@@ -210,8 +210,8 @@ func run(opts options, log *slog.Logger) error {
 // loadPolicy reads the policy file, or returns nil when there is none.
 func loadPolicy(path string) (*policy.Policy, error) {
 	if path == "" {
-		// An empty policy checks nothing, but gives sessions a checker for the kill switch.
-		return policy.Parse([]byte("{}"))
+		// An empty policy checks nothing, not even DDL's locks, but gives sessions a checker for the kill switch.
+		return policy.Parse([]byte(`{"ddl_guard": {"mode": "off"}}`))
 	}
 	return policy.Load(path)
 }
