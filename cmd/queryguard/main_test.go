@@ -442,3 +442,63 @@ func TestNoTelemetryFlagsKeepJustTheConsole(t *testing.T) {
 		t.Errorf("got %v, %v, %v, %v; want a console logger only", log, metrics, decisions, err)
 	}
 }
+
+func TestTestCLIChecksACorpusAgainstAConfig(t *testing.T) {
+	dir := t.TempDir()
+	config, corpus := filepath.Join(dir, "agent.json"), filepath.Join(dir, "bypass.sql")
+	writeFile(t, config, []byte(`{"rules": [{"check": "read_only"}, {"check": "deny_functions"}]}`))
+	writeFile(t, corpus, []byte(`-- Statements an agent might try.
+
+-- reject read_only
+COMMIT;
+DROP TABLE orders;
+
+-- reject
+select pg_terminate_backend(42)
+
+-- allow
+select * from orders -- reject is only a marker at the start of a line
+where id = 1;
+
+-- allow
+insert into orders values (1);
+`))
+	var stdout, stderr bytes.Buffer
+	code := testCLI([]string{"-config", config, corpus}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Errorf("exit code %d; want 1 for the insert that was let through", code)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "bypass.sql:15: want allow, got reject (read_only): insert into orders values (1);") {
+		t.Errorf("output doesn't name the failing case:\n%s", out)
+	}
+	if !strings.Contains(out, "3 passed, 1 failed") {
+		t.Errorf("output lacks the summary:\n%s", out)
+	}
+}
+
+func TestTestCLIChecksTheRuleNamed(t *testing.T) {
+	dir := t.TempDir()
+	config, corpus := filepath.Join(dir, "agent.json"), filepath.Join(dir, "cases.sql")
+	writeFile(t, config, []byte(`{"rules": [{"check": "deny_ddl"}, {"check": "read_only"}]}`))
+	writeFile(t, corpus, []byte("-- reject read_only\ndrop table orders;\n"))
+	var stdout, stderr bytes.Buffer
+	if code := testCLI([]string{"-config", config, corpus}, &stdout, &stderr); code != 1 || !strings.Contains(stdout.String(), "got reject (deny_ddl)") {
+		t.Errorf("exit %d, output %q; want a failure naming deny_ddl", code, stdout.String())
+	}
+}
+
+func TestTestCLIWithoutACorpusOnlyValidatesTheConfig(t *testing.T) {
+	config := filepath.Join(t.TempDir(), "bad.json")
+	writeFile(t, config, []byte(`{"rules": [{"check": "nope"}]}`))
+	var stdout, stderr bytes.Buffer
+	if code := testCLI([]string{"-config", config}, &stdout, &stderr); code != 1 || !strings.Contains(stderr.String(), "nope") {
+		t.Errorf("exit %d, stderr %q; want the config's error", code, stderr.String())
+	}
+	writeFile(t, config, []byte(`{"rules": [{"check": "max_cost", "cost": 1000}]}`))
+	stdout.Reset()
+	if code := testCLI([]string{"-config", config}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "config is valid") {
+		t.Errorf("exit %d, stdout %q; want the config found valid", code, stdout.String())
+	}
+}

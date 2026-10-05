@@ -909,6 +909,9 @@ func (p *Policy) DDLGuard() DDLGuard {
 	return g
 }
 
+// HasCostRules reports whether some rule judges plans, which only a session with a server to explain statements can check.
+func (p *Policy) HasCostRules() bool { return p.costRules }
+
 // ReplicationLag returns the most a standby may lag before best-effort statements are held back; 0 means lag isn't watched.
 func (p *Policy) ReplicationLag() time.Duration { return time.Duration(p.cfg.ReplicationLag.Max) }
 

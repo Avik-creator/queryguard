@@ -32,6 +32,7 @@ import (
 	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/proxy"
+	"github.com/Avik-creator/queryguard/pkg/session"
 	"github.com/Avik-creator/queryguard/pkg/stats"
 	"github.com/Avik-creator/queryguard/pkg/telemetry"
 	"github.com/Avik-creator/queryguard/pkg/wire"
@@ -75,6 +76,8 @@ func main() {
 			os.Exit(adminCLI(os.Args[2:], os.Stdout, os.Stderr))
 		case "simulate":
 			os.Exit(simulateCLI(os.Args[2:], os.Stdout, os.Stderr))
+		case "test":
+			os.Exit(testCLI(os.Args[2:], os.Stdout, os.Stderr))
 		}
 	}
 	var opts options
@@ -476,6 +479,112 @@ func simulateCLI(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "not simulated: %s\n", n)
 	}
 	return 0
+}
+
+// testCLI checks a config, and the statements in each corpus file against it, printing every case it gets wrong.
+func testCLI(args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("queryguard test", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	config := flags.String("config", "", "the config to check")
+	role := flags.String("role", "agent", "the role the statements run as")
+	database := flags.String("database", "postgres", "the database they run in")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if *config == "" {
+		fmt.Fprintln(stderr, "usage: queryguard test -config config.json [-role name] [corpus.sql ...]")
+		return 2
+	}
+	p, err := policy.Load(*config)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+	if flags.NArg() == 0 {
+		fmt.Fprintln(stdout, *config+": config is valid")
+		return 0
+	}
+	if p.HasCostRules() {
+		fmt.Fprintln(stdout, "not checked: cost rules (max_cost, max_scan_rows), which need each statement's plan from a server")
+	}
+	c := p.Checker(*role, slog.New(slog.DiscardHandler))
+	c.Env = policy.Env{Database: *database}
+	passed, failed := 0, 0
+	for _, path := range flags.Args() {
+		cases, err := readCases(path)
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		for _, tc := range cases {
+			got := "allow"
+			if rej, _ := c.Check(tc.sql, session.Settings{StandardConformingStrings: "on", ClientEncoding: "UTF8"}); rej != nil {
+				got = "reject (" + policy.RuleName(rej.Message) + ")"
+			}
+			want := tc.want
+			if tc.rule != "" {
+				want += " " + tc.rule
+			}
+			ok := got == "allow" == (tc.want == "allow") && (tc.rule == "" || got == "reject ("+tc.rule+")")
+			if ok {
+				passed++
+				continue
+			}
+			failed++
+			fmt.Fprintf(stdout, "%s:%d: want %s, got %s: %s\n", path, tc.line, want, got, strings.Join(strings.Fields(tc.sql), " "))
+		}
+	}
+	fmt.Fprintf(stdout, "%d passed, %d failed\n", passed, failed)
+	if failed > 0 {
+		return 1
+	}
+	return 0
+}
+
+// testCase is one statement of a corpus file and what the config should do with it.
+type testCase struct {
+	line int    // where its text starts
+	want string // reject or allow
+	rule string // the rule that should reject it; "" means any
+	sql  string
+}
+
+// readCases reads a corpus file: each case is a line "-- reject [rule]" or "-- allow", then the statement's text up to the next such line.
+func readCases(path string) ([]testCase, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var cases []testCase
+	for i, line := range strings.Split(string(data), "\n") {
+		marker, isMarker := strings.CutPrefix(strings.TrimSpace(line), "-- ")
+		fields := strings.Fields(marker)
+		if isMarker && len(fields) > 0 && len(fields) <= 2 && (fields[0] == "reject" || fields[0] == "allow" && len(fields) == 1) {
+			tc := testCase{want: fields[0]}
+			if len(fields) == 2 {
+				tc.rule = fields[1]
+			}
+			cases = append(cases, tc)
+			continue
+		}
+		if len(cases) == 0 {
+			continue
+		}
+		tc := &cases[len(cases)-1]
+		if tc.sql == "" && strings.TrimSpace(line) != "" {
+			tc.line = i + 1
+		}
+		if tc.sql != "" || strings.TrimSpace(line) != "" {
+			tc.sql += line + "\n"
+		}
+	}
+	for i := range cases {
+		cases[i].sql = strings.TrimSpace(cases[i].sql)
+		if cases[i].sql == "" {
+			return nil, fmt.Errorf("%s: a %s case has no statement", path, cases[i].want)
+		}
+	}
+	return cases, nil
 }
 
 // printTable writes columns and rows as text, each column as wide as its widest cell.

@@ -94,7 +94,7 @@ func Simulate(p *Policy, list *Allowlist, records []stats.Record) Simulation {
 		}
 		refused := false
 		if rej, _ := c.Check(rec.Query, readingAsRecorded); rej != nil {
-			r := sim.rule(ruleName(rej.Message))
+			r := sim.rule(RuleName(rej.Message))
 			r.Count++
 			if len(r.Examples) < examplesKept && !slices.Contains(r.Examples, rec.Query) {
 				r.Examples = append(r.Examples, rec.Query)
@@ -169,8 +169,8 @@ func (sim *Simulation) rule(name string) *SimulatedRule {
 	return r
 }
 
-// ruleName names what refused a statement, from its error's message.
-func ruleName(message string) string {
+// RuleName names what refused a statement, such as read_only or allowlist, from its error's message.
+func RuleName(message string) string {
 	if rest, ok := strings.CutPrefix(message, "queryguard: rule "); ok {
 		name, _, _ := strings.Cut(rest, " ")
 		return name
