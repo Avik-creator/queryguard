@@ -358,6 +358,7 @@ func TestAIMD(t *testing.T) {
 		"calm and full grows by one":       {10, Signal{Slowdown: 1.5, Saturated: true}, 11},
 		"calm with room to spare holds":    {10, Signal{Slowdown: 1}, 10},
 		"nothing finished holds":           {10, Signal{Saturated: true}, 10},
+		"finished but unmeasured grows":    {10, Signal{Finished: 3, Saturated: true}, 11},
 		"backing off always takes one off": {3, Signal{Slowdown: 3}, 2},
 	} {
 		if got := a.Adjust(tc.limit, tc.sig); got != tc.want {
@@ -392,6 +393,35 @@ func TestAdaptiveLimitFollowsLoad(t *testing.T) {
 		}
 		if highest > 8 {
 			t.Errorf("limit reached %d; want never above max_active, 8", highest)
+		}
+	})
+}
+
+func TestLimitGrowsWhenStatementsWithoutAUsualTimeFinish(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Fast: Lane{MaxActive: 8, QueueTimeout: time.Hour}, Controller: AIMD{Floor: 2}})
+		s.LockWaits(8)
+		go s.Run(t.Context())
+		release := acquire(t, s, "a", Fast)
+		nextInterval()
+		s.LockWaits(0)
+		release()
+		if got := s.Limit(); got != 7 {
+			t.Fatalf("limit after lock waits = %d; want 7", got)
+		}
+
+		// New statements have no usual time to measure them by, but each one that ends is a slot the server gave back.
+		releases := make([]func(), 7)
+		for i := range releases {
+			releases[i] = acquire(t, s, "a", Fast)
+		}
+		go acquire(t, s, "a", Fast)
+		synctest.Wait()
+		releases[0]()
+		nextInterval()
+
+		if got := s.Limit(); got != 8 {
+			t.Errorf("limit after a full second in which a statement ended = %d; want 8", got)
 		}
 	})
 }
@@ -841,6 +871,26 @@ func TestShutBudgetWaitsForCapacity(t *testing.T) {
 	})
 }
 
+func TestForceTakesASlotPastTheLimitHoldAndCap(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := New(Config{Fast: Lane{MaxActive: 1, QueueTimeout: time.Second}})
+		acquire(t, s, "a", Fast)
+		s.CapTenant("a", 1)
+		s.HoldBestEffort(true)
+
+		release := s.Force("a", Fast)
+
+		if d := s.TakeDemand(); d.Running[Fast] != 2 {
+			t.Errorf("running %d; want 2, one past the limit", d.Running[Fast])
+		}
+		release()
+		release()
+		if d := s.TakeDemand(); d.Running[Fast] != 1 {
+			t.Errorf("running %d after the forced slot was freed twice; want 1", d.Running[Fast])
+		}
+	})
+}
+
 func TestTakeDemand(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := New(Config{Fast: Lane{MaxActive: 2, QueueTimeout: time.Second}, Budgets: map[string]Budget{"tight": {Rate: 1, Burst: 1, WhenOver: Reject}}})
@@ -859,8 +909,8 @@ func TestTakeDemand(t *testing.T) {
 			t.Errorf("demand %+v; want 50 spent by acme, 5 by tight, which was starved", d)
 		}
 		// Two running and one waiting.
-		if d.Slots[Fast] != 3 {
-			t.Errorf("fast lane demand %d; want 3", d.Slots[Fast])
+		if d.Slots[Fast] != 3 || d.Running[Fast] != 2 {
+			t.Errorf("fast lane demand %d with %d running; want 3 with 2", d.Slots[Fast], d.Running[Fast])
 		}
 		if again := s.TakeDemand(); len(again.Spent) != 0 || len(again.Starved) != 0 || again.Slots[Fast] != 3 {
 			t.Errorf("second TakeDemand = %+v; want nothing spent and the slots still in use", again)

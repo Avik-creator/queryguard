@@ -83,7 +83,8 @@ const AdjustInterval = time.Second
 
 // Signal is what the scheduler saw over one AdjustInterval.
 type Signal struct {
-	Slowdown  float64 // geometric mean of finished statements' time over their usual time; 0 when none finished
+	Slowdown  float64 // geometric mean of finished statements' time over their usual time; 0 when none with a usual time finished
+	Finished  int     // fast-lane statements that finished, with a usual time or not
 	LockWaits int     // sessions waiting on a lock, as last reported
 	Saturated bool    // every slot under the limit was taken at some point, so the limit held statements back
 }
@@ -109,7 +110,7 @@ func (a AIMD) Adjust(limit int, s Signal) int {
 	case overloaded:
 		// Rounding down alone could leave a small limit where it is.
 		return max(floor, min(limit-1, int(float64(limit)*cmp.Or(a.Backoff, 0.9))))
-	case s.Slowdown > 0 && s.Saturated:
+	case s.Saturated && (s.Slowdown > 0 || s.Finished > 0):
 		return limit + 1
 	}
 	return max(floor, limit)
@@ -140,7 +141,8 @@ type Scheduler struct {
 	limit      int            // the fast lane's limit now; 0 means none
 	overloaded bool           // the limit last moved down, so best-effort statements don't wait
 	slowdowns  float64        // the sum of ln(slowdown) this interval
-	finished   int            // statements finished this interval
+	finished   int            // statements with a usual time finished this interval
+	ended      int            // fast-lane statements finished this interval
 	lockWaits  int            // sessions waiting on a lock, as last reported
 	saturated  bool           // every fast slot was taken at some point this interval
 	held       bool           // best-effort statements wait, however many slots are free
@@ -379,6 +381,13 @@ func (s *Scheduler) Acquire(ctx context.Context, tenant string, id LaneID, prio 
 	return nil, err
 }
 
+// Force gives tenant a slot in lane id at once, past the limit, holds and caps, as for a session whose locks others wait on.
+func (s *Scheduler) Force(tenant string, id LaneID) (release func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.releaser(s.take(id, tenant))
+}
+
 // slot is one statement's place in a lane.
 type slot struct {
 	lane   LaneID
@@ -406,6 +415,9 @@ func (s *Scheduler) release(sl *slot) {
 		sl.demote.Stop()
 	}
 	s.lanes[sl.lane].active--
+	if sl.lane == Fast {
+		s.ended++
+	}
 	if s.running[sl.tenant]--; s.running[sl.tenant] <= 0 {
 		delete(s.running, sl.tenant)
 	}
@@ -611,7 +623,7 @@ func (s *Scheduler) adjust() {
 	if s.cfg.Controller == nil || s.limit <= 0 {
 		return
 	}
-	sig := Signal{LockWaits: s.lockWaits, Saturated: s.saturated}
+	sig := Signal{Finished: s.ended, LockWaits: s.lockWaits, Saturated: s.saturated}
 	if s.finished > 0 {
 		sig.Slowdown = math.Exp(s.slowdowns / float64(s.finished))
 	}
@@ -621,7 +633,7 @@ func (s *Scheduler) adjust() {
 		s.overloaded = limit < s.limit
 	}
 	s.limit = limit
-	s.slowdowns, s.finished = 0, 0
+	s.slowdowns, s.finished, s.ended = 0, 0, 0
 	s.saturated = s.lanes[Fast].active >= limit || len(s.lanes[Fast].waiters) > 0
 	if s.overloaded {
 		s.shed()
@@ -739,6 +751,7 @@ type Demand struct {
 	Spent   map[string]float64 // cost charged, by tenant
 	Starved map[string]bool    // tenants that found their budget spent
 	Slots   [2]int             // the most statements running or waiting at once, by lane
+	Running [2]int             // statements running when it was taken, by lane
 }
 
 // TakeDemand returns the demand since its last call and starts counting again.
@@ -746,6 +759,9 @@ func (s *Scheduler) TakeDemand() Demand {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	d := s.demand
+	for id := range s.lanes {
+		d.Running[id] = s.lanes[id].active
+	}
 	for t, n := range d.Spent {
 		if n <= 0 {
 			delete(d.Spent, t)
