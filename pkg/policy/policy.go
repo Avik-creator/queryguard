@@ -622,9 +622,7 @@ var checks = map[string]check{
 	},
 }
 
-// deniedFunctions are the built-ins with effects beyond the statement's own rows: ending sessions, reading or writing the server's
-// files, writing large objects, reaching other servers, changing settings and roles, WAL and replication control, session advisory
-// locks, and running SQL text given as a value.
+// deniedFunctions are the built-ins with effects beyond the statement's own rows, and those that run SQL text given as a value.
 var deniedFunctions = []string{
 	"pg_terminate_backend", "pg_cancel_backend", "pg_reload_conf", "pg_rotate_logfile", "pg_promote",
 	"pg_switch_wal", "pg_create_restore_point", "pg_backup_start", "pg_backup_stop", "pg_logical_emit_message",

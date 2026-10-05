@@ -150,8 +150,7 @@ func (r *backends) get(pid int32) *backend {
 	return r.byPID[pid]
 }
 
-// maxThrottled is how many addresses and roles the login throttle remembers; past it, those whose cool-off and window are over go,
-// then the one that matters least.
+// maxThrottled is how many addresses and roles the login throttle remembers; past it, spent entries go, then the least important.
 const maxThrottled = 10000
 
 // loginThrottle counts failed logins by client address and role.

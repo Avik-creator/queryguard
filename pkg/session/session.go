@@ -461,8 +461,7 @@ func (s *session) fromClient() error {
 	}
 }
 
-// rememberText keeps a prepared statement's text for recording its runs; past the bounds the texts start over, as DEALLOCATE ALL
-// and DISCARD ALL drop statements the proxy never sees closed.
+// rememberText keeps a prepared statement's text for recording; past the bounds they start over, as DEALLOCATE ALL closes none.
 func (s *session) rememberText(name, sql string) {
 	s.forgetText(name)
 	if len(s.texts) >= maxTexts || s.textBytes+len(sql) > maxTextBytes {
