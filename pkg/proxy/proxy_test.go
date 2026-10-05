@@ -2036,3 +2036,21 @@ func TestLoginThrottleRemembersNoMoreThanItsMax(t *testing.T) {
 		t.Error("a cooling-off login was forgotten before ones that only failed once")
 	}
 }
+
+func TestQuietLogHoldsBackAFloodAndCountsIt(t *testing.T) {
+	var q quietLog
+	start := time.Now()
+	for i := range quietBurst {
+		if ok, held := q.allow(start.Add(time.Duration(i) * time.Millisecond)); !ok || held != 0 {
+			t.Fatalf("line %d: allow = %v, %d; want it logged", i, ok, held)
+		}
+	}
+	for range 5 {
+		if ok, _ := q.allow(start.Add(time.Second)); ok {
+			t.Fatal("a line past the burst was logged")
+		}
+	}
+	if ok, held := q.allow(start.Add(quietWindow + time.Second)); !ok || held != 5 {
+		t.Errorf("next window: allow = %v, %d; want it logged with 5 held back", ok, held)
+	}
+}

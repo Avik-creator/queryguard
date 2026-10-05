@@ -104,11 +104,13 @@ type Server struct {
 
 	keys     cancelKeys
 	sessions sessionCount
-	throttle loginThrottle
-	backends backends
-	policies policy.Holder
-	starting atomic.Int64  // connections that have yet to send their startup message
-	capacity atomic.Uint64 // the server's measured cost units a second, as float64 bits; 0 until measured
+	// Each holds back a flood of one kind of line, such as failed handshakes from a port scanner.
+	startupLogs, cancelLogs quietLog
+	throttle                loginThrottle
+	backends                backends
+	policies                policy.Holder
+	starting                atomic.Int64  // connections that have yet to send their startup message
+	capacity                atomic.Uint64 // the server's measured cost units a second, as float64 bits; 0 until measured
 
 	// Only the Monitor's goroutine uses these.
 	observed   time.Time              // when it last reported
@@ -242,7 +244,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		// handle gives the slot back once the startup message is in.
 		if s.starting.Add(1) > int64(cmp.Or(s.MaxStartups, DefaultMaxStartups)) {
 			s.starting.Add(-1)
-			log.Warn("closed connection over the cap on connections starting up", "client", client.RemoteAddr())
+			if ok, held := s.startupLogs.allow(time.Now()); ok {
+				log.Warn("closed connection over the cap on connections starting up", heldBack(held, "client", client.RemoteAddr())...)
+			}
 			client.Close()
 			continue
 		}
@@ -284,7 +288,9 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 	if err != nil {
 		// A client that connects and leaves without a word, like a TCP health check, is not an error.
 		if !errors.Is(err, io.EOF) {
-			log.Warn("client startup failed", "client", client.RemoteAddr(), "err", err)
+			if ok, held := s.startupLogs.allow(time.Now()); ok {
+				log.Warn("client startup failed", heldBack(held, "client", client.RemoteAddr(), "err", err)...)
+			}
 		}
 		return
 	}
@@ -298,15 +304,21 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 		if !ok {
 			if forwarded, err := s.forwardCancel(ctx, msg); forwarded {
 				if err != nil {
-					log.Warn("forward cancel request to its instance", "client", client.RemoteAddr(), "err", err)
+					if ok, held := s.cancelLogs.allow(time.Now()); ok {
+						log.Warn("forward cancel request to its instance", heldBack(held, "client", client.RemoteAddr(), "err", err)...)
+					}
 				}
 				return
 			}
-			log.Info("ignored cancel request with unknown key", "client", client.RemoteAddr())
+			if ok, held := s.cancelLogs.allow(time.Now()); ok {
+				log.Info("ignored cancel request with unknown key", heldBack(held, "client", client.RemoteAddr())...)
+			}
 			return
 		}
 		if err := s.Upstream.Cancel(ctx, req); err != nil {
-			log.Warn("forward cancel request", "client", client.RemoteAddr(), "err", err)
+			if ok, held := s.cancelLogs.allow(time.Now()); ok {
+				log.Warn("forward cancel request", heldBack(held, "client", client.RemoteAddr(), "err", err)...)
+			}
 		}
 	case *pgproto3.StartupMessage:
 		if _, encrypted := conn.(*tls.Conn); s.RequireClientTLS && !encrypted {
@@ -537,6 +549,45 @@ func (s *Server) addSettings(startup *pgproto3.StartupMessage) {
 		}
 		startup.Parameters[name] = value
 	}
+}
+
+// A quietLog lets quietBurst lines through in each quietWindow.
+const (
+	quietBurst  = 10
+	quietWindow = time.Minute
+)
+
+// quietLog holds back a flood of one kind of log line and counts the lines it held back.
+type quietLog struct {
+	mu    sync.Mutex
+	start time.Time // when the current window began
+	n     int       // lines let through in it
+	held  int       // lines held back since the last one let through
+}
+
+// allow reports whether a line may be logged at now, and how many were held back before it.
+func (q *quietLog) allow(now time.Time) (bool, int) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if now.Sub(q.start) >= quietWindow {
+		q.start, q.n = now, 0
+	}
+	if q.n >= quietBurst {
+		q.held++
+		return false, 0
+	}
+	q.n++
+	held := q.held
+	q.held = 0
+	return true, held
+}
+
+// heldBack returns attrs, with the number of lines held back before this one when there were any.
+func heldBack(held int, attrs ...any) []any {
+	if held > 0 {
+		attrs = append(attrs, "lines_held_back", held)
+	}
+	return attrs
 }
 
 // sameCertificate reports whether both sides use TLS and the server presented the proxy's own certificate, so channel binding works end to end.
