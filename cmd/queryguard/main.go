@@ -21,6 +21,7 @@ import (
 	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/proxy"
+	"github.com/Avik-creator/queryguard/pkg/stats"
 	"github.com/Avik-creator/queryguard/pkg/wire"
 	"github.com/jackc/pgx/v5"
 )
@@ -45,6 +46,8 @@ type options struct {
 	advertiseAddr   string
 	maxInstances    int
 	shutdownTimeout time.Duration
+	statsMax        int
+	statsErrorText  bool
 }
 
 func main() {
@@ -70,6 +73,10 @@ func main() {
 		"the most instances sharing -state-dsn; each falls back to this share of a limit while the store is unreachable")
 	flag.BoolVar(&opts.keepAlive, "tcp-keepalive", true,
 		"find silently dead clients and servers in about 30s; false keeps the operating system's timing")
+	flag.IntVar(&opts.statsMax, "stats-max", stats.DefaultMax,
+		"statement fingerprints, by tenant, whose calls, times and errors are kept; the least called goes first; 0 keeps none")
+	flag.BoolVar(&opts.statsErrorText, "stats-error-text", false,
+		"keep each statement's last error text with its stats; off by default since error text can carry row values")
 	flag.DurationVar(&opts.shutdownTimeout, "shutdown-timeout", proxy.DefaultShutdownTimeout,
 		"how long open sessions may continue after a shutdown signal")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -138,6 +145,9 @@ func run(opts options, log *slog.Logger) error {
 	}
 	if fl != nil {
 		fl.Log = log
+	}
+	if opts.statsMax > 0 {
+		s.Stats = &stats.Table{Max: opts.statsMax, ErrorText: opts.statsErrorText}
 	}
 	s.Monitor = newMonitor(catalog, s, log)
 	if opts.config != "" {

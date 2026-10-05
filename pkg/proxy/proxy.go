@@ -26,6 +26,7 @@ import (
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/sched"
 	"github.com/Avik-creator/queryguard/pkg/session"
+	"github.com/Avik-creator/queryguard/pkg/stats"
 	"github.com/Avik-creator/queryguard/pkg/wire"
 	"github.com/jackc/pgx/v5/pgproto3"
 )
@@ -84,6 +85,8 @@ type Server struct {
 	Plans plan.Cache
 	// History learns how each statement's plans run, for calibrated costs and plan flips.
 	History plan.History
+	// Stats gathers each statement's calls, time, rows and errors by fingerprint and tenant; nil gathers none.
+	Stats *stats.Table
 
 	keys     cancelKeys
 	sessions sessionCount
@@ -160,6 +163,12 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 				log.Warn("release fleet leases", "err", err)
 			}
 		}()
+	}
+	if s.Stats != nil {
+		if s.Stats.Tenant == nil {
+			s.Stats.Tenant = s.tenantOf
+		}
+		go safe.Loop(ctx, log, "stats", s.Stats.Run)
 	}
 	if s.ActivePolicy() != nil {
 		tick := time.Tick(planStatsInterval)
@@ -270,6 +279,8 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 // relay connects client to an upstream connection and relays messages both ways until either side closes.
 func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, startup *pgproto3.StartupMessage) {
 	role := pgName(startup.Parameters["user"])
+	// Postgres connects a client that names no database to the one named after its role.
+	database := pgName(cmp.Or(startup.Parameters["database"], role))
 	var (
 		check         session.Checker
 		authenticated func() *wire.Error
@@ -278,8 +289,7 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	)
 	if p := s.ActivePolicy(); p != nil {
 		c := s.policies.Checker(role, log.With("client", client.RemoteAddr()))
-		// Postgres connects a client that names no database to the one named after its role.
-		c.Env = policy.Env{Database: pgName(cmp.Or(startup.Parameters["database"], role)), Client: clientAddr(client), Plans: &s.Plans, History: &s.History, Scheduler: s.scheduler()}
+		c.Env = policy.Env{Database: database, Client: clientAddr(client), Plans: &s.Plans, History: &s.History, Scheduler: s.scheduler()}
 		if s.Catalog != nil {
 			c.Env.Tables = s.Catalog
 		}
@@ -357,7 +367,14 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 			log.Warn("cancel statement", "client", client.RemoteAddr(), "err", err)
 		}
 	}
-	err = session.Relay(client, server, session.Options{Check: check, Cancel: cancel,
+	var record func(session.Finished)
+	if t := s.Stats; t != nil {
+		record = func(f session.Finished) {
+			t.Record(stats.Statement{Database: database, Role: role, SQL: f.SQL, Took: f.Took, Rows: f.Rows, Code: f.Code,
+				Message: f.Message, Rejected: f.Rejected, NotRun: f.NotRun})
+		}
+	}
+	err = session.Relay(client, server, session.Options{Check: check, Cancel: cancel, Record: record,
 		Interrupt: func(interrupt func(session.Interruption) bool) {
 			if running != nil {
 				running.setInterrupt(interrupt)
@@ -376,6 +393,14 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	case !refused && !errors.Is(err, wire.ErrLoginRefused) && !hungUp(err):
 		log.Warn("session ended", "client", client.RemoteAddr(), "err", err)
 	}
+}
+
+// tenantOf returns the tenant role's statement sql runs for under the policy in force.
+func (s *Server) tenantOf(role, sql string) string {
+	if p := s.ActivePolicy(); p != nil {
+		return p.TenantOf(role, sql)
+	}
+	return role
 }
 
 // isPanic reports whether err is a recovered panic.
