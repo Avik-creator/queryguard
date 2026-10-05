@@ -325,6 +325,13 @@ func (s *Scheduler) RetryAfter(tenant string) time.Duration {
 	return time.Duration(math.Ceil(-t.tokens / b.Rate * float64(time.Second)))
 }
 
+// Rate returns tenant's budget rate in force: 0 without a budget, below 0 while it is shut.
+func (s *Scheduler) Rate(tenant string) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.budget(tenant).Rate
+}
+
 // Spent reports whether tenant owes cost units, so its next statement would wait, go to the slow lane or fail.
 func (s *Scheduler) Spent(tenant string) bool {
 	s.mu.Lock()

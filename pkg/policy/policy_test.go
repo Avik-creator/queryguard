@@ -1497,6 +1497,22 @@ func TestBudgetRejectionSaysWhenToRetryWithJitter(t *testing.T) {
 	}
 }
 
+func TestOverBudgetSaysTheRateInForce(t *testing.T) {
+	// A budget by capacity has no rate in the config; the scheduler has the one measured.
+	s := sched.New(sched.Config{Budgets: map[string]sched.Budget{"acme": {Rate: 250}, "shut": {Rate: -1}}})
+	if rej := overBudget(s, "acme"); !strings.Contains(rej.Detail, "refills at 250 cost units a second") {
+		t.Errorf("detail %q; want the scheduler's rate", rej.Detail)
+	}
+	// A budget shut until the fleet leases a share has nothing to work a wait out from.
+	rej := overBudget(s, "shut")
+	if !strings.Contains(rej.Detail, "no share") {
+		t.Errorf("detail %q; want it to say the instance has no share yet", rej.Detail)
+	}
+	if d := retryIn(t, rej.Hint); d < time.Second {
+		t.Errorf("shut budget retry in %v; want at least a second", d)
+	}
+}
+
 func TestBusyRejectionSaysWhenToRetry(t *testing.T) {
 	if d := retryIn(t, busy(mustParse(t, `{}`), sched.Fast).Hint); d < time.Second || d > 1500*time.Millisecond {
 		t.Errorf("busy retry in %v; want about a second", d)

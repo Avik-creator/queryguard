@@ -1284,7 +1284,7 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 		// The budget is looked at before EXPLAIN, the dearest step, and spent once the cost is known.
 		if s != nil && !warn {
 			if _, err := s.Reserve(ctx, who.tenant); err != nil && !holds.locks() {
-				return c.refuse(err, who, "budget", overBudget(t.Budget, s.RetryAfter(who.tenant)))
+				return c.refuse(err, who, "budget", overBudget(s, who.tenant))
 			}
 		}
 
@@ -1358,7 +1358,7 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 			case err != nil && holds.locks():
 				s.Charge(who.tenant, cost)
 			case err != nil:
-				return c.refuse(err, who, "budget", overBudget(t.Budget, s.RetryAfter(who.tenant)))
+				return c.refuse(err, who, "budget", overBudget(s, who.tenant))
 			default:
 				lane = l
 			}
@@ -1677,10 +1677,13 @@ func (c *Checker) unchecked(p *Policy, warn bool, reason string) *pgproto3.Error
 }
 
 // overBudget is the error for a statement whose tenant's budget is spent and owes nothing again after retry.
-func overBudget(b *Budget, retry time.Duration) *pgproto3.ErrorResponse {
-	detail := "The tenant's cost budget is spent."
-	if b != nil {
-		detail = fmt.Sprintf("The tenant's cost budget is spent; it refills at %.0f cost units a second.", b.Rate)
+func overBudget(s *sched.Scheduler, tenant string) *pgproto3.ErrorResponse {
+	detail, retry := "The tenant's cost budget is spent.", s.RetryAfter(tenant)
+	switch rate := s.Rate(tenant); {
+	case rate > 0:
+		detail = fmt.Sprintf("The tenant's cost budget is spent; it refills at %.0f cost units a second.", rate)
+	case rate < 0:
+		detail, retry = "This instance has no share of the tenant's fleet-wide cost budget yet.", retryBase
 	}
 	return rejection("53000", "queryguard: tenant is over its cost budget", detail, retryHint(retry)+", or run fewer or cheaper statements.")
 }

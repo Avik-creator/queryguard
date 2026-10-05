@@ -971,6 +971,15 @@ func TestRetryAfterIsHowLongUntilTheTenantOwesNothing(t *testing.T) {
 	})
 }
 
+func TestRateIsTheBudgetInForce(t *testing.T) {
+	s := New(Config{Budgets: map[string]Budget{"acme": {Rate: 250}, "shut": {Rate: -1}}})
+	for tenant, want := range map[string]float64{"acme": 250, "shut": -1, "unlimited": 0} {
+		if got := s.Rate(tenant); got != want {
+			t.Errorf("Rate(%s) = %v; want %v", tenant, got, want)
+		}
+	}
+}
+
 func TestSurchargeTakesExactlyItsCost(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := New(Config{Budgets: map[string]Budget{"acme": {Rate: 10, Burst: 10, MinCharge: 5, WhenOver: Reject}}})
