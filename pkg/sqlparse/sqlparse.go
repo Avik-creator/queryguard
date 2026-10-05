@@ -23,6 +23,8 @@ type Query struct {
 	Explainable         bool     // a single statement EXPLAIN can plan: SELECT, INSERT, UPDATE, DELETE, MERGE, DECLARE or CREATE TABLE AS
 	Analyzes            bool     // VACUUM or ANALYZE, which refresh the planner's statistics
 	Cursor              bool     // DECLARE, whose query runs in the FETCHes that follow
+	TransactionControl  bool     // only BEGIN, COMMIT, ROLLBACK, SAVEPOINT and the like, which do no work of their own
+	ChangesTimeout      bool     // may change statement_timeout: SET or RESET of it, or set_config of it or of a name known only when it runs
 }
 
 // notDDL lists the statement types Postgres's GetCommandLogLevel does not log as DDL; every other *Stmt is DDL.
@@ -57,6 +59,10 @@ func Analyze(sql string) (Query, error) {
 		}
 		_, q.Cursor = tree.Stmts[0].GetStmt().GetNode().(*pg_query.Node_DeclareCursorStmt)
 	}
+	q.TransactionControl = len(tree.Stmts) > 0 && !slices.ContainsFunc(tree.Stmts, func(s *pg_query.RawStmt) bool {
+		_, ok := s.GetStmt().GetNode().(*pg_query.Node_TransactionStmt)
+		return !ok
+	})
 	schemas := map[string]bool{}
 	add := func(schema string) {
 		if schema != "" {
@@ -75,7 +81,7 @@ func Analyze(sql string) (Query, error) {
 			q.ChangesEveryRow = q.ChangesEveryRow || n.WhereClause == nil
 			// Updating the pg_settings view calls set_config for each row, with names and values known only when it runs.
 			if r := n.GetRelation(); r.GetRelname() == "pg_settings" && (r.GetSchemaname() == "" || r.GetSchemaname() == "pg_catalog") {
-				q.UnknownSearchPath = true
+				q.UnknownSearchPath, q.ChangesTimeout = true, true
 			}
 		case *pg_query.DeleteStmt:
 			q.ChangesEveryRow = q.ChangesEveryRow || n.WhereClause == nil
@@ -108,6 +114,9 @@ func Analyze(sql string) (Query, error) {
 			add(n.Schemaname)
 		case *pg_query.FuncCall:
 			add(schemaOf(n.Funcname))
+			if setting, ok := settingSet(n); ok && (setting == nil || strings.EqualFold(*setting, statementTimeout)) {
+				q.ChangesTimeout = true
+			}
 			if path, ok := searchPathSet(n); ok {
 				q.UnknownSearchPath = q.UnknownSearchPath || path == nil
 				for _, s := range path {
@@ -132,6 +141,7 @@ func Analyze(sql string) (Query, error) {
 				}
 			}
 		case *pg_query.VariableSetStmt:
+			q.ChangesTimeout = q.ChangesTimeout || strings.EqualFold(n.Name, statementTimeout)
 			if strings.EqualFold(n.Name, searchPath) {
 				for _, arg := range n.Args {
 					// "$user" stands for the role's own schema, which Postgres skips when it doesn't exist.
@@ -156,6 +166,21 @@ func schemaOf(names []*pg_query.Node) string {
 
 // searchPath is the setting schema_allowlist watches; Postgres matches setting names ignoring case.
 const searchPath = "search_path"
+
+// statementTimeout is the setting that cancels statements running longer than it.
+const statementTimeout = "statement_timeout"
+
+// settingSet returns the name of the setting a set_config call changes, nil when it is known only when it runs; ok is false
+// for any other call.
+func settingSet(call *pg_query.FuncCall) (setting *string, ok bool) {
+	if call.Funcname[len(call.Funcname)-1].GetString_().GetSval() != "set_config" || len(call.Args) < 2 {
+		return nil, false
+	}
+	if c := call.Args[0].GetAConst().GetSval(); c != nil {
+		return &c.Sval, true
+	}
+	return nil, true
+}
 
 // searchPathSet reports whether call may be set_config('search_path', …) and returns the schemas it sets, or nil when the name or value is not a constant.
 func searchPathSet(call *pg_query.FuncCall) (schemas []string, ok bool) {
