@@ -344,13 +344,25 @@ func simulateCLI(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	var records []stats.Record
+	found := false
 	for _, path := range []string{*traffic + ".1", *traffic} {
-		recs, err := stats.ReadTraffic(path)
-		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		recs, skipped, err := stats.ReadTraffic(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
 			fmt.Fprintln(stderr, err)
 			return 1
 		}
+		if skipped > 0 {
+			fmt.Fprintf(stderr, "%s: skipped %d lines that aren't records\n", path, skipped)
+		}
+		found = true
 		records = append(records, recs...)
+	}
+	if !found {
+		fmt.Fprintf(stderr, "no traffic log at %s\n", *traffic)
+		return 1
 	}
 	sim := policy.Simulate(p, records)
 

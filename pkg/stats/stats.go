@@ -730,7 +730,7 @@ func (l *TrafficLog) open() error {
 		return err
 	}
 	l.f, l.started = f, time.Time{}
-	if recs, err := readTraffic(l.Path, 1); err == nil && len(recs) > 0 {
+	if recs, _, err := readTraffic(l.Path, 1); err == nil && len(recs) > 0 {
 		l.started = recs[0].At
 	}
 	return nil
@@ -748,26 +748,31 @@ func (l *TrafficLog) Close() error {
 	return err
 }
 
-// ReadTraffic reads every record in a traffic log file.
-func ReadTraffic(path string) ([]Record, error) { return readTraffic(path, -1) }
+// ReadTraffic reads every record in a traffic log file, and counts the lines it skipped for not being one.
+func ReadTraffic(path string) (records []Record, skipped int, err error) {
+	return readTraffic(path, -1)
+}
 
-// readTraffic reads up to n records of path; n below 0 reads them all.
-func readTraffic(path string, n int) ([]Record, error) {
+// readTraffic reads up to n records of path, skipping lines that aren't one, as a crash mid-write leaves; n below 0 reads them all.
+func readTraffic(path string, n int) (records []Record, skipped int, err error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer f.Close()
-	var out []Record
 	lines := bufio.NewScanner(f)
 	lines.Buffer(make([]byte, 64<<10), 16<<20)
 	for lines.Scan() && n != 0 {
 		var rec Record
-		if err := json.Unmarshal(lines.Bytes(), &rec); err != nil {
-			return out, fmt.Errorf("%s: %w", path, err)
+		if json.Unmarshal(lines.Bytes(), &rec) != nil {
+			skipped++
+			continue
 		}
-		out = append(out, rec)
+		records = append(records, rec)
 		n--
 	}
-	return out, lines.Err()
+	if err := lines.Err(); err != nil {
+		return records, skipped, fmt.Errorf("%s: %w", path, err)
+	}
+	return records, skipped, nil
 }

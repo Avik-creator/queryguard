@@ -371,7 +371,7 @@ func TestTrafficIsLoggedOnePerLineAndRotatedDaily(t *testing.T) {
 	tb.add(Statement{At: now, Database: "shop", Role: "app", SQL: "select * from orders where id = 1", Took: 20 * time.Millisecond, Rows: 1})
 	tb.add(Statement{At: now, Database: "shop", Role: "app", SQL: "drop table orders", Code: "42501", Rejected: true})
 
-	recs, err := ReadTraffic(log.Path)
+	recs, _, err := ReadTraffic(log.Path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,10 +383,10 @@ func TestTrafficIsLoggedOnePerLineAndRotatedDaily(t *testing.T) {
 	// A day on, the file moves aside and a new one starts.
 	now = now.Add(25 * time.Hour)
 	tb.add(Statement{At: now, Database: "shop", Role: "app", SQL: "select 1"})
-	if old, err := ReadTraffic(log.Path + ".1"); err != nil || len(old) != 2 {
+	if old, _, err := ReadTraffic(log.Path + ".1"); err != nil || len(old) != 2 {
 		t.Errorf("rotated file has %d records, %v; want the first 2", len(old), err)
 	}
-	if recent, err := ReadTraffic(log.Path); err != nil || len(recent) != 1 {
+	if recent, _, err := ReadTraffic(log.Path); err != nil || len(recent) != 1 {
 		t.Errorf("new file has %d records, %v; want 1", len(recent), err)
 	}
 	log.Close()

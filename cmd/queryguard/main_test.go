@@ -228,6 +228,32 @@ func TestAdminCLIPrintsAnAlignedTable(t *testing.T) {
 	}
 }
 
+func TestSimulateSkipsALineCutShortByACrash(t *testing.T) {
+	dir := t.TempDir()
+	traffic := filepath.Join(dir, "traffic.jsonl")
+	rec := `{"at":"2026-10-05T12:00:00Z","database":"shop","role":"app","tenant":"app","query":"select $1"}` + "\n"
+	writeFile(t, traffic, []byte(rec+`{"at":"2026-10-05T12:00:01Z","data`+"\n"+rec+rec))
+	config := filepath.Join(dir, "new.json")
+	writeFile(t, config, []byte(`{}`))
+	var out, errs strings.Builder
+
+	if code := simulateCLI([]string{"-config", config, "-traffic", traffic}, &out, &errs); code != 0 {
+		t.Fatalf("exit %d: %s", code, errs.String())
+	}
+	if !strings.Contains(out.String(), "3 statements") || !strings.Contains(errs.String(), "skipped 1") {
+		t.Errorf("printed %q and %q; want the 3 whole records replayed and the bad line reported", out.String(), errs.String())
+	}
+}
+
+func TestSimulateFailsWithoutTraffic(t *testing.T) {
+	config := filepath.Join(t.TempDir(), "new.json")
+	writeFile(t, config, []byte(`{}`))
+	var out, errs strings.Builder
+	if code := simulateCLI([]string{"-config", config, "-traffic", filepath.Join(t.TempDir(), "nope.jsonl")}, &out, &errs); code != 1 {
+		t.Errorf("exit %d with no traffic file; want 1", code)
+	}
+}
+
 func TestSimulateReadsBothTrafficFilesAndPrintsWhatChanges(t *testing.T) {
 	dir := t.TempDir()
 	traffic := filepath.Join(dir, "traffic.jsonl")
