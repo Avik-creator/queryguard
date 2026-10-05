@@ -2,10 +2,15 @@
 package stats
 
 import (
+	"bufio"
 	"cmp"
 	"context"
+	"encoding/json/v2"
+	"fmt"
+	"log/slog"
 	"maps"
 	"math"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -25,6 +30,7 @@ const unparsable = "(unparsable)"
 
 // Statement is one finished statement as a session saw it.
 type Statement struct {
+	At             time.Time // when it was answered; zero means when the table takes it in
 	Database, Role string
 	SQL            string        // the Query or Parse text
 	Took           time.Duration // from when it went to Postgres to its answer; 0 when it shared a Sync with others, so has no time of its own
@@ -82,6 +88,10 @@ type row struct {
 	took               sketch
 	errors, rejections map[string]int64
 	lastErrors         map[string]string
+	p99                time.Duration // cached for P99, from when timed was p99At
+	p99At              int64
+	p50v               time.Duration // cached for p50, from when timed was p50At
+	p50At              int64
 }
 
 // Table gathers statements into rows; it is safe for concurrent use, and its zero value is ready.
@@ -89,6 +99,10 @@ type Table struct {
 	Max       int                           // rows kept; the least called row goes to make room; 0 means DefaultMax
 	ErrorText bool                          // keep each code's last error text, which can carry row values
 	Tenant    func(role, sql string) string // the tenant a statement runs for; nil means its role
+	// Traffic, when set, gets a record of each statement, for the policy simulator.
+	Traffic *TrafficLog
+	// Units gives the cost units a statement's time is worth on this server, for its traffic record; nil records none.
+	Units func(time.Duration) (float64, bool)
 
 	init    sync.Once
 	queue   chan Statement
@@ -101,6 +115,16 @@ type Table struct {
 	buffers      map[owner]Buffers // from pg_stat_statements
 	last         map[counterKey]Counters
 	queryPrints  map[int64]string // pg_stat_statements query ID to fingerprint
+	now          minute           // this minute's traffic, for anomalies
+	baselines    map[string]*baseline
+	anomalies    []Anomaly
+	flips        []Flip
+}
+
+// Flip is a plan flip lately seen.
+type Flip struct {
+	Database, Fingerprint, Query string
+	At                           time.Time
 }
 
 // counterKey names a pg_stat_statements entry.
@@ -152,7 +176,14 @@ func (t *Table) add(st Statement) {
 		tenant = t.Tenant(st.Role, st.SQL)
 	}
 	k := key{st.Database, st.Role, tenant, fingerprint}
+	query = t.addToRow(k, query, st)
+	if t.Traffic != nil {
+		t.Traffic.write(t.record(st, k, query))
+	}
+}
 
+// addToRow puts st in the row k, making it with query when new, and returns the row's text.
+func (t *Table) addToRow(k key, query string, st Statement) string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	r := t.rows[k]
@@ -170,7 +201,7 @@ func (t *Table) add(st Statement) {
 	switch {
 	case st.Rejected:
 		r.rejections = inc(r.rejections, st.Code)
-		return
+		return r.query
 	case st.Code != "":
 		r.errors = inc(r.errors, st.Code)
 		if t.ErrorText {
@@ -181,8 +212,10 @@ func (t *Table) add(st Statement) {
 		}
 	}
 	if st.NotRun {
-		return
+		return r.query
 	}
+	// The minute is judged against the statement's usual runs, so it is counted before this one joins them.
+	t.count(k, r, st)
 	r.calls++
 	r.n += st.Rows
 	if st.Took > 0 {
@@ -190,6 +223,7 @@ func (t *Table) add(st Statement) {
 		r.total += st.Took
 		r.took.add(st.Took)
 	}
+	return r.query
 }
 
 // fingerprint returns sql's fingerprint, and its text for a new row when that is known without parsing; the caller doesn't hold mu.
@@ -286,6 +320,32 @@ func (t *Table) Counters(cs []Counters) {
 	}
 }
 
+// P99 returns the p99 of a row's timed calls and how many there were; 0 calls when there is no such row.
+func (t *Table) P99(database, role, tenant, fingerprint string) (time.Duration, int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	r := t.rows[key{database, role, tenant, fingerprint}]
+	if r == nil {
+		return 0, 0
+	}
+	// Each admission may ask, so the quantile is worked out again only once the calls have grown by a sixteenth.
+	if r.timed != r.p99At && (r.timed < 64 || r.timed-r.p99At >= r.timed/16) {
+		r.p99, r.p99At = r.took.quantile(0.99), r.timed
+	}
+	return r.p99, r.timed
+}
+
+// WALPerCall returns the WAL a statement of role with fingerprint writes per call in database, by pg_stat_statements; false before it has counted one.
+func (t *Table) WALPerCall(database, role, fingerprint string) (float64, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	b := t.buffers[owner{database, role, fingerprint}]
+	if b.Calls <= 0 {
+		return 0, false
+	}
+	return b.WALBytes / float64(b.Calls), true
+}
+
 // Rows returns every row, most total time first.
 func (t *Table) Rows() []Row {
 	t.mu.Lock()
@@ -342,4 +402,365 @@ func (s *sketch) quantile(q float64) time.Duration {
 		}
 	}
 	return 0
+}
+
+// How anomalies are found: each minute's p99, share of failed statements and share of slow ones are held against a moving baseline.
+const (
+	minuteCalls     = 20  // statements a minute needs before it says anything
+	baselineMinutes = 30  // minutes the baseline is averaged over
+	warmupMinutes   = 10  // minutes of baseline before anything is flagged
+	raiseAfter      = 2   // anomalous minutes in a row that start an anomaly, so one spike raises nothing
+	clearAfter      = 2   // normal minutes in a row that end one
+	slowerThanUsual = 10  // a run this many times its statement's p50, and at least slowRun, is slow
+	keptAnomalies   = 100 // anomalies Anomalies remembers
+	namedStatements = 3   // statements an anomaly names
+)
+
+// slowRun is the shortest run counted as slow: under load a quick statement now and then takes tens of milliseconds.
+const slowRun = 100 * time.Millisecond
+
+// signals are what each minute is judged on, with the least a minute's value must reach to be anomalous whatever the baseline.
+var signals = []struct {
+	name  string
+	floor float64
+}{
+	{"p99", 0.05}, // seconds
+	{"errors", 0.02},
+	{"slow", 0.05},
+}
+
+// Anomaly is a signal that stayed well above its baseline, or its end.
+type Anomaly struct {
+	Signal          string    // p99 (seconds), errors (the share of statements that failed) or slow (the share far slower than their usual)
+	At              time.Time // the end of the minute that started or ended it
+	Ended           bool
+	Value, Baseline float64
+	Statements      []string // the statements behind it, most first
+	Flips           []string // statements whose plan flipped that minute
+	LockWaits       int      // the most sessions waiting on locks at once that minute
+}
+
+// minute is one minute's traffic.
+type minute struct {
+	calls, errors, slow int64
+	took                sketch
+	byKey               map[key]*minuteRow
+	flips               map[owner]bool
+	lockWaits           int
+}
+
+type minuteRow struct {
+	calls, errors, slow int64
+	took                time.Duration
+}
+
+// baseline is a signal's moving mean and mean absolute deviation, and where its anomaly stands.
+type baseline struct {
+	mean, dev    float64
+	n            int
+	above, below int // anomalous and normal minutes in a row
+	active       bool
+}
+
+// count adds st to the minute; the caller holds mu, and r is st's row.
+func (t *Table) count(k key, r *row, st Statement) {
+	if t.now.byKey == nil {
+		t.now.byKey = map[key]*minuteRow{}
+	}
+	m := t.now.byKey[k]
+	if m == nil {
+		m = &minuteRow{}
+		t.now.byKey[k] = m
+	}
+	t.now.calls++
+	m.calls++
+	if st.Code != "" {
+		t.now.errors++
+		m.errors++
+	}
+	if st.Took > 0 {
+		t.now.took.add(st.Took)
+		m.took += st.Took
+		if r.timed >= minuteCalls && st.Took >= slowRun && st.Took > slowerThanUsual*r.p50() {
+			t.now.slow++
+			m.slow++
+		}
+	}
+}
+
+// Flipped notes that a statement's plan flipped this minute.
+func (t *Table) Flipped(database, fingerprint string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.now.flips == nil {
+		t.now.flips = map[owner]bool{}
+	}
+	t.now.flips[owner{database: database, fingerprint: fingerprint}] = true
+	t.flips = append(t.flips, Flip{Database: database, Fingerprint: fingerprint, At: time.Now()})
+	if extra := len(t.flips) - keptAnomalies; extra > 0 {
+		t.flips = slices.Delete(t.flips, 0, extra)
+	}
+}
+
+// Flips returns the plan flips lately seen, oldest first, with the text of a statement of each.
+func (t *Table) Flips() []Flip {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := slices.Clone(t.flips)
+	for i, f := range out {
+		for k, r := range t.rows {
+			if k.database == f.Database && k.fingerprint == f.Fingerprint {
+				out[i].Query = r.query
+				break
+			}
+		}
+	}
+	return out
+}
+
+// LockWaits notes how many sessions wait on locks now; the minute keeps the most.
+func (t *Table) LockWaits(n int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.now.lockWaits = max(t.now.lockWaits, n)
+}
+
+// Minute ends the minute at now and returns the anomalies it started or ended.
+func (t *Table) Minute(now time.Time) []Anomaly {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	m := t.now
+	t.now = minute{}
+	if m.calls < minuteCalls {
+		return nil
+	}
+	values := map[string]float64{
+		"p99":    m.took.quantile(0.99).Seconds(),
+		"errors": float64(m.errors) / float64(m.calls),
+		"slow":   float64(m.slow) / float64(m.calls),
+	}
+	var out []Anomaly
+	for _, sig := range signals {
+		b := t.baselines[sig.name]
+		if b == nil {
+			b = &baseline{}
+			if t.baselines == nil {
+				t.baselines = map[string]*baseline{}
+			}
+			t.baselines[sig.name] = b
+		}
+		v := values[sig.name]
+		anomalous := b.n >= warmupMinutes && v > sig.floor && v > 2*b.mean && v > b.mean+3*b.dev
+		if anomalous {
+			b.above, b.below = b.above+1, 0
+		} else {
+			b.above, b.below = 0, b.below+1
+			// An anomalous minute stays out of the baseline, so a long incident isn't learned as normal.
+			w := float64(min(b.n+1, baselineMinutes))
+			b.mean += (v - b.mean) / w
+			b.dev += (math.Abs(v-b.mean) - b.dev) / w
+			b.n++
+		}
+		switch {
+		case !b.active && b.above >= raiseAfter:
+			b.active = true
+			out = append(out, t.anomaly(sig.name, now, false, v, b.mean, m))
+		case b.active && b.below >= clearAfter:
+			b.active = false
+			out = append(out, t.anomaly(sig.name, now, true, v, b.mean, m))
+		}
+	}
+	t.anomalies = append(t.anomalies, out...)
+	if extra := len(t.anomalies) - keptAnomalies; extra > 0 {
+		t.anomalies = slices.Delete(t.anomalies, 0, extra)
+	}
+	return out
+}
+
+// anomaly describes signal in minute m, naming the statements behind it; the caller holds mu.
+func (t *Table) anomaly(signal string, at time.Time, ended bool, v, base float64, m minute) Anomaly {
+	a := Anomaly{Signal: signal, At: at, Ended: ended, Value: v, Baseline: base, LockWaits: m.lockWaits}
+	if ended {
+		return a
+	}
+	keys := slices.Collect(maps.Keys(m.byKey))
+	weight := func(k key) (int64, time.Duration) {
+		r := m.byKey[k]
+		if signal == "errors" {
+			return r.errors, 0
+		}
+		return r.slow, r.took
+	}
+	slices.SortFunc(keys, func(x, y key) int {
+		xn, xt := weight(x)
+		yn, yt := weight(y)
+		return cmp.Or(cmp.Compare(yn, xn), cmp.Compare(yt, xt), cmp.Compare(x.fingerprint, y.fingerprint))
+	})
+	for _, k := range keys {
+		if n, took := weight(k); (n == 0 && took == 0) || len(a.Statements) == namedStatements {
+			break
+		}
+		if r := t.rows[k]; r != nil && !slices.Contains(a.Statements, r.query) {
+			a.Statements = append(a.Statements, r.query)
+		}
+	}
+	for o := range m.flips {
+		for k, r := range t.rows {
+			if k.database == o.database && k.fingerprint == o.fingerprint {
+				a.Flips = append(a.Flips, r.query)
+				break
+			}
+		}
+	}
+	slices.Sort(a.Flips)
+	return a
+}
+
+// Anomalies returns the anomalies started and ended lately, oldest first.
+func (t *Table) Anomalies() []Anomaly {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return slices.Clone(t.anomalies)
+}
+
+// p50 returns the row's median run, worked out again only once its runs have grown by a sixteenth.
+func (r *row) p50() time.Duration {
+	if r.timed != r.p50At && (r.timed < 64 || r.timed-r.p50At >= r.timed/16) {
+		r.p50v, r.p50At = r.took.quantile(0.5), r.timed
+	}
+	return r.p50v
+}
+
+// Record is one statement in the traffic log: what the policy simulator replays.
+type Record struct {
+	At          time.Time `json:"at"`
+	Database    string    `json:"database"`
+	Role        string    `json:"role"`
+	Tenant      string    `json:"tenant"`
+	Fingerprint string    `json:"fingerprint"`
+	Query       string    `json:"query"` // with its constants as $1, $2…, so the log holds no values
+	TookMS      float64   `json:"took_ms,omitzero"`
+	Units       float64   `json:"units,omitzero"` // the cost units its time was worth on the server
+	Rows        int64     `json:"rows,omitzero"`
+	Code        string    `json:"code,omitempty"`
+	Rejected    bool      `json:"rejected,omitzero"`
+	NotRun      bool      `json:"not_run,omitzero"`
+}
+
+// record makes st's traffic record.
+func (t *Table) record(st Statement, k key, query string) Record {
+	rec := Record{At: cmp.Or(st.At, time.Now()), Database: k.database, Role: k.role, Tenant: k.tenant, Fingerprint: k.fingerprint,
+		Query: query, TookMS: float64(st.Took) / float64(time.Millisecond), Rows: st.Rows, Code: st.Code, Rejected: st.Rejected, NotRun: st.NotRun}
+	if t.Units != nil && st.Took > 0 {
+		rec.Units, _ = t.Units(st.Took)
+	}
+	return rec
+}
+
+// trafficKept is how long one traffic file is written before it moves aside, so the log holds between one and two days.
+const trafficKept = 24 * time.Hour
+
+// TrafficLog writes traffic records as JSON lines to Path, moving the file to Path.1 once it holds a day.
+type TrafficLog struct {
+	Path string
+	Log  *slog.Logger // where write errors go; nil means slog.Default()
+
+	now     func() time.Time // nil means time.Now
+	mu      sync.Mutex
+	f       *os.File
+	started time.Time // the time of the file's first record
+	failed  bool      // a write failed, which was logged; the next success clears it
+}
+
+func (l *TrafficLog) write(rec Record) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.writeLocked(rec); err != nil {
+		if !l.failed {
+			cmp.Or(l.Log, slog.Default()).Error("write traffic log", "file", l.Path, "err", err)
+		}
+		l.failed = true
+		return
+	}
+	l.failed = false
+}
+
+func (l *TrafficLog) writeLocked(rec Record) error {
+	now := time.Now
+	if l.now != nil {
+		now = l.now
+	}
+	if l.f == nil {
+		if err := l.open(); err != nil {
+			return err
+		}
+	}
+	if !l.started.IsZero() && now().Sub(l.started) >= trafficKept {
+		l.f.Close()
+		l.f = nil
+		if err := os.Rename(l.Path, l.Path+".1"); err != nil {
+			return err
+		}
+		if err := l.open(); err != nil {
+			return err
+		}
+	}
+	if l.started.IsZero() {
+		l.started = rec.At
+	}
+	line, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	_, err = l.f.Write(append(line, '\n'))
+	return err
+}
+
+// open opens Path to append, learning when its first record was written.
+func (l *TrafficLog) open() error {
+	f, err := os.OpenFile(l.Path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	l.f, l.started = f, time.Time{}
+	if recs, err := readTraffic(l.Path, 1); err == nil && len(recs) > 0 {
+		l.started = recs[0].At
+	}
+	return nil
+}
+
+// Close closes the file.
+func (l *TrafficLog) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.f == nil {
+		return nil
+	}
+	err := l.f.Close()
+	l.f = nil
+	return err
+}
+
+// ReadTraffic reads every record in a traffic log file.
+func ReadTraffic(path string) ([]Record, error) { return readTraffic(path, -1) }
+
+// readTraffic reads up to n records of path; n below 0 reads them all.
+func readTraffic(path string, n int) ([]Record, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var out []Record
+	lines := bufio.NewScanner(f)
+	lines.Buffer(make([]byte, 64<<10), 16<<20)
+	for lines.Scan() && n != 0 {
+		var rec Record
+		if err := json.Unmarshal(lines.Bytes(), &rec); err != nil {
+			return out, fmt.Errorf("%s: %w", path, err)
+		}
+		out = append(out, rec)
+		n--
+	}
+	return out, lines.Err()
 }

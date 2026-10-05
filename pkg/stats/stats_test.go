@@ -2,9 +2,13 @@ package stats
 
 import (
 	"math"
+	"path/filepath"
+	"slices"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/Avik-creator/queryguard/pkg/sqlparse"
 )
 
 func TestSketchQuantilesAreWithinOnePercent(t *testing.T) {
@@ -199,4 +203,172 @@ func TestErrorsBeforeRunningAreNotCalls(t *testing.T) {
 	if r := tb.Rows()[0]; r.Calls != 0 || r.Errors["22P02"] != 1 {
 		t.Errorf("row %+v; want the Bind's error counted and no call", r)
 	}
+}
+
+func TestWALPerCallIsTheAverageOfTheRolesStatement(t *testing.T) {
+	var tb Table
+	if _, ok := tb.WALPerCall("shop", "app", sqlparse.Fingerprint("update t set x = 1")); ok {
+		t.Error("WALPerCall known before any reading")
+	}
+	tb.Counters([]Counters{{Database: "shop", Role: "app", QueryID: 3, Query: "update t set x = $1", Calls: 4, WALBytes: 4000}})
+
+	if w, ok := tb.WALPerCall("shop", "app", sqlparse.Fingerprint("update t set x = 2")); !ok || w != 1000 {
+		t.Errorf("WALPerCall = %v, %v; want 1000", w, ok)
+	}
+}
+
+func TestP99OfARowFollowsItsTimedCalls(t *testing.T) {
+	var tb Table
+	fp := sqlparse.Fingerprint("select * from orders where id = 1")
+	if _, n := tb.P99("shop", "app", "app", fp); n != 0 {
+		t.Errorf("P99 of an unknown row counted %d calls; want 0", n)
+	}
+	for i := range 200 {
+		tb.add(Statement{Database: "shop", Role: "app", SQL: "select * from orders where id = 1", Took: time.Duration(i+1) * time.Millisecond})
+	}
+
+	d, n := tb.P99("shop", "app", "app", fp)
+	if n != 200 || d < 195*time.Millisecond || d > 201*time.Millisecond {
+		t.Errorf("P99 = %v over %d calls; want about 198ms over 200", d, n)
+	}
+}
+
+// minuteOf adds n statements to tb as one minute's traffic: fast ones, then slow ones of slowSQL, and errors of errSQL.
+func minuteOf(tb *Table, fast, slow, errs int, took time.Duration) {
+	for range fast {
+		tb.add(Statement{Database: "shop", Role: "app", SQL: "select * from orders where id = 1", Took: 5 * time.Millisecond})
+	}
+	for range slow {
+		tb.add(Statement{Database: "shop", Role: "app", SQL: "select * from orders where note like 'x'", Took: took})
+	}
+	for range errs {
+		tb.add(Statement{Database: "shop", Role: "app", SQL: "insert into orders values (1)", Code: "23505"})
+	}
+}
+
+func TestAnomalyNeedsTwoMinutesAboveTheBaselineAndEndsAfterTwoBelow(t *testing.T) {
+	var tb Table
+	now := time.Now()
+	for i := range 15 {
+		minuteOf(&tb, 100, 2, 0, 10*time.Millisecond)
+		if got := tb.Minute(now.Add(time.Duration(i) * time.Minute)); len(got) != 0 {
+			t.Fatalf("steady minute %d raised %+v", i, got)
+		}
+	}
+
+	// One spike raises nothing.
+	minuteOf(&tb, 100, 20, 0, 2*time.Second)
+	if got := tb.Minute(now.Add(15 * time.Minute)); len(got) != 0 {
+		t.Fatalf("one slow minute raised %+v; want nothing until a second", got)
+	}
+	minuteOf(&tb, 100, 2, 0, 10*time.Millisecond)
+	tb.Minute(now.Add(16 * time.Minute))
+
+	minuteOf(&tb, 100, 20, 0, 2*time.Second)
+	tb.Minute(now.Add(17 * time.Minute))
+	tb.Flipped("shop", sqlparse.Fingerprint("select * from orders where note like 'x'"))
+	tb.LockWaits(7)
+	minuteOf(&tb, 100, 20, 0, 2*time.Second)
+	got := tb.Minute(now.Add(18 * time.Minute))
+	var p99 *Anomaly
+	for i := range got {
+		if got[i].Signal == "p99" {
+			p99 = &got[i]
+		}
+	}
+	if p99 == nil || p99.Ended {
+		t.Fatalf("two slow minutes raised %+v; want a p99 anomaly", got)
+	}
+	if len(p99.Statements) == 0 || p99.Statements[0] != "select * from orders where note like $1" {
+		t.Errorf("anomaly names %q; want the slow statement first", p99.Statements)
+	}
+	if len(p99.Flips) != 1 || p99.LockWaits != 7 {
+		t.Errorf("anomaly flips %q, lock waits %d; want the flipped statement and 7", p99.Flips, p99.LockWaits)
+	}
+
+	minuteOf(&tb, 100, 2, 0, 10*time.Millisecond)
+	if got := tb.Minute(now.Add(19 * time.Minute)); len(got) != 0 {
+		t.Fatalf("first normal minute gave %+v; want the anomaly to last", got)
+	}
+	minuteOf(&tb, 100, 2, 0, 10*time.Millisecond)
+	ended := tb.Minute(now.Add(20 * time.Minute))
+	if !slices.ContainsFunc(ended, func(a Anomaly) bool { return a.Signal == "p99" && a.Ended }) {
+		t.Errorf("two normal minutes gave %+v; want the p99 anomaly ended", ended)
+	}
+	if a := tb.Anomalies(); !slices.ContainsFunc(a, func(a Anomaly) bool { return a.Signal == "p99" }) {
+		t.Errorf("Anomalies = %+v; want the p99 one remembered", a)
+	}
+}
+
+func TestErrorRateAnomalyNamesTheFailingStatement(t *testing.T) {
+	var tb Table
+	now := time.Now()
+	for i := range 15 {
+		minuteOf(&tb, 100, 0, 0, 0)
+		tb.Minute(now.Add(time.Duration(i) * time.Minute))
+	}
+	var got []Anomaly
+	for i := range 2 {
+		minuteOf(&tb, 100, 0, 30, 0)
+		got = tb.Minute(now.Add(time.Duration(15+i) * time.Minute))
+	}
+
+	if len(got) != 1 || got[0].Signal != "errors" || got[0].Statements[0] != "insert into orders values ($1)" {
+		t.Errorf("got %+v; want an errors anomaly naming the insert", got)
+	}
+}
+
+func TestQuietMinutesRaiseNothing(t *testing.T) {
+	var tb Table
+	now := time.Now()
+	for i := range 15 {
+		minuteOf(&tb, 100, 0, 0, 0)
+		tb.Minute(now.Add(time.Duration(i) * time.Minute))
+	}
+	// A handful of statements, all failing, is too few to say anything.
+	for i := range 3 {
+		minuteOf(&tb, 2, 0, 3, 0)
+		if got := tb.Minute(now.Add(time.Duration(15+i) * time.Minute)); len(got) != 0 {
+			t.Fatalf("quiet minute raised %+v", got)
+		}
+	}
+}
+
+func TestFlipsListsRecentFlipsWithTheirText(t *testing.T) {
+	var tb Table
+	tb.add(Statement{Database: "shop", Role: "app", SQL: "select * from orders where id = 1"})
+	tb.Flipped("shop", sqlparse.Fingerprint("select * from orders where id = 2"))
+
+	if f := tb.Flips(); len(f) != 1 || f[0].Query != "select * from orders where id = $1" || f[0].At.IsZero() {
+		t.Errorf("Flips = %+v; want the flip with its statement's text", f)
+	}
+}
+
+func TestTrafficIsLoggedOnePerLineAndRotatedDaily(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	log := &TrafficLog{Path: filepath.Join(dir, "traffic.jsonl"), now: func() time.Time { return now }}
+	tb := Table{Traffic: log, Units: func(d time.Duration) (float64, bool) { return d.Seconds() * 1000, true }}
+	tb.add(Statement{At: now, Database: "shop", Role: "app", SQL: "select * from orders where id = 1", Took: 20 * time.Millisecond, Rows: 1})
+	tb.add(Statement{At: now, Database: "shop", Role: "app", SQL: "drop table orders", Code: "42501", Rejected: true})
+
+	recs, err := ReadTraffic(log.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 2 || recs[0].Query != "select * from orders where id = $1" || recs[0].Units != 20 || recs[0].Rows != 1 ||
+		!recs[1].Rejected || recs[1].Code != "42501" || recs[1].Tenant != "app" {
+		t.Fatalf("read back %+v; want both statements with their numbers", recs)
+	}
+
+	// A day on, the file moves aside and a new one starts.
+	now = now.Add(25 * time.Hour)
+	tb.add(Statement{At: now, Database: "shop", Role: "app", SQL: "select 1"})
+	if old, err := ReadTraffic(log.Path + ".1"); err != nil || len(old) != 2 {
+		t.Errorf("rotated file has %d records, %v; want the first 2", len(old), err)
+	}
+	if recent, err := ReadTraffic(log.Path); err != nil || len(recent) != 1 {
+		t.Errorf("new file has %d records, %v; want 1", len(recent), err)
+	}
+	log.Close()
 }
