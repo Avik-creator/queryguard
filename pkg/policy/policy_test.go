@@ -1754,6 +1754,31 @@ func TestWatchedStatementCoolsDownInTheSlowLane(t *testing.T) {
 	}
 }
 
+func TestAWarnTenantIsOnlyLoggedAsARunaway(t *testing.T) {
+	config := `{"runaway": {"action": "slow"}, "learned_timeouts": {"mode": "on", "min_runs": 10},
+		"scheduler": {"max_active": 1, "queue_timeout": "10ms"}, "tenants": {"alice": {"mode": "warn", "statement_timeout": "30s"}}}`
+	var logs bytes.Buffer
+	c := gateChecker(t, config, "alice", slog.New(slog.NewTextHandler(&logs, nil)))
+	c.Env.Runaways = &Watch{}
+	c.Env.P99 = func(string, string, string, string) (time.Duration, int64) { return time.Millisecond, 1000 }
+	const sql = "select * from orders where note like '%x%'"
+
+	broke := pass(t, c, sql, costing(1), false)
+	if broke.Timeout != 30*time.Second {
+		t.Errorf("timeout %v; want the tenant's 30s, as warn mode only logs", broke.Timeout)
+	}
+	broke.Broke(session.Interruption{Code: "57014"})
+	broke.Release()
+	holder := pass(t, c, "select 1", costing(1), false)
+	defer holder.Release()
+
+	// Warn mode leaves it in the fast lane, whose one slot is taken, so it would have been turned away there.
+	pass(t, c, sql, costing(1), false)
+	if !strings.Contains(logs.String(), `rule=busy tenant=alice lane=fast`) {
+		t.Errorf("logged %q; want the watched statement kept in the fast lane", logs.String())
+	}
+}
+
 func TestPlanFlipIsToldToTheStats(t *testing.T) {
 	c := gateChecker(t, `{"plan_flips": {"mode": "warn"}, "scheduler": {"slow_lane": {"max_active": 1}}}`, "alice", discard)
 	var flipped []string

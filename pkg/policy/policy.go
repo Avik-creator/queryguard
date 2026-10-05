@@ -1291,7 +1291,7 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 					case runaway.Action == "reject" && !warn:
 						c.log.Warn("rejected statement", "rule", "runaway", "tenant", who.tenant, "query", sqlparse.Normalize(sql))
 						return session.Admission{Reject: onWatch(left)}
-					case runaway.Action == "slow":
+					case runaway.Action == "slow" && !warn:
 						cooled = true
 					case first:
 						c.log.Warn("runaway statement runs again", "tenant", who.tenant, "query", sqlparse.Normalize(sql), "watched_for", left.Round(time.Second))
@@ -1365,7 +1365,7 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 			ctx, cancel = context.WithDeadline(ctx, start)
 			defer cancel()
 		}
-		if l := p.cfg.LearnedTimeouts; l.Mode == "on" && c.Env.P99 != nil && !q.Named {
+		if l := p.cfg.LearnedTimeouts; l.Mode == "on" && c.Env.P99 != nil && !q.Named && !warn {
 			if fingerprint == "" {
 				fingerprint = sqlparse.Fingerprint(sql)
 			}
