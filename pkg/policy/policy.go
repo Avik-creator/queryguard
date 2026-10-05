@@ -725,7 +725,7 @@ func pgDuration(v string) (time.Duration, bool) {
 
 // tenant returns who a statement runs for: the tenant its tag names when the role is trusted to name one, else the role.
 func (c *Checker) tenant(p *Policy, tags map[string]string) string {
-	name := tags[cmp.Or(p.cfg.TenantTag, defaultTenantTag)]
+	name := p.taggedTenant(tags)
 	switch {
 	case name == "":
 		return c.role
@@ -737,6 +737,19 @@ func (c *Checker) tenant(p *Policy, tags map[string]string) string {
 		c.log.Warn("ignored a tenant tag from a role not trusted to name one", "tag", name)
 	}
 	return c.role
+}
+
+// taggedTenant returns the tenant tags name, trusted or not; "" when they name none.
+func (p *Policy) taggedTenant(tags map[string]string) string {
+	return tags[cmp.Or(p.cfg.TenantTag, defaultTenantTag)]
+}
+
+// TenantOf returns the tenant role's statement sql runs for: its tag's when role is trusted to send one, else role.
+func (p *Policy) TenantOf(role, sql string) string {
+	if name := p.taggedTenant(sqlparse.Tags(sql)); name != "" && p.trusted(role) {
+		return name
+	}
+	return role
 }
 
 // gate admits sql as admit does, and tells the Backend what runs.

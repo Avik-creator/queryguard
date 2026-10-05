@@ -1438,3 +1438,16 @@ func ruleOf(e *pgproto3.ErrorResponse) string {
 	}
 	return "unknown: " + e.Message
 }
+
+func TestTenantOfFollowsTagsOnlyFromTrustedRoles(t *testing.T) {
+	p := mustParse(t, `{"trusted_roles": ["app"]}`)
+	for _, tc := range []struct{ role, sql, want string }{
+		{"app", "select 1 /*tenant='acme'*/", "acme"},
+		{"app", "select 1", "app"},
+		{"intruder", "select 1 /*tenant='acme'*/", "intruder"},
+	} {
+		if got := p.TenantOf(tc.role, tc.sql); got != tc.want {
+			t.Errorf("TenantOf(%q, %q) = %q; want %q", tc.role, tc.sql, got, tc.want)
+		}
+	}
+}
