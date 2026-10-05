@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"maps"
 	"sync"
 
 	"github.com/Avik-creator/queryguard/pkg/session"
@@ -48,12 +49,41 @@ type backend struct {
 	ddl       bool                            // it runs DDL now
 	flagged   bool                            // the DDL guard acted on the statement it runs, so it won't again
 	interrupt func(session.Interruption) bool // cancels what it runs; nil until the session starts
+	blocking  chan struct{}                   // closed while others wait on its locks; made when first asked for
 }
 
 func (b *backend) Running(tenant string, ddl bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.tenant, b.ddl, b.flagged = tenant, ddl, false
+}
+
+func (b *backend) Blocking() <-chan struct{} {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.blocking == nil {
+		b.blocking = make(chan struct{})
+	}
+	return b.blocking
+}
+
+// setBlocking says whether others now wait on its locks.
+func (b *backend) setBlocking(on bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	select {
+	case <-b.blocking:
+		if !on {
+			b.blocking = make(chan struct{})
+		}
+	default:
+		if on {
+			if b.blocking == nil {
+				b.blocking = make(chan struct{})
+			}
+			close(b.blocking)
+		}
+	}
 }
 
 func (b *backend) setInterrupt(f func(session.Interruption) bool) {
@@ -101,6 +131,13 @@ func (r *backends) add(pid int32, b *backend) (forget func()) {
 			delete(r.byPID, pid)
 		}
 	})
+}
+
+// all returns every backend by pid.
+func (r *backends) all() map[int32]*backend {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return maps.Clone(r.byPID)
 }
 
 // get returns the backend with pid, or nil when it is no session of this proxy.

@@ -801,6 +801,31 @@ func TestBlockerPaysForTheWaitsItCauses(t *testing.T) {
 	})
 }
 
+func TestSessionsOthersWaitOnAreToldSo(t *testing.T) {
+	s := &Server{Logger: slog.New(slog.DiscardHandler)}
+	s.SetPolicy(mustPolicy(t, `{"scheduler": {"max_active": 1}}`))
+	holder, other := &backend{}, &backend{}
+	defer s.backends.add(5, holder)()
+	defer s.backends.add(7, other)()
+	closed := func(b *backend) bool {
+		select {
+		case <-b.Blocking():
+			return true
+		default:
+			return false
+		}
+	}
+
+	s.observe(plan.Activity{Waiting: map[int32]plan.Wait{10: {Blockers: []int32{5}}}})
+	if !closed(holder) || closed(other) {
+		t.Errorf("holder told %v, other told %v; want only the holder told others wait on it", closed(holder), closed(other))
+	}
+	s.observe(plan.Activity{})
+	if closed(holder) {
+		t.Error("holder still told others wait on it once nobody did")
+	}
+}
+
 func TestBlockerPaysCanBeTurnedOff(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := &Server{Logger: slog.New(slog.DiscardHandler)}
@@ -982,6 +1007,29 @@ func TestScalesLimitsToTheFleetShare(t *testing.T) {
 		stop()
 		for _, ch := range done {
 			<-ch
+		}
+	})
+}
+
+func TestFleetWantsCountRunningSlotsAndLetAStarvedTenantBackIn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		config := `{"scheduler": {"max_active": 8, "queue_timeout": "1h"}, "tenants": {"acme": {"budget": {"rate": 100, "when_over": "queue"}}}}`
+		s := &Server{Upstream: Dialer{Addr: "unused"}, Logger: slog.New(slog.DiscardHandler), Policy: mustPolicy(t, config),
+			Fleet: &fleet.Fleet{Store: &fleet.Memory{}, MaxInstances: 4}}
+		s.sched = sched.New(sched.Config{Fast: sched.Lane{MaxActive: 8}, Budgets: map[string]sched.Budget{"acme": {Rate: -1}}})
+		s.sched.Acquire(t.Context(), "acme", sched.Fast, sched.Normal)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		// Its share elsewhere is all of acme's rate, so here acme has none and spends nothing.
+		s.sched.Spend(ctx, "acme", 1)
+
+		wants := s.fleetWants()
+
+		if w := wants["slots:fast"]; w.Using != 1 || !w.Whole {
+			t.Errorf("fast slots %+v; want 1 in use, in whole units", w)
+		}
+		if w := wants["rate:acme"]; w.Demand <= 0 {
+			t.Errorf("acme %+v; want some demand, or it never gets a share back", w)
 		}
 	})
 }

@@ -409,7 +409,8 @@ func (p *Policy) compile() error {
 	slots := s.MaxActive > 0 || s.SlowLane.MaxActive > 0
 	// Fair shares of slots go by cost too, so limited slots need plans as budgets do.
 	p.needsCost = p.costRules || budgeted || slots
-	p.gated = budgeted || timed || slots
+	// A lag hold and a horizon cap act at the slot a statement takes, so every statement must ask for one.
+	p.gated = budgeted || timed || slots || c.ReplicationLag.Max > 0 || c.MVCCHorizon.MaxAge > 0
 	return errors.Join(errs...)
 }
 
@@ -593,6 +594,8 @@ type Env struct {
 type Backend interface {
 	// Running says the connection now runs a statement of tenant, DDL or not, or has finished it (ddl false).
 	Running(tenant string, ddl bool)
+	// Blocking returns a channel closed while others wait on locks the connection holds.
+	Blocking() <-chan struct{}
 }
 
 // Checker checks the statements of one session; only the session's own goroutine uses it.
@@ -611,8 +614,8 @@ type subject struct {
 	role, tenant, app string
 	client            netip.Addr
 	tags              map[string]string
-	trusted           bool      // the role is trusted to tag its statements
-	deadline          time.Time // when the client gives up on the statement; zero when unknown
+	trusted           bool          // the role is trusted to tag its statements
+	wait              time.Duration // how long the client waits for the statement from when it is sent to run; 0 when unknown
 }
 
 // priority returns the priority of who's statement: its tenant's, or its tag's when the role is trusted or the tag lowers it.
@@ -638,7 +641,7 @@ func (c *Checker) Check(sql string, set session.Settings) (*pgproto3.ErrorRespon
 	}
 	tags := sqlparse.Tags(sql)
 	who := subject{role: c.role, tenant: c.tenant(p, tags), app: set.ApplicationName, client: c.Env.Client, tags: tags, trusted: p.trusted(c.role),
-		deadline: c.deadline(tags)}
+		wait: c.wait(tags)}
 	warn := p.cfg.Tenants[who.tenant].Mode == Warn
 
 	reason := misread(sql, set)
@@ -648,6 +651,10 @@ func (c *Checker) Check(sql string, set session.Settings) (*pgproto3.ErrorRespon
 		if q, err = sqlparse.Analyze(sql); err != nil {
 			reason = "The parser cannot read it: " + err.Error()
 		}
+	}
+	if q.ChangesTimeout {
+		// The new value is known only once the statement runs, if it does, so the client's wait is no longer known.
+		c.clientTimeout = 0
 	}
 	if reason != "" {
 		// A statement that can't be read can still be scheduled, though it can't be explained or judged.
@@ -676,20 +683,17 @@ func (c *Checker) Check(sql string, set session.Settings) (*pgproto3.ErrorRespon
 	return nil, c.gate(p, sql, q, who)
 }
 
-// deadlineTag is the sqlcommenter key giving how long, from when QueryGuard reads a statement, its client waits for it.
+// deadlineTag is the sqlcommenter key giving how long, from when it is sent to run, a statement's client waits for it.
 const deadlineTag = "deadline"
 
-// deadline returns when the client gives up on a statement read now with tags: the sooner of its login's statement_timeout and
-// its deadline tag, counted from now as the time the client waits, queue included; zero when it gave neither.
-func (c *Checker) deadline(tags map[string]string) time.Time {
+// wait returns how long the client waits for a statement with tags, queue included: the shorter of its login's
+// statement_timeout and its deadline tag; 0 when it gave neither.
+func (c *Checker) wait(tags map[string]string) time.Duration {
 	wait := c.clientTimeout
 	if d, ok := pgDuration(tags[deadlineTag]); ok && d > 0 && (wait == 0 || d < wait) {
 		wait = d
 	}
-	if wait == 0 {
-		return time.Time{}
-	}
-	return time.Now().Add(wait)
+	return wait
 }
 
 // pgUnits are the units Postgres takes for time settings; a number alone is in milliseconds.
@@ -741,6 +745,13 @@ func (c *Checker) gate(p *Policy, sql string, q sqlparse.Query, who subject) ses
 				}
 				b.Running(who.tenant, false)
 			}
+			idle := a.Idle
+			a.Idle = func() {
+				if idle != nil {
+					idle()
+				}
+				b.Running(who.tenant, false)
+			}
 		}
 		return a
 	}
@@ -752,16 +763,26 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 		t := p.tenant(who.tenant)
 		warn := t.Mode == Warn
 		a := session.Admission{Timeout: time.Duration(t.StatementTimeout), IdleInTransaction: time.Duration(t.IdleInTransactionTimeout)}
+		if q.TransactionControl {
+			// A slot may be held by a statement waiting on this transaction's locks, which only its end frees.
+			return a
+		}
 		s := c.Env.Scheduler
-		if !who.deadline.IsZero() && !warn {
+		// A prepared statement passes its gate at every execution, and the client's wait starts at each.
+		var deadline time.Time
+		if who.wait > 0 && !warn {
+			deadline = time.Now().Add(who.wait)
 			var cancel context.CancelFunc
-			ctx, cancel = context.WithDeadline(ctx, who.deadline)
+			ctx, cancel = context.WithDeadline(ctx, deadline)
 			defer cancel()
 		}
+		// Others waiting on the session's locks wait until its next statement, likely its COMMIT, runs, so it waits for nothing.
+		ctx, holds := c.holdingLocks(ctx)
+		defer holds.stop(nil)
 
 		// The budget is looked at before EXPLAIN, the dearest step, and spent once the cost is known.
 		if s != nil && !warn {
-			if _, err := s.Reserve(ctx, who.tenant); err != nil {
+			if _, err := s.Reserve(ctx, who.tenant); err != nil && !holds.locks() {
 				return c.refuse(err, who, "budget", overBudget(t.Budget))
 			}
 		}
@@ -787,9 +808,9 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 				cost, flipped, usual, a.Ran = c.learn(p, sql, fingerprint, who, warn, pl)
 			}
 		}
-		if !who.deadline.IsZero() && !warn && usual > 0 {
+		if !deadline.IsZero() && usual > 0 {
 			// It must start by when it can still end in its usual time.
-			start := who.deadline.Add(-usual)
+			start := deadline.Add(-usual)
 			if !time.Now().Before(start) {
 				return c.refuse(context.DeadlineExceeded, who, "deadline", pastDeadline())
 			}
@@ -815,10 +836,14 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 			s.Charge(who.tenant, cost)
 		} else {
 			l, err := s.Spend(ctx, who.tenant, cost)
-			if err != nil {
+			switch {
+			case err != nil && holds.locks():
+				s.Charge(who.tenant, cost)
+			case err != nil:
 				return c.refuse(err, who, "budget", overBudget(t.Budget))
+			default:
+				lane = l
 			}
-			lane = l
 		}
 		if flipped {
 			lane = sched.Slow
@@ -826,6 +851,9 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 		if !running {
 			release, err := s.Acquire(ctx, who.tenant, lane, p.priority(who))
 			switch {
+			case err != nil && holds.locks():
+				c.log.Info("let in a statement of a session others wait on", "tenant", who.tenant, "lane", lane)
+				a.Release = s.Force(who.tenant, lane)
 			case err != nil && warn:
 				c.log.Warn("would reject statement", "rule", "busy", "tenant", who.tenant, "lane", lane)
 			case errors.Is(err, sched.ErrShed):
@@ -845,6 +873,36 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 		}
 		return a
 	}
+}
+
+// errHoldsLocks ends the waits of a statement whose session holds locks others wait on.
+var errHoldsLocks = errors.New("others wait on the session's locks")
+
+// holding watches whether others wait on the session's locks while one of its statements waits to be admitted.
+type holding struct {
+	ctx  context.Context
+	stop context.CancelCauseFunc
+}
+
+// locks reports whether others came to wait on the session's locks.
+func (h holding) locks() bool { return errors.Is(context.Cause(h.ctx), errHoldsLocks) }
+
+// holdingLocks returns a context that ends, with errHoldsLocks as its cause, once the Backend says others wait on the session's
+// locks; call stop when the statement's waits are over.
+func (c *Checker) holdingLocks(ctx context.Context) (context.Context, holding) {
+	ctx, stop := context.WithCancelCause(ctx)
+	h := holding{ctx: ctx, stop: stop}
+	if b := c.Env.Backend; b != nil {
+		blocking, done := b.Blocking(), ctx.Done()
+		go func() {
+			select {
+			case <-blocking:
+				stop(errHoldsLocks)
+			case <-done:
+			}
+		}()
+	}
+	return ctx, h
 }
 
 // refuse logs and returns the rejection for a statement whose wait ended with err: rej, unless it was its deadline that ended it.

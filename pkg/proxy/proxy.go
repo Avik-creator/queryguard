@@ -457,10 +457,20 @@ func (s *Server) observe(a plan.Activity) {
 	if sc != nil {
 		sc.LockWaits(a.LockWaits())
 	}
+	// A session others wait on is let past the limits, since only its next statement can end their wait.
+	blocking := map[int32]bool{}
+	for _, w := range a.Waiting {
+		for _, pid := range w.Blockers {
+			blocking[pid] = true
+		}
+	}
+	for pid, b := range s.backends.all() {
+		b.setBlocking(blocking[pid])
+	}
 	if p == nil {
 		return
 	}
-	s.guardDDL(p, a)
+	s.guardDDL(p, a, blocking)
 	if sc == nil {
 		return
 	}
@@ -533,18 +543,12 @@ func grown(base, now map[plan.Table]float64) float64 {
 }
 
 // guardDDL cancels this proxy's DDL that waits on a lock while others queue behind it, or past the guard's lock_timeout.
-func (s *Server) guardDDL(p *policy.Policy, a plan.Activity) {
+func (s *Server) guardDDL(p *policy.Policy, a plan.Activity, blocking map[int32]bool) {
 	g := p.DDLGuard()
 	if g.Mode == "off" {
 		return
 	}
 	// A backend that others wait for while it waits itself is at the head of a lock queue.
-	blocking := map[int32]bool{}
-	for _, w := range a.Waiting {
-		for _, pid := range w.Blockers {
-			blocking[pid] = true
-		}
-	}
 	log := cmp.Or(s.Logger, slog.Default())
 	for pid, w := range a.Waiting {
 		b := s.backends.get(pid)
@@ -672,7 +676,8 @@ func (s *Server) fleetWants() map[string]fleet.Want {
 		id       sched.LaneID
 	}{{"slots:fast", cfg.Fast, sched.Fast}, {"slots:slow", cfg.Slow, sched.Slow}} {
 		if l.lane.MaxActive > 0 {
-			wants[l.resource] = fleet.Want{Capacity: float64(l.lane.MaxActive), Demand: float64(d.Slots[l.id])}
+			wants[l.resource] = fleet.Want{Capacity: float64(l.lane.MaxActive), Demand: float64(d.Slots[l.id]),
+				Using: float64(d.Running[l.id]), Whole: true}
 		}
 	}
 
@@ -697,9 +702,9 @@ func (s *Server) fleetWants() map[string]fleet.Want {
 	maps.DeleteFunc(s.known, func(_ string, seen time.Time) bool { return now.Sub(seen) > forgetTenantAfter })
 	budget := func(tenant string, b sched.Budget) {
 		demand := d.Spent[tenant] / elapsed.Seconds()
-		// A tenant held back by its share would use more, so it asks for twice what it has.
+		// A tenant held back by its share would use more, so it asks for twice what it has, and with none, for the fallback share.
 		if d.Starved[tenant] {
-			demand = max(demand, 2*s.Fleet.Share("rate:"+tenant))
+			demand = max(demand, 2*s.Fleet.Share("rate:"+tenant), b.Rate/float64(cmp.Or(s.Fleet.MaxInstances, fleet.DefaultMaxInstances)))
 		}
 		wants["rate:"+tenant] = fleet.Want{Capacity: b.Rate, Demand: demand}
 	}

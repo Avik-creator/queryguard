@@ -467,7 +467,7 @@ func TestGateChargesStatementsWithoutPlan(t *testing.T) {
 
 	var got []string
 	for range 3 {
-		got = append(got, codeOf(pass(t, c, "begin", never, false).Reject))
+		got = append(got, codeOf(pass(t, c, "show work_mem", never, false).Reject))
 	}
 
 	if !slices.Equal(got, []string{"", "", "53000"}) {
@@ -742,6 +742,23 @@ func TestGateTellsTheBackendWhatRuns(t *testing.T) {
 	}
 }
 
+func TestGateTellsTheBackendWhenTheServerIsIdle(t *testing.T) {
+	c := mustParse(t, `{}`).Checker("alice", discard)
+	b := &backend{}
+	c.Env = Env{Database: "shop", Plans: &plan.Cache{RefreshOneIn: -1}, Backend: b}
+
+	// A Bind with no Execute passes the gate, but the server never runs it, so only the server going idle ends it.
+	a := pass(t, c, "alter table orders add column note text", costing(1), false)
+	if a.Idle == nil {
+		t.Fatal("no Idle to report the server idle")
+	}
+	a.Idle()
+
+	if want := []running{{"alice", true}, {"alice", false}}; !slices.Equal(b.runs, want) {
+		t.Errorf("backend told %v; want %v", b.runs, want)
+	}
+}
+
 func TestDDLGetsAGateOnlyForTheGuard(t *testing.T) {
 	for config, wantGate := range map[string]bool{`{"ddl_guard": {"mode": "off"}}`: false, `{}`: true} {
 		c := mustParse(t, config).Checker("alice", discard)
@@ -885,6 +902,55 @@ func TestStatementWithinItsDeadlineRuns(t *testing.T) {
 	})
 }
 
+func TestPreparedStatementsDeadlineCountsFromEachExecution(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := gateChecker(t, `{"scheduler": {"max_active": 1}}`, "alice", discard)
+		if rej := c.CheckStartup(maps.All(map[string]string{"statement_timeout": "1s"})); rej != nil {
+			t.Fatal(rej)
+		}
+		gate := gateOf(t, c, lookupSQL)
+
+		// A prepared statement is checked once, at Parse, and its gate is passed at every Bind.
+		time.Sleep(time.Minute)
+		if a := gate(t.Context(), explained(orderLookup, nil), false); a.Reject != nil {
+			t.Errorf("statement bound a minute after it was prepared got %v", a.Reject)
+		}
+	})
+}
+
+func TestDeadlineForgetsTheLoginTimeoutOnceTheSessionSetsItsOwn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := gateChecker(t, `{"scheduler": {"max_active": 1, "queue_timeout": "1m"}}`, "alice", discard)
+		if rej := c.CheckStartup(maps.All(map[string]string{"statement_timeout": "300"})); rej != nil {
+			t.Fatal(rej)
+		}
+		pass(t, c, "set statement_timeout = 0", costing(1), false).Release()
+		hold := pass(t, c, "select 0", costing(1), false)
+		time.AfterFunc(400*time.Millisecond, hold.Release)
+
+		// QueryGuard can't tell what the session set it to, so it no longer guesses when the client gives up.
+		if a := pass(t, c, lookupSQL, explained(orderLookup, nil), false); a.Reject != nil {
+			t.Errorf("statement after SET statement_timeout got %v; want it run once the slot came free", a.Reject)
+		}
+	})
+}
+
+func TestTransactionControlNeedsNoSlotOrBudget(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := gateChecker(t, `{"scheduler": {"max_active": 1, "queue_timeout": "1m"},
+			"tenants": {"alice": {"budget": {"rate": 1, "burst": 1, "when_over": "reject"}}}}`, "alice", discard)
+		pass(t, c, "select 0", costing(5), false)
+
+		// The slot may be held by a statement waiting on this transaction's locks, which only its COMMIT or ROLLBACK frees.
+		for _, sql := range []string{"commit", "rollback", "begin"} {
+			start := time.Now()
+			if a := pass(t, c, sql, session.Explain{}, false); a.Reject != nil || a.Release != nil || time.Since(start) != 0 {
+				t.Errorf("%s got %v and a slot %v after %v; want it run at once without one", sql, a.Reject, a.Release != nil, time.Since(start))
+			}
+		}
+	})
+}
+
 func TestBudgetWaitPastTheDeadlineIsAnsweredAtOnce(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		c := gateChecker(t, `{"tenants": {"alice": {"budget": {"rate": 100, "burst": 100}}}}`, "alice", discard)
@@ -908,7 +974,10 @@ func TestTenantMode(t *testing.T) {
 }
 
 // backend records what a Checker says its session runs.
-type backend struct{ runs []running }
+type backend struct {
+	runs     []running
+	blocking chan struct{} // closed when others wait on the session's locks; nil never is
+}
 
 type running struct {
 	tenant string
@@ -916,6 +985,60 @@ type running struct {
 }
 
 func (b *backend) Running(tenant string, ddl bool) { b.runs = append(b.runs, running{tenant, ddl}) }
+func (b *backend) Blocking() <-chan struct{}       { return b.blocking }
+
+func TestServerWideRulesGateEveryStatement(t *testing.T) {
+	for _, config := range []string{
+		`{"replication_lag": {"max": "1s"}, "tenants": {"alice": {"priority": "best_effort"}}}`,
+		`{"mvcc_horizon": {"max_age": "1m"}, "tenants": {"alice": {"priority": "best_effort"}}}`,
+	} {
+		synctest.Test(t, func(t *testing.T) {
+			c := gateChecker(t, config, "alice", discard)
+			b := &backend{}
+			c.Env.Backend = b
+			c.Env.Scheduler.HoldBestEffort(true)
+
+			// Holds and caps work at the slot a statement takes, and the horizon check finds a snapshot's tenant from what runs.
+			rej, gate := c.Check("select 1", standard)
+			if rej != nil || gate == nil {
+				t.Fatalf("%s: Check gave %v and gate %v; want a gate", config, rej, gate != nil)
+			}
+			if a := gate(t.Context(), session.Explain{}, false); codeOf(a.Reject) != "53000" || len(b.runs) != 0 {
+				t.Errorf("%s: held statement got %v and ran %v; want 53000 and nothing run", config, a.Reject, b.runs)
+			}
+			c.Env.Scheduler.HoldBestEffort(false)
+			if a := gate(t.Context(), session.Explain{}, false); a.Reject != nil || !slices.Equal(b.runs, []running{{"alice", false}}) {
+				t.Errorf("%s: got %v and ran %v; want alice's statement run", config, a.Reject, b.runs)
+			}
+		})
+	}
+}
+
+func TestSessionHoldingLocksOthersWaitOnSkipsTheQueue(t *testing.T) {
+	for name, config := range map[string]string{
+		"no slot free": `{"scheduler": {"max_active": 1, "queue_timeout": "1m"}}`,
+		"budget spent": `{"tenants": {"alice": {"budget": {"rate": 1, "burst": 1, "when_over": "queue"}}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c := gateChecker(t, config, "alice", discard)
+				b := &backend{blocking: make(chan struct{})}
+				c.Env.Backend = b
+				// The only slot, or the whole budget, goes to a statement that will wait on this session's locks.
+				pass(t, c, "select 0", costing(5), false)
+				time.AfterFunc(time.Second, func() { close(b.blocking) })
+
+				// Only this session's next statement, likely its COMMIT, can end that wait.
+				start := time.Now()
+				a := pass(t, c, lookupSQL, explained(orderLookup, nil), false)
+
+				if a.Reject != nil || time.Since(start) != time.Second {
+					t.Errorf("got %v after %v; want it run as soon as others waited on it", a.Reject, time.Since(start))
+				}
+			})
+		})
+	}
+}
 
 func TestSchedConfigWithoutAdaptive(t *testing.T) {
 	if c := mustParse(t, `{"scheduler": {"max_active": 8}}`).SchedConfig().Controller; c != nil {

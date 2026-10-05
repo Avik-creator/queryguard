@@ -390,6 +390,49 @@ func TestDDLStuckBehindALongTransactionIsCancelled(t *testing.T) {
 	expectSelectOne(t, migrator)
 }
 
+func TestSessionOthersWaitOnRunsPastAFullLane(t *testing.T) {
+	dsn := catalogDSN(t) + " dbname=queryguard"
+	direct := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
+	name := fmt.Sprintf("qg_hot_row_%d", time.Now().UnixNano())
+	mustExec(t, direct, "create table "+name+" (id int primary key, v int)")
+	t.Cleanup(func() { direct.Exec(context.Background(), "drop table "+name) })
+	mustExec(t, direct, "insert into "+name+" values (1, 0)")
+
+	var logs lockedBuffer
+	qg := startProxyWith(t, func(s *proxy.Server) {
+		s.Policy = mustPolicy(t, `{"scheduler": {"max_active": 1, "queue_timeout": "10s"}}`)
+		s.Monitor = &plan.Monitor{DSN: dsn, Interval: 100 * time.Millisecond}
+		s.Logger = slog.New(slog.NewTextHandler(io.MultiWriter(&logs, t.Output()), nil))
+	})
+	holder, waiter := qg.connect(t, "sslmode=disable"), qg.connect(t, "sslmode=disable")
+	mustExec(t, holder, "begin")
+	mustExec(t, holder, "update "+name+" set v = 1 where id = 1")
+	// The waiter takes the only slot, then waits on the holder's row lock.
+	updated := make(chan error, 1)
+	go func() {
+		_, err := waiter.Exec(context.Background(), "update "+name+" set v = 2 where id = 1")
+		updated <- err
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	// The holder's next statement needs a slot only the waiter can free, and the waiter needs the holder to commit.
+	start := time.Now()
+	var v int
+	if err := holder.QueryRow(t.Context(), "select v from "+name+" where id = 1").Scan(&v); err != nil {
+		t.Fatalf("holder's read: %v", err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("the holder waited %v; want it let in within a second or so, not after the 10s queue timeout", took)
+	}
+	mustExec(t, holder, "commit")
+	if err := <-updated; err != nil {
+		t.Errorf("waiter's update: %v", err)
+	}
+	if !strings.Contains(logs.String(), "let in a statement of a session others wait on") {
+		t.Errorf("log %q; want the holder let in", logs.String())
+	}
+}
+
 func TestOldSnapshotLimitsItsTenantWhileTheQueueBloats(t *testing.T) {
 	dsn := catalogDSN(t) + " dbname=queryguard"
 	direct := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")

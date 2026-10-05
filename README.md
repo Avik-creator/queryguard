@@ -5,11 +5,13 @@ speaks the Postgres wire protocol. It estimates what each query will cost before
 it runs and gives every tenant a budget, so one tenant's expensive queries can't
 starve everyone else.
 
-> **Status:** early development. Milestones M1 to M5 are done: QueryGuard
+> **Status:** early development. Milestones M1 to M6 are done: QueryGuard
 > relays sessions, cancel requests and TLS; blocks statements by rule or by
 > their planned cost; gives each tenant a cost budget, a fair share of the
-> server and time limits; and learns from how long statements take, to
-> correct their costs and to catch plans that suddenly get worse.
+> server and time limits; learns from how long statements take, to correct
+> their costs and to catch plans that suddenly get worse; and adapts to the
+> server's load, cancels DDL stuck in a lock queue, and shares its limits
+> across instances.
 
 ## Planned features
 
@@ -229,7 +231,9 @@ CREATE ROLE queryguard_catalog LOGIN PASSWORD '…' IN ROLE pg_monitor;
 ```
 
 A reading that fails is logged and skipped, and the connection is opened
-again for the next one.
+again for the next one. After three failures in a row QueryGuard acts as if
+nothing were happening, so a hold or a cap set from an old reading doesn't
+outlast it.
 
 ### DDL that waits on a lock
 
@@ -259,7 +263,7 @@ about a second behind the DDL before it is cancelled.
 While any standby's `replay_lag` is over `max`, best-effort statements wait
 for a slot however many are free, as Vitess's throttler holds back backfills,
 and fail with `53000` after their queue timeout. Other statements run as
-before. Logical replication slots and standbys that only stream WAL to an
+before. This and `mvcc_horizon` need no other scheduler setting. Logical replication slots and standbys that only stream WAL to an
 archive count too, since they show up in `pg_stat_replication`.
 
 ### Old snapshots
@@ -347,6 +351,21 @@ that finds no slot within its lane's `queue_timeout` fails with `53000`. A
 session holds one slot until PostgreSQL has answered everything it sent, so
 a pipeline needs just one.
 
+### Transactions and locks
+
+`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` and the like never wait for a
+budget or a slot. They do no work of their own, and the slot they would wait
+for may be held by a statement waiting on the very locks that the `COMMIT`
+would let go.
+
+The same knot can tie up any statement. A transaction updates a row and goes
+idle, which frees its slot. Another session takes the last slot and waits on
+that row. Now the first transaction's next statement waits for a slot that
+only it can free. With server activity on, QueryGuard sees which sessions
+others wait on, and lets their statements past every limit, budget and hold,
+within about a second. A budget is still charged, so the tenant pays for them
+later.
+
 ### Queues under overload
 
 Normally the fast lane's queue is first in, first out among equals. Once it
@@ -370,12 +389,14 @@ first out.
 A statement whose client will have given up before it could end is answered
 at once with `57014` instead of being run. Its deadline is the sooner of the
 `statement_timeout` the client set at login (in its connection string or
-`options`) and a `/*deadline='250ms'*/` tag, counted from when QueryGuard
-reads the statement, since a client's time limit covers the time it queues
-too. Once its plan has run five times, it must also start early enough to
+`options`) and a `/*deadline='250ms'*/` tag, counted from when the statement
+is sent to run, since a client's time limit covers the time it queues too.
+Each execution of a prepared statement starts its own count. Once its plan has run five times, it must also start early enough to
 end in its usual time, so a statement that usually takes a second and has
 half a second left fails before it is run. Waits for a slot and for a budget
-both stop at the deadline. A `SET statement_timeout` after login isn't seen.
+both stop at the deadline. Once the session changes `statement_timeout`
+itself, with `SET`, `RESET` or `set_config`, QueryGuard can't know the new
+value, so only the tag counts from then on.
 
 ### Adaptive limit
 
@@ -393,7 +414,10 @@ control does (AIMD: additive increase, multiplicative decrease):
   waits on locks. The limit is then multiplied by `backoff` (0.9), and drops
   by at least one.
 - **Calm and full**: when every slot was taken at some point in a calm
-  second, the limit grows by one.
+  second in which statements finished, the limit grows by one. A statement
+  without a usual time yet still counts as finished. A second in which
+  nothing finished leaves the limit alone, since slots held by stuck
+  statements say nothing about room for more.
 - Otherwise it stays where it is, so a quiet server doesn't drift back to
   the ceiling before the load that needs it.
 
@@ -440,7 +464,7 @@ QueryGuard:
   -state-dsn "host=db.internal dbname=queryguard_state user=queryguard" -max-instances 4
 ```
 
-Every second each instance tells the store, two UNLOGGED tables in that
+Every second each instance tells the store, three small tables in that
 database, how much of each budget and lane it used, and gets a lease of its
 share for 10 seconds, as YouTube's Doorman does: what it asks for plus an even
 part of what is spare, or a part in proportion to what it asks when the
@@ -455,9 +479,17 @@ it, for a minute after its last lease; then it stops admitting statements that
 count against a shared limit until the store is back. Losing the store or an
 instance so never admits more than the total. A new instance waits up to two
 seconds for its first lease before it accepts connections. QueryGuard creates
-the tables itself, and a crash of their server empties them, which the fleet
-sees as a lost store. `-max-instances` must be the same everywhere and at
-least the number of instances.
+the tables itself. They are ordinary logged tables, since a crash or failover
+that lost them would let the store hand out again what instances still hold.
+`-max-instances` must be the same everywhere and at least the number of
+instances, and an instance logs a warning when it sees more.
+
+Slots are leased in whole numbers. With fewer slots in a lane than instances,
+some instances hold one and the others none, rather than all of them getting
+a fraction that rounds down to nothing. A smaller lease doesn't stop
+statements already running, so the store counts the slots an instance reports
+in use until they end. A tenant whose budget share is zero on an instance
+still asks for a part of it there.
 
 Each instance's cancel keys carry its ID in the fleet, so a cancel request the
 load balancer sends to another instance is passed on to the one that owns the
