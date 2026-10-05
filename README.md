@@ -534,9 +534,12 @@ statement whose rows are spread over the disk, or that waits on locks, takes
 longer per unit than one reading cached pages in order. For each plan,
 QueryGuard averages the time per cost unit over its last 50 or so runs of
 5 ms or more, and charges budgets the planned cost times that plan's time per
-unit over the server's. The server's is averaged over all such runs, in log
-terms and weighted by cost, so a cheap statement that waited long on a lock
-barely moves it. A quicker run is mostly the round trip and the work every
+unit over the server's. Each tenant's runs are averaged in log terms and
+weighted by cost, so a cheap statement that waited long on a lock barely
+moves it. The server's is the mean of the tenants' averages, each counting
+for its runs up to 100, so one busy tenant whose statements run slow, on its
+own locks say, can't move every other tenant's costs and charges toward its
+own. A quicker run is mostly the round trip and the work every
 statement does, and would make long plans look cheap next to it;
 `min_charge` covers it instead. A plan seen only a
 few times leans on the server's average instead: its own timing counts for

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"strconv"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -222,8 +223,8 @@ func TestHistoryCalibratesByMeasuredTime(t *testing.T) {
 		tune := Tuning{Credibility: tc.credibility}
 		fast, slow := Plan{Cost: 100, Shape: 1}, Plan{Cost: 100, Shape: 2}
 		for range 10 {
-			h.Ran("fast", fast, 10*time.Millisecond, true, tune)
-			h.Ran("slow", slow, 100*time.Millisecond, true, tune)
+			h.Ran("", "fast", fast, 10*time.Millisecond, true, tune)
+			h.Ran("", "slow", slow, 100*time.Millisecond, true, tune)
 		}
 
 		// Averaged in log terms, a cost unit takes 316µs; fast takes about 3.16 times less, slow 3.16 times more.
@@ -242,8 +243,8 @@ func TestHistoryLearnsCostOnlyFromLongRuns(t *testing.T) {
 	var h History
 	quick, long := Plan{Cost: 100, Shape: 1}, Plan{Cost: 100, Shape: 2}
 	for range 10 {
-		h.Ran("quick", quick, time.Millisecond, true, Tuning{})
-		h.Ran("long", long, 100*time.Millisecond, true, Tuning{})
+		h.Ran("", "quick", quick, time.Millisecond, true, Tuning{})
+		h.Ran("", "long", long, 100*time.Millisecond, true, Tuning{})
 	}
 
 	// A run of a millisecond is mostly the round trip and the work every statement does, so it says little about its plan.
@@ -256,12 +257,12 @@ func TestHistoryServerTimingWeighsRunsByCost(t *testing.T) {
 	var h History
 	big := Plan{Cost: 100_000, Shape: 1}
 	for range 10 {
-		h.Ran("big", big, time.Second, true, Tuning{})
+		h.Ran("", "big", big, time.Second, true, Tuning{})
 	}
 	before := h.Judge("big", big, Tuning{}).Factor
 
 	// A cheap statement that waited ten seconds on a lock says little about how fast the server works through cost units.
-	h.Ran("cheap", Plan{Cost: 1, Shape: 2}, 10*time.Second, true, Tuning{})
+	h.Ran("", "cheap", Plan{Cost: 1, Shape: 2}, 10*time.Second, true, Tuning{})
 
 	if after := h.Judge("big", big, Tuning{}).Factor; math.Abs(after-before) > 0.01 {
 		t.Errorf("factor %v, then %v after one cheap statement's long wait; want it about the same", before, after)
@@ -274,7 +275,7 @@ func TestHistoryCostOfTime(t *testing.T) {
 		t.Errorf("CostOf with nothing learned = %v; want unknown", c)
 	}
 	for range 10 {
-		h.Ran("s", Plan{Cost: 1000, Shape: 1}, 100*time.Millisecond, true, Tuning{})
+		h.Ran("", "s", Plan{Cost: 1000, Shape: 1}, 100*time.Millisecond, true, Tuning{})
 	}
 
 	// 1000 cost units take 0.1s on this server, so a second is worth 10000 of them.
@@ -283,12 +284,40 @@ func TestHistoryCostOfTime(t *testing.T) {
 	}
 }
 
+func TestOneTenantsRunsCountNoMoreThanAnothersInTheServerTiming(t *testing.T) {
+	var h History
+	for range 200 {
+		h.Ran("shop", "s", Plan{Cost: 1000, Shape: 1}, 100*time.Millisecond, true, Tuning{})
+	}
+	// Ten times the runs, each a hundred times slower per cost unit, as a tenant stuck on its own locks would be.
+	for range 2000 {
+		h.Ran("rogue", "r", Plan{Cost: 1000, Shape: 1}, 10*time.Second, true, Tuning{})
+	}
+
+	// Counted alike, 0.1s and 10s per 1000 units meet at 1s, so a second is worth 1000 units.
+	if c, ok := h.CostOf(time.Second); !ok || math.Abs(c-1000) > 10 {
+		t.Errorf("CostOf(1s) = %v, %v; want 1000, each tenant's timing counting the same", c, ok)
+	}
+}
+
+func TestATenantWithFewRunsCountsForLess(t *testing.T) {
+	var h History
+	for range 200 {
+		h.Ran("shop", "s", Plan{Cost: 1000, Shape: 1}, 100*time.Millisecond, true, Tuning{})
+	}
+	h.Ran("new", "n", Plan{Cost: 1000, Shape: 1}, 10*time.Second, true, Tuning{})
+
+	if c, ok := h.CostOf(time.Second); !ok || c < 9000 {
+		t.Errorf("CostOf(1s) = %v, %v; want near 10000, one run of a new tenant moving it little", c, ok)
+	}
+}
+
 func TestHistoryNewPlanLearnsItsOwnFactor(t *testing.T) {
 	var h History
 	p := mustParse(t, lookup)
 	for range 10 {
-		h.Ran("a", p, time.Millisecond, true, Tuning{})
-		h.Ran("b", Plan{Cost: 100, Shape: 7}, 100*time.Millisecond, true, Tuning{})
+		h.Ran("", "a", p, time.Millisecond, true, Tuning{})
+		h.Ran("", "b", Plan{Cost: 100, Shape: 7}, 100*time.Millisecond, true, Tuning{})
 	}
 
 	if f := h.Judge("a", mustParse(t, fullRead), Tuning{}).Factor; f != 1 {
@@ -300,12 +329,12 @@ func TestHistoryFlagsIndexScanTurningIntoFullRead(t *testing.T) {
 	var h History
 	usual, full := mustParse(t, lookup), mustParse(t, fullRead)
 	for range minRuns - 1 {
-		h.Ran("a", usual, time.Millisecond, true, Tuning{})
+		h.Ran("", "a", usual, time.Millisecond, true, Tuning{})
 	}
 	if v := h.Judge("a", full, Tuning{}); v.Flip != "" {
 		t.Errorf("flagged %q after %d runs; want a flip only after %d", v.Flip, minRuns-1, minRuns)
 	}
-	h.Ran("a", usual, time.Millisecond, true, Tuning{})
+	h.Ran("", "a", usual, time.Millisecond, true, Tuning{})
 
 	first, again, back := h.Judge("a", full, Tuning{}), h.Judge("a", full, Tuning{}), h.Judge("a", usual, Tuning{})
 
@@ -321,16 +350,16 @@ func TestHistoryTakesPlanForOtherValuesAsAnAlternative(t *testing.T) {
 	var h History
 	usual, full := mustParse(t, lookup), mustParse(t, fullRead)
 	for range minRuns {
-		h.Ran("a", usual, time.Millisecond, true, Tuning{})
+		h.Ran("", "a", usual, time.Millisecond, true, Tuning{})
 	}
 
 	// A common value reads the table in full while rare ones keep using the index: that is data, not a regression.
 	var flagged []bool
 	for range minRuns + 1 {
 		flagged = append(flagged, h.Judge("a", full, Tuning{}).Flip != "")
-		h.Ran("a", full, time.Second, true, Tuning{})
+		h.Ran("", "a", full, time.Second, true, Tuning{})
 		h.Judge("a", usual, Tuning{})
-		h.Ran("a", usual, time.Millisecond, true, Tuning{})
+		h.Ran("", "a", usual, time.Millisecond, true, Tuning{})
 	}
 
 	if !flagged[0] || flagged[minRuns] {
@@ -342,7 +371,7 @@ func TestHistoryTakesPlanForOtherValuesAsAnAlternative(t *testing.T) {
 func TestHistoryDoesNotFlagABetterPlan(t *testing.T) {
 	var h History
 	for range minRuns {
-		h.Ran("a", mustParse(t, fullRead), time.Second, true, Tuning{})
+		h.Ran("", "a", mustParse(t, fullRead), time.Second, true, Tuning{})
 	}
 	if v := h.Judge("a", mustParse(t, lookup), Tuning{}); v.Flip != "" {
 		t.Errorf("an index scan replacing a full read was flagged: %q", v.Flip)
@@ -355,14 +384,14 @@ func TestHistoryTakesANewPlanAsUsualAfterQuarantine(t *testing.T) {
 		tune := Tuning{Quarantine: 10 * time.Minute}
 		usual, full := mustParse(t, lookup), mustParse(t, fullRead)
 		for range 10 {
-			h.Ran("a", usual, time.Millisecond, true, tune)
+			h.Ran("", "a", usual, time.Millisecond, true, tune)
 		}
 
 		var flagged []bool
 		for range 30 {
 			time.Sleep(time.Minute)
 			flagged = append(flagged, h.Judge("a", full, tune).Flip != "")
-			h.Ran("a", full, time.Second, true, tune)
+			h.Ran("", "a", full, time.Second, true, tune)
 		}
 
 		// The old plan's runs fade with the quarantine as half-life, so the new one outweighs them in about that time.
@@ -375,18 +404,18 @@ func TestHistoryTakesANewPlanAsUsualAfterQuarantine(t *testing.T) {
 func TestHistoryFlagsRunFarSlowerThanPlanned(t *testing.T) {
 	var h History
 	p := mustParse(t, lookup)
-	if h.Ran("a", p, time.Millisecond, true, Tuning{}) || h.Ran("a", p, 5*time.Second, true, Tuning{}) {
+	if h.Ran("", "a", p, time.Millisecond, true, Tuning{}) || h.Ran("", "a", p, 5*time.Second, true, Tuning{}) {
 		t.Fatal("a slow run was flagged before the plan had a timing to compare with")
 	}
 	h = History{}
 	for range minRuns {
-		h.Ran("a", p, time.Millisecond, true, Tuning{})
+		h.Ran("", "a", p, time.Millisecond, true, Tuning{})
 	}
 
-	slow := h.Ran("a", p, 2*time.Second, true, Tuning{})
+	slow := h.Ran("", "a", p, 2*time.Second, true, Tuning{})
 	flagged := h.Judge("a", p, Tuning{})
-	again := h.Ran("a", p, 2*time.Second, true, Tuning{})
-	h.Ran("a", p, time.Millisecond, true, Tuning{})
+	again := h.Ran("", "a", p, 2*time.Second, true, Tuning{})
+	h.Ran("", "a", p, time.Millisecond, true, Tuning{})
 	cleared := h.Judge("a", p, Tuning{})
 
 	// Only the run that turns the plan slow is reported, so a plan that stays slow isn't reported on every run.
@@ -400,11 +429,11 @@ func TestHistoryDoesNotFlagShortSlowRun(t *testing.T) {
 	var h History
 	p := mustParse(t, lookup)
 	for range minRuns {
-		h.Ran("a", p, time.Millisecond, true, Tuning{})
+		h.Ran("", "a", p, time.Millisecond, true, Tuning{})
 	}
 
 	// Under load a lookup now and then takes tens of milliseconds, which is no reason to move it to the slow lane.
-	if h.Ran("a", p, 50*time.Millisecond, true, Tuning{}) || h.Judge("a", p, Tuning{}).Flip != "" {
+	if h.Ran("", "a", p, 50*time.Millisecond, true, Tuning{}) || h.Judge("a", p, Tuning{}).Flip != "" {
 		t.Error("a run 50 times slower than usual but only 50ms long was flagged")
 	}
 }
@@ -413,13 +442,13 @@ func TestHistoryUnfinishedRunCountsOnlyWhenSlow(t *testing.T) {
 	var h History
 	p := mustParse(t, lookup)
 	for range minRuns {
-		h.Ran("a", p, 10*time.Millisecond, true, Tuning{})
-		h.Ran("b", Plan{Cost: 1, Shape: 1}, time.Second, true, Tuning{})
+		h.Ran("", "a", p, 10*time.Millisecond, true, Tuning{})
+		h.Ran("", "b", Plan{Cost: 1, Shape: 1}, time.Second, true, Tuning{})
 	}
 	before := h.Judge("a", p, Tuning{}).Factor
 
-	quick := h.Ran("a", p, 30*time.Millisecond, false, Tuning{})
-	timedOut := h.Ran("a", p, 30*time.Second, false, Tuning{})
+	quick := h.Ran("", "a", p, 30*time.Millisecond, false, Tuning{})
+	timedOut := h.Ran("", "a", p, 30*time.Second, false, Tuning{})
 
 	// A failed run says nothing about the plan's timing, unless it ran far too long first, as a cancelled one does.
 	if before == 1 {
@@ -435,12 +464,12 @@ func TestHistoryIgnoresRunOfUnknownLength(t *testing.T) {
 	var h History
 	p := mustParse(t, lookup)
 	for range minRuns {
-		h.Ran("a", p, 10*time.Millisecond, true, Tuning{})
-		h.Ran("b", Plan{Cost: 1, Shape: 1}, time.Second, true, Tuning{})
+		h.Ran("", "a", p, 10*time.Millisecond, true, Tuning{})
+		h.Ran("", "b", Plan{Cost: 1, Shape: 1}, time.Second, true, Tuning{})
 	}
 	before := h.Judge("a", p, Tuning{}).Factor
 
-	h.Ran("a", p, 0, true, Tuning{})
+	h.Ran("", "a", p, 0, true, Tuning{})
 
 	if after := h.Judge("a", p, Tuning{}).Factor; after != before {
 		t.Errorf("factor %v, then %v after a run of unknown length; want it unchanged", before, after)
@@ -450,7 +479,7 @@ func TestHistoryIgnoresRunOfUnknownLength(t *testing.T) {
 func TestHistoryStaysWithinSize(t *testing.T) {
 	h := History{Size: 2}
 	for _, key := range []string{"a", "b", "c", "d"} {
-		h.Ran(key, Plan{Cost: 1, Shape: 1}, time.Millisecond, true, Tuning{})
+		h.Ran("", key, Plan{Cost: 1, Shape: 1}, time.Millisecond, true, Tuning{})
 	}
 	if n := len(h.statements); n > 2 {
 		t.Errorf("history holds %d statements; want at most 2", n)
@@ -640,4 +669,15 @@ func TestMonitorReadsTheWatchedTables(t *testing.T) {
 			t.Errorf("read asked for %v; want the watched tables", got)
 		}
 	})
+}
+
+func TestHistoryKeepsTheTimingOfBoundedTenants(t *testing.T) {
+	var h History
+	for i := range maxTenants + 10 {
+		h.Ran(strconv.Itoa(i), "s", Plan{Cost: 1000, Shape: 1}, 100*time.Millisecond, true, Tuning{})
+	}
+
+	if n := len(h.tenants); n > maxTenants {
+		t.Errorf("History keeps %d tenants' timing; want at most %d", n, maxTenants)
+	}
 }

@@ -830,7 +830,7 @@ func TestBlockerPaysForTheWaitsItCauses(t *testing.T) {
 		s := &Server{Logger: slog.New(slog.DiscardHandler)}
 		// 1000 cost units take 0.1s here, so a second of waiting is worth 10000.
 		for range 10 {
-			s.History.Ran("s", plan.Plan{Cost: 1000}, 100*time.Millisecond, true, plan.Tuning{})
+			s.History.Ran("", "s", plan.Plan{Cost: 1000}, 100*time.Millisecond, true, plan.Tuning{})
 		}
 		s.SetPolicy(mustPolicy(t, `{"tenants": {"waiter": {"budget": {"rate": 1, "burst": 20000, "when_over": "reject"}},
 			"holder": {"budget": {"rate": 1, "burst": 15000, "when_over": "reject"}}}}`))
@@ -882,7 +882,7 @@ func TestBlockerPaysCanBeTurnedOff(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := &Server{Logger: slog.New(slog.DiscardHandler)}
 		for range 10 {
-			s.History.Ran("s", plan.Plan{Cost: 1000}, 100*time.Millisecond, true, plan.Tuning{})
+			s.History.Ran("", "s", plan.Plan{Cost: 1000}, 100*time.Millisecond, true, plan.Tuning{})
 		}
 		s.SetPolicy(mustPolicy(t, `{"scheduler": {"blocker_pays": "off"}, "tenants": {"holder": {"budget": {"rate": 1, "burst": 15000, "when_over": "reject"}}}}`))
 		waiter, holder := &backend{}, &backend{}

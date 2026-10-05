@@ -33,10 +33,13 @@ const (
 const (
 	minRuns      = 5    // runs of a plan before a change from it, or a run far slower than it, is flagged
 	planWindow   = 50   // runs a plan's timing is averaged over
-	globalWindow = 1000 // runs the server's timing is averaged over
-	maxFactor    = 100  // the most a statement's timing moves its cost either way
-	maxShapes    = 8    // plans remembered for each statement
-	slowRatio    = 10   // a run this many times slower than its plan's usual timing is flagged
+	globalWindow = 1000 // runs a tenant's timing is averaged over
+	// tenantRuns is how many runs a tenant's timing needs to count fully in the server's; past it, no tenant counts more than another.
+	tenantRuns = 100
+	maxTenants = 1000 // tenants whose timing is kept; the one least recently run goes first
+	maxFactor  = 100  // the most a statement's timing moves its cost either way
+	maxShapes  = 8    // plans remembered for each statement
+	slowRatio  = 10   // a run this many times slower than its plan's usual timing is flagged
 	// slowFloor is the shortest run flagged as slow: under load a quick statement now and then takes tens of milliseconds.
 	slowFloor = 100 * time.Millisecond
 	// learnFloor is the shortest run costs are learned from: a quicker one is mostly the round trip and the work every
@@ -221,7 +224,7 @@ type History struct {
 
 	mu         sync.Mutex
 	statements map[string]*statement
-	server     timing // finished runs long enough to learn from, so a plan's timing is judged against the server's
+	tenants    map[string]*timing // each tenant's finished runs long enough to learn from; together they are the server's timing
 }
 
 // Tuning sets how History judges; it comes with each call, so a reloaded config applies at once.
@@ -264,6 +267,7 @@ type shape struct {
 type timing struct {
 	logRatio, cost float64 // averages of cost × ln(seconds ÷ cost) and of cost
 	runs           int
+	used           time.Time
 }
 
 // Judge returns what History makes of key about to run with p.
@@ -294,9 +298,9 @@ func (h *History) Judge(key string, p Plan, t Tuning) Verdict {
 	return v
 }
 
-// Ran records that key ran with p for took, finished or not, and reports whether that run made p slow: far slower than it usually runs,
-// when the run before wasn't. A took of 0 is unknown.
-func (h *History) Ran(key string, p Plan, took time.Duration, finished bool, t Tuning) (turnedSlow bool) {
+// Ran records that key ran for tenant with p for took, finished or not, and reports whether that run made p slow: far slower than
+// it usually runs, when the run before wasn't. A took of 0 is unknown.
+func (h *History) Ran(tenant, key string, p Plan, took time.Duration, finished bool, t Tuning) (turnedSlow bool) {
 	if took <= 0 {
 		return false
 	}
@@ -320,19 +324,58 @@ func (h *History) Ran(key string, p Plan, took time.Duration, finished bool, t T
 	if took >= learnFloor {
 		sh.costSamples++
 		sh.costRatio += (ratio - sh.costRatio) / float64(min(sh.costSamples, planWindow))
-		h.server.add(ratio, max(p.Cost, 1))
+		h.tenant(tenant).add(ratio, max(p.Cost, 1))
 	}
 	return turnedSlow
 }
 
 // factor blends sh's timing with the server's by credibility n/(n+m), as Bühlmann's formula does; the caller holds mu.
 func (h *History) factor(sh *shape, t Tuning) float64 {
-	if h.server.runs == 0 || sh.costSamples == 0 {
+	server, ok := h.server()
+	if !ok || sh.costSamples == 0 {
 		return 1
 	}
 	z := float64(sh.costSamples) / (float64(sh.costSamples) + cmp.Or(t.Credibility, DefaultCredibility))
-	f := math.Exp(z * (sh.costRatio - h.server.logRatio/h.server.cost))
+	f := math.Exp(z * (sh.costRatio - server))
 	return min(max(f, 1.0/maxFactor), maxFactor)
+}
+
+// server returns the server's mean ln(seconds ÷ cost), each tenant's weighing by its runs up to tenantRuns, so one busy tenant
+// can't drag every other tenant's costs and charges toward its own; false before any run; the caller holds mu.
+func (h *History) server() (float64, bool) {
+	var sum, weight float64
+	for _, g := range h.tenants {
+		w := float64(min(g.runs, tenantRuns))
+		sum += w * g.logRatio / g.cost
+		weight += w
+	}
+	if weight == 0 {
+		return 0, false
+	}
+	return sum / weight, true
+}
+
+// tenant returns tenant's timing, making it, and room for it, when new; the caller holds mu.
+func (h *History) tenant(tenant string) *timing {
+	if h.tenants == nil {
+		h.tenants = map[string]*timing{}
+	}
+	g := h.tenants[tenant]
+	if g == nil {
+		if len(h.tenants) >= maxTenants {
+			var oldest string
+			for k, o := range h.tenants {
+				if oldest == "" || o.used.Before(h.tenants[oldest].used) {
+					oldest = k
+				}
+			}
+			delete(h.tenants, oldest)
+		}
+		g = &timing{}
+		h.tenants[tenant] = g
+	}
+	g.used = time.Now()
+	return g
 }
 
 // statement returns key's record, making it, and room for it, when new; the caller holds mu.
@@ -730,8 +773,9 @@ func (r *activityReader) query(ctx context.Context, watch []Table) (Activity, er
 func (h *History) CostOf(d time.Duration) (float64, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.server.runs == 0 {
+	server, ok := h.server()
+	if !ok {
 		return 0, false
 	}
-	return d.Seconds() / math.Exp(h.server.logRatio/h.server.cost), true
+	return d.Seconds() / math.Exp(server), true
 }

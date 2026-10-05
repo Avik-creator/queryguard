@@ -1014,7 +1014,7 @@ func (c *Checker) learn(p *Policy, sql, fingerprint string, who subject, warn bo
 				s.TrueUp(who.tenant, cost, actual)
 			}
 		}
-		if !history.Ran(key, pl, took, finished, tune) {
+		if !history.Ran(who.tenant, key, pl, took, finished, tune) {
 			return
 		}
 		// The cached plan may be out of date, as after an index was dropped, so the statement is explained again.
