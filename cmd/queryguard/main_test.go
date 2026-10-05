@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Avik-creator/queryguard/internal/testcert"
+	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/proxy"
 )
@@ -117,6 +118,16 @@ func TestNewCatalog(t *testing.T) {
 	}
 	if c, err := newCatalog("host=db user=qg_monitor", scans, nil); c == nil || err != nil || c.DSN != "host=db user=qg_monitor" {
 		t.Errorf("valid -catalog-dsn gave %+v, %v", c, err)
+	}
+}
+
+func TestNewMonitor(t *testing.T) {
+	if m := newMonitor(nil, nil); m != nil {
+		t.Errorf("no -catalog-dsn gave monitor %v; want none", m)
+	}
+	m, ok := newMonitor(&plan.Catalog{DSN: "host=db user=qg_monitor"}, nil).(*plan.Monitor)
+	if !ok || m.DSN != "host=db user=qg_monitor" {
+		t.Errorf("monitor %+v; want one reading over -catalog-dsn", m)
 	}
 }
 

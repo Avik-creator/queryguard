@@ -287,6 +287,77 @@ func TestCatalogSeesStaleStatistics(t *testing.T) {
 	}
 }
 
+func TestMonitorSeesLockWaitsAndTheOldestSnapshot(t *testing.T) {
+	dsn := catalogDSN(t) + " dbname=queryguard"
+	upstream := os.Getenv("QG_TEST_UPSTREAM")
+	holder, locker, waiter, setup := connectTo(t, upstream, "sslmode=disable"), connectTo(t, upstream, "sslmode=disable"),
+		connectTo(t, upstream, "sslmode=disable"), connectTo(t, upstream, "sslmode=disable")
+	name := fmt.Sprintf("qg_monitor_%d", time.Now().UnixNano())
+	mustExec(t, setup, "create table "+name+" (id int)")
+	t.Cleanup(func() { setup.Exec(context.Background(), "drop table "+name) })
+	holderPID, lockerPID, waiterPID := pidOf(t, holder), pidOf(t, locker), pidOf(t, waiter)
+
+	// holder's snapshot predates an assigned transaction ID, so it is the oldest.
+	mustExec(t, holder, "begin isolation level repeatable read")
+	mustExec(t, holder, "select 1")
+	mustExec(t, setup, "select txid_current()")
+	mustExec(t, locker, "begin")
+	mustExec(t, locker, "lock table "+name+" in access exclusive mode")
+	waited := make(chan error, 1)
+	go func() {
+		_, err := waiter.Exec(context.Background(), "select * from "+name)
+		waited <- err
+	}()
+	t.Cleanup(func() {
+		locker.Exec(context.Background(), "rollback")
+		<-waited
+	})
+
+	table := plan.Table{Schema: "public", Name: name}
+	m := &plan.Monitor{DSN: dsn, Interval: 100 * time.Millisecond, Watch: func() []plan.Table { return []plan.Table{table} }}
+	ctx, stop := context.WithCancel(t.Context())
+	defer stop()
+	seen := make(chan plan.Activity, 100)
+	go m.Run(ctx, func(a plan.Activity) {
+		if len(a.Waiting) > 0 {
+			select {
+			case seen <- a:
+			default:
+			}
+		}
+	})
+	var a plan.Activity
+	select {
+	case a = <-seen:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the monitor saw no lock wait in 10s")
+	}
+
+	w, ok := a.Waiting[waiterPID]
+	if !ok || !slices.Contains(w.Blockers, lockerPID) {
+		t.Errorf("waiting %+v; want the waiter, blocked by the locker", a.Waiting)
+	}
+	if a.Horizon.PID != holderPID || a.Horizon.Age <= 0 {
+		t.Errorf("horizon %+v; want the repeatable read transaction's backend", a.Horizon)
+	}
+	if _, ok := a.DeadTuples[table]; !ok {
+		t.Errorf("dead tuples %v; want the watched table", a.DeadTuples)
+	}
+	if a.ReplicationLag != 0 {
+		t.Errorf("replication lag %v; want 0 without standbys", a.ReplicationLag)
+	}
+}
+
+// pidOf returns conn's backend process ID.
+func pidOf(t testing.TB, conn *pgx.Conn) int32 {
+	t.Helper()
+	var pid int32
+	if err := conn.QueryRow(t.Context(), "select pg_backend_pid()").Scan(&pid); err != nil {
+		t.Fatal(err)
+	}
+	return pid
+}
+
 func TestBudgetRejectsTenantThatSpentIt(t *testing.T) {
 	// Each statement costs at least 100 units, and 250 are saved up, so the fourth finds the budget spent.
 	conn := startPolicyProxy(t, `{"tenants": {"postgres": {"budget": {"rate": 1, "burst": 250, "min_charge": 100, "when_over": "reject"}}}}`).

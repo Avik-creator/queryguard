@@ -690,6 +690,42 @@ func TestServeAdjustsTheLimit(t *testing.T) {
 	}
 }
 
+func TestFeedsLockWaitsToTheScheduler(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		waiting := map[int32]plan.Wait{1: {}, 2: {}, 3: {}, 4: {}}
+		s := &Server{Upstream: Dialer{Addr: "unused"}, Logger: slog.New(slog.DiscardHandler),
+			Policy:  mustPolicy(t, `{"scheduler": {"max_active": 8, "adaptive": {"floor": 2}}}`),
+			Monitor: fakeMonitor{plan.Activity{Waiting: waiting}}}
+		ctx, stop := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- s.Serve(ctx, newIdleListener()) }()
+
+		time.Sleep(sched.AdjustInterval + time.Millisecond)
+		synctest.Wait()
+
+		// Four of eight slots wait on locks, more than a quarter, so the limit backs off.
+		if got := s.scheduler().Limit(); got != 7 {
+			t.Errorf("limit = %d; want 7", got)
+		}
+		stop()
+		<-done
+	})
+}
+
+// fakeMonitor reports the same activity every second.
+type fakeMonitor struct{ a plan.Activity }
+
+func (m fakeMonitor) Run(ctx context.Context, report func(plan.Activity)) {
+	for {
+		report(m.a)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
 // idleListener accepts nothing until it is closed, without touching the network, so it works in a synctest bubble.
 type idleListener struct{ closed chan struct{} }
 

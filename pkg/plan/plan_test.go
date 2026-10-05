@@ -3,9 +3,11 @@ package plan
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"math"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -504,4 +506,95 @@ func TestCatalogStaleTables(t *testing.T) {
 	if _, ok := c.Rows("shop", Table{"public", "new"}); ok {
 		t.Error("a table never analyzed has a size")
 	}
+}
+
+func TestMonitorReportsEachInterval(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		m := &Monitor{read: func(context.Context, []Table) (Activity, error) {
+			return Activity{Waiting: map[int32]Wait{7: {Blockers: []int32{3}}}}, nil
+		}}
+		var reports atomic.Int32
+		go m.Run(t.Context(), func(a Activity) {
+			if a.LockWaits() == 1 {
+				reports.Add(1)
+			}
+		})
+
+		time.Sleep(3*DefaultMonitorInterval + time.Millisecond)
+
+		if n := reports.Load(); n != 3 {
+			t.Errorf("%d reports of one lock wait in 3 intervals; want 3", n)
+		}
+	})
+}
+
+func TestMonitorTurnsFinishedLockWaitTimeIntoARate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// pg_stat_lock's wait_time grows by the milliseconds of each lock wait that ended, so 2s more in 1s is two sessions waiting.
+		totals := []float64{100, 600, 2600}
+		var polls atomic.Int32
+		m := &Monitor{read: func(context.Context, []Table) (Activity, error) {
+			return Activity{finishedWaitMS: totals[min(int(polls.Add(1)), len(totals))-1]}, nil
+		}}
+		var mu sync.Mutex
+		var got []int
+		go m.Run(t.Context(), func(a Activity) {
+			mu.Lock()
+			defer mu.Unlock()
+			got = append(got, a.LockWaits())
+		})
+
+		time.Sleep(3*DefaultMonitorInterval + time.Millisecond)
+
+		mu.Lock()
+		defer mu.Unlock()
+		if !slices.Equal(got, []int{0, 1, 2}) {
+			t.Errorf("lock waits %v; want 0 with nothing to compare, then 1 (0.5 rounded), then 2", got)
+		}
+	})
+}
+
+func TestMonitorSkipsFailedReads(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var polls atomic.Int32
+		m := &Monitor{Log: slog.New(slog.DiscardHandler), read: func(context.Context, []Table) (Activity, error) {
+			if polls.Add(1) == 1 {
+				return Activity{}, errors.New("connection refused")
+			}
+			return Activity{ReplicationLag: time.Second}, nil
+		}}
+		var reports []Activity
+		var mu sync.Mutex
+		go m.Run(t.Context(), func(a Activity) {
+			mu.Lock()
+			defer mu.Unlock()
+			reports = append(reports, a)
+		})
+
+		time.Sleep(2*DefaultMonitorInterval + time.Millisecond)
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(reports) != 1 || reports[0].ReplicationLag != time.Second {
+			t.Errorf("reports %+v; want only the one read that worked", reports)
+		}
+	})
+}
+
+func TestMonitorReadsTheWatchedTables(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		jobs := Table{"public", "jobs"}
+		var asked atomic.Pointer[[]Table]
+		m := &Monitor{Watch: func() []Table { return []Table{jobs} }, read: func(_ context.Context, watch []Table) (Activity, error) {
+			asked.Store(&watch)
+			return Activity{}, nil
+		}}
+		go m.Run(t.Context(), func(Activity) {})
+
+		time.Sleep(DefaultMonitorInterval + time.Millisecond)
+
+		if got := asked.Load(); got == nil || !slices.Equal(*got, []Table{jobs}) {
+			t.Errorf("read asked for %v; want the watched tables", got)
+		}
+	})
 }

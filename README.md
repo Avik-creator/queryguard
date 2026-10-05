@@ -214,6 +214,23 @@ PGPASSWORD=… ./bin/queryguard -config queryguard.json \
 QueryGuard won't start with `max_scan_rows` and no `-catalog-dsn`. A table
 that has never been analyzed has no size yet, and isn't judged.
 
+### Server activity
+
+With `-catalog-dsn`, QueryGuard also reads what the whole server is doing,
+once a second, in one round trip on one connection: which backends wait on a
+lock and for whom (`pg_blocking_pids`), how far each standby lags
+(`pg_stat_replication`), which backend holds the oldest snapshot
+(`pg_stat_activity.backend_xmin`) and, on PostgreSQL 19, how long finished
+lock waits took (`pg_stat_lock`). Seeing other roles' sessions needs the
+`pg_monitor` role:
+
+```sql
+CREATE ROLE queryguard_catalog LOGIN PASSWORD '…' IN ROLE pg_monitor;
+```
+
+A reading that fails is logged and skipped, and the connection is opened
+again for the next one.
+
 ## Tenants, budgets and the scheduler
 
 A tenant is the database role by default. Roles listed in `trusted_roles`,

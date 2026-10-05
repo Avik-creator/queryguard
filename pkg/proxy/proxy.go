@@ -73,6 +73,8 @@ type Server struct {
 	Policy *policy.Policy
 	// Catalog gives the cost rules table sizes; nil leaves every size unknown.
 	Catalog *plan.Catalog
+	// Monitor reports what the whole server is doing, such as lock waits, every second; nil reads nothing.
+	Monitor Monitor
 	// Plans caches statement plans for every session's cost rules.
 	Plans plan.Cache
 	// History learns how each statement's plans run, for calibrated costs and plan flips.
@@ -86,6 +88,11 @@ type Server struct {
 	mu      sync.Mutex
 	sched   *sched.Scheduler // made with the first policy and reconfigured by each one after
 	serving context.Context  // Serve's context, which ends the scheduler's loop; nil before Serve
+}
+
+// Monitor reports what the whole server is doing; *plan.Monitor reads it from Postgres.
+type Monitor interface {
+	Run(ctx context.Context, report func(plan.Activity))
 }
 
 // Serve accepts on ln until ctx is cancelled, then drains sessions for up to ShutdownTimeout.
@@ -109,6 +116,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		go s.sched.Run(ctx)
 	}
 	s.mu.Unlock()
+	if s.Monitor != nil {
+		go s.Monitor.Run(ctx, s.observe)
+	}
 	if s.ActivePolicy() != nil {
 		go s.logPlanStats(ctx, log, time.Tick(planStatsInterval))
 	}
@@ -363,6 +373,13 @@ func (s *Server) logPlanStats(ctx context.Context, log *slog.Logger, tick <-chan
 		}
 		log.Info("plan cache", attrs...)
 		last = now
+	}
+}
+
+// observe acts on one reading of the server's activity.
+func (s *Server) observe(a plan.Activity) {
+	if sc := s.scheduler(); sc != nil {
+		sc.LockWaits(a.LockWaits())
 	}
 }
 

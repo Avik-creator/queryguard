@@ -55,7 +55,7 @@ func main() {
 		"how often Postgres checks that a client is still there during a query; 0 leaves Postgres's setting alone")
 	flag.StringVar(&opts.config, "config", "", "JSON policy file with rules and connection caps; none means no checks")
 	flag.StringVar(&opts.catalogDSN, "catalog-dsn", "",
-		"connection string for reading table sizes, needed by max_scan_rows; the password can come from PGPASSWORD or a .pgpass file")
+		"connection string for a pg_monitor role that reads table sizes (needed by max_scan_rows) and the server's activity; the password can come from PGPASSWORD or a .pgpass file")
 	flag.BoolVar(&opts.keepAlive, "tcp-keepalive", true,
 		"find silently dead clients and servers in about 30s; false keeps the operating system's timing")
 	flag.DurationVar(&opts.shutdownTimeout, "shutdown-timeout", proxy.DefaultShutdownTimeout,
@@ -116,6 +116,7 @@ func run(opts options, log *slog.Logger) error {
 		KeepAlive:           keepAlive,
 		Policy:              pol,
 		Catalog:             catalog,
+		Monitor:             newMonitor(catalog, log),
 		ShutdownTimeout:     opts.shutdownTimeout,
 		Logger:              log,
 	}
@@ -149,6 +150,14 @@ func newCatalog(dsn string, pol *policy.Policy, log *slog.Logger) (*plan.Catalog
 		return nil, fmt.Errorf("-catalog-dsn: %w", err)
 	}
 	return &plan.Catalog{DSN: dsn, Log: log}, nil
+}
+
+// newMonitor returns the reader of the server's activity over the catalog's connection string, or nil without one.
+func newMonitor(catalog *plan.Catalog, log *slog.Logger) proxy.Monitor {
+	if catalog == nil {
+		return nil
+	}
+	return &plan.Monitor{DSN: catalog.DSN, Log: log}
 }
 
 // loadTLS returns the client TLS config, or nil when neither file is given, which require forbids.

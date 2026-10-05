@@ -538,3 +538,177 @@ func (c *Catalog) query(ctx context.Context, database string) (map[Table]stats, 
 	})
 	return tables, err
 }
+
+// DefaultMonitorInterval is how often a Monitor reads the server's activity when its Interval is zero.
+const DefaultMonitorInterval = time.Second
+
+// Monitor reads what the whole server is doing over its own connection, for signals no single session sees.
+type Monitor struct {
+	DSN      string         // connection string for a role in pg_monitor; watched tables are in its database
+	Interval time.Duration  // how often it reads; 0 means DefaultMonitorInterval
+	Watch    func() []Table // tables whose dead tuples are reported; nil watches none
+	Log      *slog.Logger   // nil means slog.Default()
+
+	// read reads the activity once; nil reads it from Postgres at DSN.
+	read func(ctx context.Context, watch []Table) (Activity, error)
+}
+
+// Activity is what the server was doing at one reading.
+type Activity struct {
+	Waiting        map[int32]Wait    // backends waiting on a lock, by process ID
+	ReplicationLag time.Duration     // the most any standby lags in replaying; 0 without standbys
+	Horizon        Snapshot          // the backend holding back the MVCC horizon most; PID 0 when none
+	DeadTuples     map[Table]float64 // of the watched tables
+	FinishedWaits  float64           // sessions that waited on locks, on average, in waits that ended since the last reading (PG19)
+	finishedWaitMS float64           // pg_stat_lock's total wait_time, in milliseconds
+}
+
+// Wait is one backend's wait for a lock.
+type Wait struct {
+	Blockers []int32       // the backends it waits for, from pg_blocking_pids
+	Waited   time.Duration // since it started waiting; 0 when Postgres hasn't said yet
+}
+
+// Snapshot is a backend's oldest snapshot.
+type Snapshot struct {
+	PID int32
+	Age time.Duration // since its transaction, or else its statement, started
+}
+
+// LockWaits is how many sessions wait on locks: those waiting now, or more when more waited since the last reading.
+func (a Activity) LockWaits() int { return max(len(a.Waiting), int(math.Round(a.FinishedWaits))) }
+
+// Run reads the activity every Interval and passes each reading to report, until ctx ends; a failed reading is logged and skipped.
+func (m *Monitor) Run(ctx context.Context, report func(Activity)) {
+	read := m.read
+	if read == nil {
+		var r activityReader
+		defer r.close()
+		read = func(ctx context.Context, watch []Table) (Activity, error) { return r.read(ctx, m.DSN, watch) }
+	}
+	var last Activity
+	var lastAt time.Time
+	tick := time.Tick(cmp.Or(m.Interval, DefaultMonitorInterval))
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick:
+		}
+		var watch []Table
+		if m.Watch != nil {
+			watch = m.Watch()
+		}
+		rctx, cancel := context.WithTimeout(ctx, catalogTimeout)
+		a, err := read(rctx, watch)
+		cancel()
+		if err != nil {
+			if ctx.Err() == nil {
+				cmp.Or(m.Log, slog.Default()).Warn("read server activity", "err", err)
+			}
+			continue
+		}
+		// Lock wait time counts only once a wait ends, so its growth over a second is how many sessions waited on average.
+		if !lastAt.IsZero() && a.finishedWaitMS >= last.finishedWaitMS {
+			a.FinishedWaits = (a.finishedWaitMS - last.finishedWaitMS) / float64(time.Since(lastAt).Milliseconds())
+		}
+		last, lastAt = a, time.Now()
+		report(a)
+	}
+}
+
+// activityReader reads the activity over one connection, opened on first use and again after a failure.
+type activityReader struct {
+	conn    *pgx.Conn
+	version int // server_version_num
+}
+
+// pg19 is the first server_version_num with pg_stat_lock.
+const pg19 = 190000
+
+func (r *activityReader) read(ctx context.Context, dsn string, watch []Table) (Activity, error) {
+	if r.conn == nil {
+		conn, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			return Activity{}, err
+		}
+		if err := conn.QueryRow(ctx, "select current_setting('server_version_num')::int").Scan(&r.version); err != nil {
+			conn.Close(context.Background())
+			return Activity{}, err
+		}
+		r.conn = conn
+	}
+	a, err := r.query(ctx, watch)
+	if err != nil {
+		r.close()
+	}
+	return a, err
+}
+
+func (r *activityReader) close() {
+	if r.conn != nil {
+		r.conn.Close(context.Background())
+		r.conn = nil
+	}
+}
+
+// query reads the activity in one round trip.
+func (r *activityReader) query(ctx context.Context, watch []Table) (Activity, error) {
+	a := Activity{Waiting: map[int32]Wait{}, DeadTuples: map[Table]float64{}}
+	var b pgx.Batch
+	// waitstart is null for a moment after a wait starts.
+	b.Queue(`select a.pid, pg_blocking_pids(a.pid), coalesce((select extract(epoch from clock_timestamp() - min(l.waitstart))
+		from pg_locks l where l.pid = a.pid and not l.granted), 0)::float8 from pg_stat_activity a where a.wait_event_type = 'Lock'`).
+		Query(func(rows pgx.Rows) error {
+			var pid int32
+			var w Wait
+			var waited float64
+			_, err := pgx.ForEachRow(rows, []any{&pid, &w.Blockers, &waited}, func() error {
+				w.Waited = time.Duration(waited * float64(time.Second))
+				a.Waiting[pid] = w
+				w = Wait{}
+				return nil
+			})
+			return err
+		})
+	b.Queue(`select coalesce(extract(epoch from max(replay_lag)), 0)::float8 from pg_stat_replication`).QueryRow(func(row pgx.Row) error {
+		var lag float64
+		err := row.Scan(&lag)
+		a.ReplicationLag = time.Duration(lag * float64(time.Second))
+		return err
+	})
+	// Its own query's snapshot would always be the newest, but it is left out all the same.
+	b.Queue(`select pid, extract(epoch from clock_timestamp() - coalesce(xact_start, query_start, backend_start))::float8
+		from pg_stat_activity where backend_xmin is not null and pid <> pg_backend_pid() order by age(backend_xmin) desc limit 1`).
+		Query(func(rows pgx.Rows) error {
+			var age float64
+			_, err := pgx.ForEachRow(rows, []any{&a.Horizon.PID, &age}, func() error {
+				a.Horizon.Age = time.Duration(age * float64(time.Second))
+				return nil
+			})
+			return err
+		})
+	if len(watch) > 0 {
+		schemas, names := make([]string, len(watch)), make([]string, len(watch))
+		for i, t := range watch {
+			schemas[i], names[i] = t.Schema, t.Name
+		}
+		b.Queue(`select s.schemaname, s.relname, s.n_dead_tup::float8 from pg_stat_all_tables s
+			join unnest($1::text[], $2::text[]) w(schema, name) on s.schemaname = w.schema and s.relname = w.name`, schemas, names).
+			Query(func(rows pgx.Rows) error {
+				var t Table
+				var dead float64
+				_, err := pgx.ForEachRow(rows, []any{&t.Schema, &t.Name, &dead}, func() error {
+					a.DeadTuples[t] = dead
+					return nil
+				})
+				return err
+			})
+	}
+	if r.version >= pg19 {
+		b.Queue(`select coalesce(sum(wait_time), 0)::float8 from pg_stat_lock`).QueryRow(func(row pgx.Row) error {
+			return row.Scan(&a.finishedWaitMS)
+		})
+	}
+	return a, r.conn.SendBatch(ctx, &b).Close()
+}
