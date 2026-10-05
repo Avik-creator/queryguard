@@ -229,3 +229,18 @@ func FuzzRelayStartup(f *testing.F) {
 		RelayStartup(io.Discard, bytes.NewReader(in), StartupOptions{IssueKey: issue, Report: func(string, string) {}})
 	})
 }
+
+func TestRefusedLoginCarriesPostgresCode(t *testing.T) {
+	refusal := &pgproto3.ErrorResponse{Severity: "FATAL", Code: "28P01", Message: "password authentication failed"}
+	server := bytes.NewReader(encode(t, refusal))
+	var client bytes.Buffer
+
+	err := RelayStartup(&client, server, StartupOptions{})
+
+	if e, ok := errors.AsType[*LoginRefusedError](err); !ok || e.Code != "28P01" || !errors.Is(err, ErrLoginRefused) {
+		t.Fatalf("got %v; want a LoginRefusedError with code 28P01 that is ErrLoginRefused", err)
+	}
+	if !bytes.Equal(client.Bytes(), encode(t, refusal)) {
+		t.Errorf("client got %q; want the refusal as sent", client.Bytes())
+	}
+}

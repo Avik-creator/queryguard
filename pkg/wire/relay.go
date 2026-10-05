@@ -57,6 +57,8 @@ func RelayStartup(client io.Writer, server io.Reader, opts StartupOptions) error
 			err = relayKey(client, server, size, opts.IssueKey)
 		case typ == parameterStatusType && opts.Report != nil:
 			err = relayParameter(client, server, head, size, opts.Report)
+		case typ == errorResponseType && size <= maxPacketLen:
+			return relayRefusal(client, server, head, size)
 		default:
 			err = forward(client, server, head[:], size)
 		}
@@ -70,6 +72,29 @@ func RelayStartup(client io.Writer, server io.Reader, opts StartupOptions) error
 			return ErrLoginRefused
 		}
 	}
+}
+
+// LoginRefusedError is ErrLoginRefused with the SQLSTATE Postgres gave, such as 28P01 for a wrong password.
+type LoginRefusedError struct{ Code string }
+
+func (e *LoginRefusedError) Error() string { return ErrLoginRefused.Error() + ": " + e.Code }
+
+func (e *LoginRefusedError) Is(target error) bool { return target == ErrLoginRefused }
+
+// relayRefusal forwards the ErrorResponse that ends a login and returns it as a LoginRefusedError.
+func relayRefusal(client io.Writer, server io.Reader, head [5]byte, size int64) error {
+	body := make([]byte, size)
+	if _, err := io.ReadFull(server, body); err != nil {
+		return unexpected(err)
+	}
+	if _, err := client.Write(append(head[:], body...)); err != nil {
+		return err
+	}
+	var e pgproto3.ErrorResponse
+	if err := e.Decode(body); err != nil {
+		return ErrLoginRefused
+	}
+	return &LoginRefusedError{Code: e.Code}
 }
 
 // relayAuth forwards an authentication request of size bytes, removing -PLUS mechanisms from AuthenticationSASL
