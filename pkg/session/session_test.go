@@ -1345,6 +1345,26 @@ func TestATransactionThatEndsInTimeKeepsItsSession(t *testing.T) {
 	h.serverGetsNothingBefore(&pgproto3.Query{String: "select 'still here'"})
 }
 
+func TestATransactionsTimeCountsFromWhenItsOwnStatementsWent(t *testing.T) {
+	a := newAdmitter()
+	a.tx = 400 * time.Millisecond
+	h := start(t, fakeChecker{admit: a})
+
+	h.send(&pgproto3.Query{String: "select slot, pg_sleep(0.3)"})
+	h.serverGets(&pgproto3.Query{String: "select slot, pg_sleep(0.3)"})
+	time.Sleep(300 * time.Millisecond)
+	// The BEGIN goes while the sleep still runs, so its transaction began 300ms after the sleep's batch.
+	h.send(&pgproto3.Query{String: "begin slot"})
+	h.serverGets(&pgproto3.Query{String: "begin slot"})
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'},
+		&pgproto3.CommandComplete{CommandTag: []byte("BEGIN")}, &pgproto3.ReadyForQuery{TxStatus: 'T'})
+	h.clientGets(&pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'},
+		&pgproto3.CommandComplete{CommandTag: []byte("BEGIN")}, &pgproto3.ReadyForQuery{TxStatus: 'T'})
+
+	time.Sleep(200 * time.Millisecond)
+	h.serverGetsNothingBefore(&pgproto3.Query{String: "select 'still here'"})
+}
+
 func TestCancelsAReadPastItsRowCap(t *testing.T) {
 	a := newAdmitter()
 	a.maxRows = 2

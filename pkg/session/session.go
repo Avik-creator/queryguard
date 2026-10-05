@@ -247,7 +247,8 @@ type session struct {
 	txLimit        time.Duration // how long a transaction may last
 	txTimer        *time.Timer   // ends the session whose transaction lasts too long
 	txGen          int           // bumped as each transaction ends, so a transaction timer firing late does nothing
-	batchSent      time.Time     // when the first message since the server was last idle went, which is when a transaction it opens began
+	batchStart     time.Time     // when the first message since the last Query or Sync went, which is when a transaction its batch opens began
+	batchOpen      bool          // a message went since the last Query or Sync
 	idleGen        int           // bumped by each client message, so an idle timer firing late does nothing
 	interrupted    *Interruption // why the proxy cancelled the running statement, so Postgres's cancel error says so
 	interruptedRan *hooks        // that statement's admission, told once the cancel lands
@@ -278,6 +279,7 @@ type sent struct {
 	capped   bool      // ran's caps apply, since it went outside a transaction with nothing ahead of it
 	data     [2]int64  // the rows and bytes of row data answered so far
 	start    time.Time // when it went to the server, if it is timed and nothing ran ahead of it
+	batch    time.Time // when the first message of its batch, up to a Query or Sync, went
 	failed   bool      // Postgres answered with an error
 	sql      string    // the statement it belongs to, when recording
 	rejected bool      // it is the proxy's rejection of sql
@@ -897,7 +899,12 @@ func (s *session) transaction(status byte) {
 		}
 	case status != 'I' && s.status == 'I' && s.txLimit > 0:
 		gen := s.txGen
-		s.txTimer = time.AfterFunc(s.txLimit-time.Since(s.batchSent), func() {
+		// The ReadyForQuery answers the Query or Sync that ended the batch which opened the transaction.
+		began := time.Now()
+		if len(s.pending) > 0 {
+			began = s.pending[0].batch
+		}
+		s.txTimer = time.AfterFunc(s.txLimit-time.Since(began), func() {
 			defer safe.Recover(s.stop)
 			s.transactionTimedOut(gen)
 		})
@@ -1137,8 +1144,12 @@ func (s *session) track(typ byte, how answer) {
 	} else if s.skipping {
 		return
 	}
-	if len(s.pending) == 0 && s.status == 'I' {
-		s.batchSent = time.Now()
+	if !s.batchOpen {
+		s.batchStart, s.batchOpen = time.Now(), true
+	}
+	m.batch = s.batchStart
+	if typ == 'Q' || typ == 'S' {
+		s.batchOpen = false
 	}
 	// Postgres sends a pipeline's answers together at Sync, so a statement behind another running one can't be timed on its own.
 	timed := (m.ran != nil && m.ran.ran != nil) || (m.sql != "" && (typ == 'Q' || typ == 'E'))
