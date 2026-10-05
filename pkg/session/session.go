@@ -827,16 +827,11 @@ func (s *session) statementTimedOut() { s.interrupt(statementTimeout) }
 // interrupt cancels what the session runs, with i as the reason the client is given, and reports whether it ran anything.
 func (s *session) interrupt(i Interruption) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	busy := len(s.pending) > 0 && s.cancel != nil
-	var done chan struct{}
 	if busy {
 		s.interrupted, s.interruptedRan = &i, s.running()
-		done = s.startCancel()
-	}
-	s.mu.Unlock()
-	if busy {
-		defer s.endCancel(done)
-		s.cancel()
+		s.cancelServer()
 	}
 	return busy
 }
@@ -1405,8 +1400,13 @@ func (s *session) returnedRow(p *sent, n int) {
 	i.Hint = "Add a LIMIT, or page through the rows."
 	p.capped = false
 	s.interrupted, s.interruptedRan = &i, p.ran
-	done := s.startCancel()
-	// The cancel opens a connection to Postgres, which mustn't hold up the rows still arriving.
+	s.cancelServer()
+}
+
+// cancelServer cancels the running statement from a goroutine, so the connection it opens holds up only the client's next message; the caller holds mu.
+func (s *session) cancelServer() {
+	done := make(chan struct{})
+	s.cancelling = done
 	go func() {
 		defer safe.Recover(s.stop)
 		defer s.endCancel(done)
@@ -1414,14 +1414,7 @@ func (s *session) returnedRow(p *sent, n int) {
 	}()
 }
 
-// startCancel notes that the proxy is cancelling the running statement, returning what endCancel takes; the caller holds mu.
-func (s *session) startCancel() chan struct{} {
-	done := make(chan struct{})
-	s.cancelling = done
-	return done
-}
-
-// endCancel notes that the cancel startCancel noted has reached Postgres.
+// endCancel notes that the cancel cancelServer sent has reached Postgres.
 func (s *session) endCancel(done chan struct{}) {
 	s.mu.Lock()
 	if s.cancelling == done {

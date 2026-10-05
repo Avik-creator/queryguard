@@ -464,6 +464,30 @@ func TestCancelsStatementPastItsTimeout(t *testing.T) {
 		&pgproto3.ReadyForQuery{TxStatus: 'I'})
 }
 
+func TestInterruptReturnsWithoutWaitingForTheCancel(t *testing.T) {
+	release := make(chan struct{})
+	h := startWith(t, Options{Check: fakeChecker{}, Cancel: func() { <-release }})
+	done := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(done)
+	h.send(&pgproto3.Query{String: "alter table orders add column note text"})
+	h.serverGets(&pgproto3.Query{String: "alter table orders add column note text"})
+
+	// The DDL guard interrupts from the monitor's loop, which mustn't wait on a connection to Postgres.
+	interrupted := make(chan bool, 1)
+	go func() {
+		interrupted <- h.interrupt(Interruption{Code: "55P03", Message: "queryguard: canceling statement due to lock timeout"})
+	}()
+	select {
+	case busy := <-interrupted:
+		if !busy {
+			t.Error("interrupt of a running statement reported nothing to cancel")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupt waited for its cancel to be done")
+	}
+	expect(t, h.cancels, struct{}{})
+}
+
 func TestInterruptCancelsWithItsOwnError(t *testing.T) {
 	h := start(t, fakeChecker{})
 	h.send(&pgproto3.Query{String: "alter table orders add column note text"})
