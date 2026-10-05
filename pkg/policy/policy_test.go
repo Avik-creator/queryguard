@@ -542,6 +542,18 @@ func TestGateTakesOneSlotPerBatch(t *testing.T) {
 	}
 }
 
+func TestGateGivesTheTenantsTransactionTimeout(t *testing.T) {
+	config := `{"tenant_defaults": {"transaction_timeout": "5m"}, "tenants": {"batch": {"transaction_timeout": "1h"}}}`
+	for role, want := range map[string]time.Duration{"alice": 5 * time.Minute, "batch": time.Hour} {
+		// BEGIN needs no slot or budget, but it opens the transaction the limit is for.
+		for _, sql := range []string{"begin", "select 1"} {
+			if a := pass(t, gateChecker(t, config, role, discard), sql, costing(1), false); a.TransactionTimeout != want {
+				t.Errorf("%s, %s: transaction timeout %v; want %v", role, sql, a.TransactionTimeout, want)
+			}
+		}
+	}
+}
+
 func TestGateTimeouts(t *testing.T) {
 	config := `{"tenant_defaults": {"statement_timeout": "30s", "idle_in_transaction_timeout": "1m"},
 		"tenants": {"batch": {"statement_timeout": "10m"}}}`
@@ -1270,46 +1282,57 @@ func TestParseRejectsBadConfig(t *testing.T) {
 		`{"rules": [{"check": "require_where"}, {"check": "require_where"}]}`: "twice",
 		`{"rules": [{"check": "schema_allowlist"}]}`:                          "schemas",
 		`{"rules": [{"check": "require_where", "schemas": ["public"]}]}`:      "schemas",
+		`{"rules": [{"check": "require_where", "functions": ["upper"]}]}`:     "functions",
 		`{"unchecked": "maybe"}`:                                              "maybe",
+		`{"login_throttle": {"mode": "maybe"}}`:                               "login_throttle",
+		`{"learned_timeouts": {"mode": "on", "multiple": 0.5}}`:               "learned_timeouts",
+		`{"runaway": {"action": "explode"}}`:                                  "runaway",
+		`{"login_throttle": {"failures": -1}}`:                                "login_throttle",
 		`{"tenants": {"alice": {"mode": "loud"}}}`:                            "loud",
 		`{"max_connections": -1}`:                                             "max_connections",
 		`{"tenants": {"alice": {"max_connections": -1}}}`:                     "max_connections",
-		`{"rule": []}`:                                                               "rule",
-		`{"rules": [{"check": "max_cost"}]}`:                                         "cost",
-		`{"rules": [{"check": "max_cost", "cost": -1}]}`:                             "cost",
-		`{"rules": [{"check": "max_scan_rows"}]}`:                                    "rows",
-		`{"rules": [{"check": "require_where", "cost": 5}]}`:                         "cost",
-		`{"rules": [{"check": "max_cost", "cost": 5, "rows": 5}]}`:                   "rows",
-		`{"tenants": {"a": {"budget": {"rate": -1}}}}`:                               "rate",
-		`{"tenants": {"a": {"budget": {"rate": 10, "when_over": "later"}}}}`:         "later",
-		`{"tenants": {"a": {"budget": {"burst": 10}}}}`:                              "burst",
-		`{"tenant_defaults": {"statement_timeout": "soon"}}`:                         "soon",
-		`{"tenant_defaults": {"statement_timeout": "-1s"}}`:                          "statement_timeout",
-		`{"tenant_defaults": {"mode": "warn"}}`:                                      "tenant_defaults",
-		`{"scheduler": {"max_active": -1}}`:                                          "max_active",
-		`{"rules": [{"check": "deny_ddl", "match": {"clients": ["10.0.0.0/33"]}}]}`:  "10.0.0.0/33",
-		`{"calibration": {"mode": "maybe"}}`:                                         "maybe",
-		`{"calibration": {"credibility": -1}}`:                                       "credibility",
-		`{"plan_flips": {"mode": "loud"}}`:                                           "loud",
-		`{"plan_flips": {"quarantine": "-1m"}}`:                                      "quarantine",
-		`{"rules": [{"check": "deny_ddl", "match": {"tags": {"route": "/admin"}}}]}`: "trusted_roles",
-		`{"scheduler": {"adaptive": {}}}`:                                            "max_active",
-		`{"scheduler": {"max_active": 4, "adaptive": {"floor": 8}}}`:                 "floor",
-		`{"scheduler": {"max_active": 4, "adaptive": {"backoff": 1}}}`:               "backoff",
-		`{"scheduler": {"max_active": 4, "adaptive": {"max_slowdown": 0.5}}}`:        "max_slowdown",
-		`{"scheduler": {"max_active": 4, "adaptive": {"lock_wait_share": -1}}}`:      "lock_wait_share",
-		`{"tenants": {"a": {"priority": "urgent"}}}`:                                 "urgent",
-		`{"ddl_guard": {"mode": "loud"}}`:                                            "loud",
-		`{"ddl_guard": {"lock_timeout": "-1s"}}`:                                     "lock_timeout",
-		`{"scheduler": {"blocker_pays": "maybe"}}`:                                   "maybe",
-		`{"scheduler": {"demote_after": "-1s"}}`:                                     "demote_after",
-		`{"replication_lag": {"max": "-1s"}}`:                                        "replication_lag",
-		`{"mvcc_horizon": {"max_age": "-1s"}}`:                                       "max_age",
-		`{"mvcc_horizon": {"max_age": "1m", "watch": ["jobs"]}}`:                     "schema.table",
-		`{"mvcc_horizon": {"max_age": "1m", "max_dead_tuples": -1}}`:                 "max_dead_tuples",
-		`{"mvcc_horizon": {"watch": ["public.jobs"]}}`:                               "max_age",
-		`{"scheduler": {"overload_queue": {"mode": "sometimes"}}}`:                   "sometimes",
-		`{"scheduler": {"overload_queue": {"timeout": "-1s"}}}`:                      "overload_queue",
+		`{"rule": []}`:                                                                                 "rule",
+		`{"rules": [{"check": "max_cost"}]}`:                                                           "cost",
+		`{"rules": [{"check": "max_cost", "cost": -1}]}`:                                               "cost",
+		`{"rules": [{"check": "max_scan_rows"}]}`:                                                      "rows",
+		`{"rules": [{"check": "require_where", "cost": 5}]}`:                                           "cost",
+		`{"rules": [{"check": "max_cost", "cost": 5, "rows": 5}]}`:                                     "rows",
+		`{"tenants": {"a": {"budget": {"rate": -1}}}}`:                                                 "rate",
+		`{"tenants": {"a": {"budget": {"rate": 10, "when_over": "later"}}}}`:                           "later",
+		`{"tenants": {"a": {"budget": {"burst": 10}}}}`:                                                "burst",
+		`{"scheduler": {"max_active": 4}, "tenants": {"a": {"budget": {"capacity": 1.5}}}}`:            "capacity",
+		`{"scheduler": {"max_active": 4}, "tenants": {"a": {"budget": {"capacity": 0.2, "rate": 5}}}}`: "capacity",
+		`{"tenants": {"a": {"budget": {"capacity": 0.2}}}}`:                                            "max_active",
+		`{"tenant_defaults": {"statement_timeout": "soon"}}`:                                           "soon",
+		`{"tenant_defaults": {"statement_timeout": "-1s"}}`:                                            "statement_timeout",
+		`{"tenant_defaults": {"transaction_timeout": "-1s"}}`:                                          "transaction_timeout",
+		`{"tenant_defaults": {"mode": "warn"}}`:                                                        "tenant_defaults",
+		`{"scheduler": {"max_active": -1}}`:                                                            "max_active",
+		`{"rules": [{"check": "deny_ddl", "match": {"clients": ["10.0.0.0/33"]}}]}`:                    "10.0.0.0/33",
+		`{"calibration": {"mode": "maybe"}}`:                                                           "maybe",
+		`{"calibration": {"credibility": -1}}`:                                                         "credibility",
+		`{"calibration": {"returned_mb": -1}}`:                                                         "returned_mb",
+		`{"tenant_defaults": {"max_rows": -1}}`:                                                        "max_rows",
+		`{"plan_flips": {"mode": "loud"}}`:                                                             "loud",
+		`{"plan_flips": {"quarantine": "-1m"}}`:                                                        "quarantine",
+		`{"rules": [{"check": "deny_ddl", "match": {"tags": {"route": "/admin"}}}]}`:                   "trusted_roles",
+		`{"scheduler": {"adaptive": {}}}`:                                                              "max_active",
+		`{"scheduler": {"max_active": 4, "adaptive": {"floor": 8}}}`:                                   "floor",
+		`{"scheduler": {"max_active": 4, "adaptive": {"backoff": 1}}}`:                                 "backoff",
+		`{"scheduler": {"max_active": 4, "adaptive": {"max_slowdown": 0.5}}}`:                          "max_slowdown",
+		`{"scheduler": {"max_active": 4, "adaptive": {"lock_wait_share": -1}}}`:                        "lock_wait_share",
+		`{"tenants": {"a": {"priority": "urgent"}}}`:                                                   "urgent",
+		`{"ddl_guard": {"mode": "loud"}}`:                                                              "loud",
+		`{"ddl_guard": {"lock_timeout": "-1s"}}`:                                                       "lock_timeout",
+		`{"scheduler": {"blocker_pays": "maybe"}}`:                                                     "maybe",
+		`{"scheduler": {"demote_after": "-1s"}}`:                                                       "demote_after",
+		`{"replication_lag": {"max": "-1s"}}`:                                                          "replication_lag",
+		`{"mvcc_horizon": {"max_age": "-1s"}}`:                                                         "max_age",
+		`{"mvcc_horizon": {"max_age": "1m", "watch": ["jobs"]}}`:                                       "schema.table",
+		`{"mvcc_horizon": {"max_age": "1m", "max_dead_tuples": -1}}`:                                   "max_dead_tuples",
+		`{"mvcc_horizon": {"watch": ["public.jobs"]}}`:                                                 "max_age",
+		`{"scheduler": {"overload_queue": {"mode": "sometimes"}}}`:                                     "sometimes",
+		`{"scheduler": {"overload_queue": {"timeout": "-1s"}}}`:                                        "overload_queue",
 	} {
 		if _, err := Parse([]byte(config)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("Parse(%s) = %v; want an error mentioning %q", config, err, want)
@@ -1449,5 +1472,348 @@ func TestTenantOfFollowsTagsOnlyFromTrustedRoles(t *testing.T) {
 		if got := p.TenantOf(tc.role, tc.sql); got != tc.want {
 			t.Errorf("TenantOf(%q, %q) = %q; want %q", tc.role, tc.sql, got, tc.want)
 		}
+	}
+}
+
+func TestBudgetRejectionSaysWhenToRetryWithJitter(t *testing.T) {
+	c := gateChecker(t, `{"tenants": {"alice": {"budget": {"rate": 10, "burst": 150, "when_over": "reject"}}}}`, "alice", discard)
+	// The first spends 150 and owes 50, five seconds at 10 a second; the second is turned away.
+	pass(t, c, "select * from orders where id = 1", costing(200), false)
+	seen := map[time.Duration]bool{}
+	for range 20 {
+		rej := pass(t, c, "select * from orders where id = 1", costing(200), false).Reject
+		if rej == nil {
+			t.Fatal("statement over budget ran")
+		}
+		d := retryIn(t, rej.Hint)
+		// Refills while the test runs only shorten the wait a little.
+		if d < 4*time.Second || d > 7500*time.Millisecond {
+			t.Fatalf("retry in %v (%q); want about 5s plus up to half again", d, rej.Hint)
+		}
+		seen[d] = true
+	}
+	if len(seen) < 3 {
+		t.Errorf("retry hints %v; want them spread by jitter", seen)
+	}
+}
+
+func TestBusyRejectionSaysWhenToRetry(t *testing.T) {
+	if d := retryIn(t, busy(mustParse(t, `{}`), sched.Fast).Hint); d < time.Second || d > 1500*time.Millisecond {
+		t.Errorf("busy retry in %v; want about a second", d)
+	}
+}
+
+// retryIn reads the wait out of a hint saying "Retry in about 2.5s…".
+func retryIn(t *testing.T, hint string) time.Duration {
+	t.Helper()
+	_, rest, ok := strings.Cut(hint, "Retry in about ")
+	if !ok {
+		t.Fatalf("hint %q gives no time to retry in", hint)
+	}
+	word, _, _ := strings.Cut(rest, " ")
+	d, err := time.ParseDuration(strings.TrimRight(word, ",."))
+	if err != nil {
+		t.Fatalf("hint %q: %v", hint, err)
+	}
+	return d
+}
+
+func TestDenyFunctionsBlocksSideEffectsEvenInASelect(t *testing.T) {
+	c := mustParse(t, `{"rules": [{"check": "deny_functions"}]}`).Checker("alice", discard)
+	for sql, blocked := range map[string]bool{
+		"select pg_terminate_backend(42)":                        true,
+		"select pg_catalog.pg_terminate_backend(42)":             true,
+		"select * from dblink_exec('host=x', 'drop table t')":    true,
+		"select set_config('role', 'admin', false)":              true,
+		"select upper(name), count(*) from customers group by 1": false,
+	} {
+		rej, _ := c.Check(sql, standard)
+		if got := ruleOf(rej) == "deny_functions"; got != blocked {
+			t.Errorf("Check(%q) = %v; want blocked %v", sql, rej, blocked)
+		}
+	}
+}
+
+func TestDenyFunctionsTakesItsOwnList(t *testing.T) {
+	c := mustParse(t, `{"rules": [{"check": "deny_functions", "functions": ["Upper", "billing.wipe"]}]}`).Checker("alice", discard)
+	for sql, blocked := range map[string]bool{
+		"select upper('a')":               true,
+		"select billing.wipe(1)":          true,
+		"select wipe(1)":                  true,
+		"select pg_terminate_backend(42)": false,
+	} {
+		rej, _ := c.Check(sql, standard)
+		if got := ruleOf(rej) == "deny_functions"; got != blocked {
+			t.Errorf("Check(%q) = %v; want blocked %v", sql, rej, blocked)
+		}
+	}
+}
+
+func TestGateCapsOnlyReads(t *testing.T) {
+	config := `{"tenant_defaults": {"max_rows": 1000, "max_bytes": 1048576}}`
+	c := gateChecker(t, config, "alice", discard)
+	if a := pass(t, c, "select * from orders", costing(1), false); a.MaxRows != 1000 || a.MaxBytes != 1<<20 {
+		t.Errorf("read got caps %d rows, %d bytes; want 1000 and 1 MB", a.MaxRows, a.MaxBytes)
+	}
+	// A write cut short would roll its transaction back.
+	if a := pass(t, c, "update orders set total = 0 where id = 1 returning *", costing(1), false); a.MaxRows != 0 || a.MaxBytes != 0 {
+		t.Errorf("write got caps %d rows, %d bytes; want none", a.MaxRows, a.MaxBytes)
+	}
+}
+
+func TestGateChargesTheBytesAStatementReturned(t *testing.T) {
+	c := gateChecker(t, `{"tenants": {"alice": {"budget": {"rate": 100, "burst": 100, "when_over": "reject"}}}}`, "alice", discard)
+	a := pass(t, c, "select * from orders", costing(10), false)
+
+	// Two MB at 128 units each, after the 10 the plan cost: 266 spent of 100, so 166 owed at 100 a second.
+	a.Returned(5000, 2<<20)
+
+	if d := c.Env.Scheduler.RetryAfter("alice"); d < 1600*time.Millisecond || d > 1700*time.Millisecond {
+		t.Errorf("owes for %v; want about 1.66s, the plan's cost and 2 MB returned", d)
+	}
+}
+
+func TestGateChargesAWritesUsualWAL(t *testing.T) {
+	c := gateChecker(t, `{"tenants": {"alice": {"budget": {"rate": 100, "burst": 100, "when_over": "reject"}}}}`, "alice", discard)
+	var asked []string
+	c.Env.WAL = func(database, role, fingerprint string) (float64, bool) {
+		asked = append(asked, database+"/"+role)
+		return 1 << 20, true
+	}
+
+	pass(t, c, "select * from orders where id = 1", costing(10), false)
+	if d := c.Env.Scheduler.RetryAfter("alice"); d != 0 {
+		t.Fatalf("a read owes for %v; want its WAL not charged", d)
+	}
+	// A MB of WAL at 128 units, after the 10 the plan cost and the 10 the read did: 148 of 100, so 48 owed.
+	pass(t, c, "update orders set total = 0 where id = 1", costing(10), false)
+
+	if d := c.Env.Scheduler.RetryAfter("alice"); d < 470*time.Millisecond || d > 490*time.Millisecond {
+		t.Errorf("owes for %v; want about 0.48s", d)
+	}
+	if !slices.Equal(asked, []string{"shop/alice"}) {
+		t.Errorf("asked about %v; want the write's database and role once", asked)
+	}
+}
+
+func TestCapacityBudgetsReachTheScheduler(t *testing.T) {
+	p := mustParse(t, `{"scheduler": {"max_active": 4}, "tenant_defaults": {"budget": {"capacity": 0.1}},
+		"tenants": {"reporting": {"budget": {"capacity": 0.2, "when_over": "reject"}}}}`)
+	cfg := p.SchedConfig()
+	if b := cfg.Budgets["reporting"]; b.Capacity != 0.2 || b.Rate != 0 {
+		t.Errorf("reporting budget %+v; want capacity 0.2 and no fixed rate", b)
+	}
+	if cfg.Default.Capacity != 0.1 {
+		t.Errorf("default budget %+v; want capacity 0.1", cfg.Default)
+	}
+}
+
+func TestLearnedTimeoutIsAMultipleOfTheStatementsP99(t *testing.T) {
+	config := `{"learned_timeouts": {"mode": "on", "multiple": 5, "min_runs": 10, "floor": "100ms"},
+		"tenant_defaults": {"statement_timeout": "30s"}}`
+	for _, tc := range []struct {
+		p99  time.Duration
+		runs int64
+		want time.Duration
+	}{
+		{200 * time.Millisecond, 50, time.Second},
+		{5 * time.Millisecond, 50, 100 * time.Millisecond},
+		{200 * time.Millisecond, 5, 30 * time.Second},
+		{10 * time.Second, 50, 30 * time.Second},
+	} {
+		c := gateChecker(t, config, "alice", discard)
+		var asked string
+		c.Env.P99 = func(database, role, tenant, fingerprint string) (time.Duration, int64) {
+			asked = database + "/" + role + "/" + tenant
+			return tc.p99, tc.runs
+		}
+		if a := pass(t, c, "select * from orders where id = 1", costing(1), false); a.Timeout != tc.want {
+			t.Errorf("p99 %v over %d runs: timeout %v; want %v", tc.p99, tc.runs, a.Timeout, tc.want)
+		}
+		if asked != "shop/alice/alice" {
+			t.Errorf("asked for %q; want the statement's database, role and tenant", asked)
+		}
+	}
+}
+
+func TestLearnedTimeoutsAreOffByDefault(t *testing.T) {
+	c := gateChecker(t, `{"tenant_defaults": {"statement_timeout": "30s"}}`, "alice", discard)
+	c.Env.P99 = func(string, string, string, string) (time.Duration, int64) { return time.Millisecond, 1000 }
+	if a := pass(t, c, "select 1", costing(1), false); a.Timeout != 30*time.Second {
+		t.Errorf("timeout %v; want the tenant's 30s", a.Timeout)
+	}
+}
+
+func TestWatchKeepsAStatementForItsTime(t *testing.T) {
+	var w Watch
+	now := time.Now()
+	w.add("shop", "fp", "select $1", "57014", 10*time.Minute, now)
+
+	if left, _, ok := w.watched("shop", "fp", now.Add(time.Minute)); !ok || left != 9*time.Minute {
+		t.Errorf("watched = %v, %v; want 9m left", left, ok)
+	}
+	if _, _, ok := w.watched("other", "fp", now); ok {
+		t.Error("a statement watched in another database")
+	}
+	if _, _, ok := w.watched("shop", "fp", now.Add(11*time.Minute)); ok {
+		t.Error("still watched after its time")
+	}
+	if l := w.List(now); len(l) != 1 || l[0].Query != "select $1" || l[0].Reason != "57014" {
+		t.Errorf("List = %+v; want the one entry", l)
+	}
+}
+
+func TestStatementThatBreaksItsTimeoutIsWatched(t *testing.T) {
+	config := `{"runaway": {"action": "reject", "watch": "10m"}, "tenant_defaults": {"statement_timeout": "1s"}}`
+	c := gateChecker(t, config, "alice", discard)
+	c.Env.Runaways = &Watch{}
+	const sql = "select * from orders where note like '%x%'"
+
+	a := pass(t, c, sql, costing(1), false)
+	// A cancel for another reason, such as the DDL guard's, says nothing about the statement.
+	a.Broke(session.Interruption{Code: "55P03"})
+	if again := pass(t, c, sql, costing(1), false); again.Reject != nil {
+		t.Fatalf("statement rejected after a lock timeout: %v", again.Reject)
+	}
+	a.Broke(session.Interruption{Code: "57014"})
+
+	rej := pass(t, c, "select * from orders where note like '%y%'", costing(1), false).Reject
+	if codeOf(rej) != "53000" || !strings.Contains(rej.Message, "runaway") {
+		t.Fatalf("watched statement got %v; want 53000 for a runaway", rej)
+	}
+	if d := retryIn(t, rej.Hint); d < 9*time.Minute {
+		t.Errorf("retry in %v; want about the 10m it is watched", d)
+	}
+	if other := pass(t, c, "select 1", costing(1), false); other.Reject != nil {
+		t.Errorf("another statement got %v; want it run", other.Reject)
+	}
+}
+
+func TestWatchedStatementCoolsDownInTheSlowLane(t *testing.T) {
+	config := `{"runaway": {"action": "slow"}, "scheduler": {"max_active": 1, "queue_timeout": "10ms"}, "tenant_defaults": {"statement_timeout": "1s"}}`
+	c := gateChecker(t, config, "alice", discard)
+	c.Env.Runaways = &Watch{}
+	const sql = "select * from orders where note like '%x%'"
+	broke := pass(t, c, sql, costing(1), false)
+	broke.Broke(session.Interruption{Code: "54000"})
+	broke.Release()
+	holder := pass(t, c, "select 1", costing(1), false)
+	defer holder.Release()
+
+	// The fast lane's one slot is taken, but the slow lane has room.
+	if a := pass(t, c, sql, costing(1), false); a.Reject != nil {
+		t.Errorf("watched statement got %v; want it run in the slow lane", a.Reject)
+	}
+}
+
+func TestPlanFlipIsToldToTheStats(t *testing.T) {
+	c := gateChecker(t, `{"plan_flips": {"mode": "warn"}, "scheduler": {"slow_lane": {"max_active": 1}}}`, "alice", discard)
+	var flipped []string
+	c.Env.Flipped = func(database, fingerprint string) { flipped = append(flipped, database+"/"+fingerprint) }
+	train(t, c, lookupSQL, explained(orderLookup, nil), 5, time.Millisecond)
+	c.Env.Plans = &plan.Cache{RefreshOneIn: -1}
+
+	for range 2 {
+		pass(t, c, lookupSQL, explained(orderFullRead, nil), false)
+	}
+
+	if want := "shop/" + sqlparse.Fingerprint(lookupSQL); !slices.Equal(flipped, []string{want}) {
+		t.Errorf("flips told %q; want the one flip, once", flipped)
+	}
+}
+
+func TestKilledTenantOrStatementIsTurnedAway(t *testing.T) {
+	kills := &Kills{}
+	now := time.Now()
+	kills.Kill(KillTenant, "acme", now.Add(10*time.Minute))
+	kills.Kill(KillFingerprint, sqlparse.Fingerprint("delete from jobs where id = 1"), now.Add(time.Hour))
+	// A policy with nothing else to check still turns killed statements away.
+	p := mustParse(t, `{"trusted_roles": ["app"]}`)
+	check := func(role, sql string) *pgproto3.ErrorResponse {
+		c := p.Checker(role, discard)
+		c.Env = Env{Database: "shop", Kills: kills}
+		rej, _ := c.Check(sql, standard)
+		return rej
+	}
+
+	if rej := check("acme", "select 1"); codeOf(rej) != "53000" || !strings.Contains(rej.Message, "tenant") {
+		t.Errorf("killed tenant got %v; want 53000", rej)
+	}
+	if rej := check("app", "select 1 /*tenant='acme'*/"); codeOf(rej) != "53000" {
+		t.Errorf("killed tenant through a trusted role's tag got %v; want 53000", rej)
+	}
+	if rej := check("bob", "delete from jobs where id = 7"); codeOf(rej) != "53000" || !strings.Contains(rej.Message, "statement") {
+		t.Errorf("killed statement got %v; want 53000", rej)
+	}
+	if rej := check("bob", "select 1"); rej != nil {
+		t.Errorf("another tenant's statement got %v; want it run", rej)
+	}
+	kills.Unkill(KillTenant, "acme")
+	if rej := check("acme", "select 1"); rej != nil {
+		t.Errorf("unkilled tenant got %v", rej)
+	}
+	if l := kills.List(now); len(l) != 1 || l[0].Kind != KillFingerprint {
+		t.Errorf("List = %+v; want the statement's kill left", l)
+	}
+}
+
+func TestKillsEnd(t *testing.T) {
+	var kills Kills
+	now := time.Now()
+	kills.Kill(KillTenant, "acme", now.Add(time.Minute))
+	if _, ok := kills.killed(KillTenant, "acme", now.Add(2*time.Minute)); ok {
+		t.Error("tenant still killed after its kill ended")
+	}
+}
+
+func TestAdminRolesMayUseTheConsole(t *testing.T) {
+	p := mustParse(t, `{"admin_roles": ["ops"]}`)
+	if !p.Admin("ops") || p.Admin("alice") {
+		t.Errorf("Admin(ops) = %v, Admin(alice) = %v; want only ops", p.Admin("ops"), p.Admin("alice"))
+	}
+}
+
+func TestAllowlistLearnsThenEnforces(t *testing.T) {
+	list := &Allowlist{}
+	checkAs := func(config, role, sql string) *pgproto3.ErrorResponse {
+		c := mustParse(t, config).Checker(role, discard)
+		c.Env = Env{Database: "shop", Allowlist: list}
+		rej, _ := c.Check(sql, standard)
+		return rej
+	}
+	const learn, enforce = `{"allowlist": {"mode": "learn", "roles": ["agent"]}}`, `{"allowlist": {"mode": "enforce", "roles": ["agent"]}}`
+
+	if rej := checkAs(learn, "agent", "select * from orders where id = 1"); rej != nil {
+		t.Fatalf("learn mode got %v; want everything run", rej)
+	}
+	checkAs(learn, "bob", "select * from customers")
+
+	if rej := checkAs(enforce, "agent", "select * from orders where id = 42"); rej != nil {
+		t.Errorf("learned statement with another value got %v; want it run", rej)
+	}
+	if rej := checkAs(enforce, "agent", "delete from orders where id = 1"); codeOf(rej) != "42501" {
+		t.Errorf("unlearned statement got %v; want 42501", rej)
+	}
+	// Roles not listed are neither learned nor held to it.
+	if rej := checkAs(enforce, "bob", "delete from orders where id = 1"); rej != nil {
+		t.Errorf("unlisted role got %v; want it run", rej)
+	}
+	if l := list.List(); len(l) != 1 || l[0].Role != "agent" || l[0].Query != "select * from orders where id = $1" {
+		t.Errorf("List = %+v; want agent's one statement", l)
+	}
+}
+
+func TestAllowlistSavesAndLoads(t *testing.T) {
+	var a, b Allowlist
+	a.learn("agent", "fp1", "select $1")
+	var buf bytes.Buffer
+	if err := a.Save(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Load(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if !b.allowed("agent", "fp1") || b.allowed("agent", "fp2") {
+		t.Errorf("loaded allowlist %+v; want fp1 only", b.List())
 	}
 }

@@ -5,17 +5,21 @@ import (
 	"cmp"
 	"context"
 	"crypto/sha256"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"log/slog"
 	"maps"
+	"math/rand/v2"
 	"net/netip"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -42,6 +46,7 @@ type Config struct {
 	MaxConnections       int               `json:"max_connections"`        // across all tenants; 0 means no cap
 	TenantMaxConnections int               `json:"tenant_max_connections"` // for each role without its own; 0 means no cap
 	TrustedRoles         []string          `json:"trusted_roles"`          // roles whose statements may name their tenant in a tag
+	AdminRoles           []string          `json:"admin_roles"`            // roles besides superusers that may use the admin console
 	TenantTag            string            `json:"tenant_tag"`             // the sqlcommenter key naming the tenant; "" means "tenant"
 	Scheduler            Scheduler         `json:"scheduler"`
 	Calibration          Calibration       `json:"calibration"`
@@ -49,6 +54,10 @@ type Config struct {
 	DDLGuard             DDLGuard          `json:"ddl_guard"`
 	ReplicationLag       ReplicationLag    `json:"replication_lag"`
 	MVCCHorizon          Horizon           `json:"mvcc_horizon"`
+	LoginThrottle        LoginThrottle     `json:"login_throttle"`
+	LearnedTimeouts      LearnedTimeouts   `json:"learned_timeouts"`
+	Runaway              Runaway           `json:"runaway"`
+	Allowlist            AllowlistConfig   `json:"allowlist"`
 	TenantDefaults       Tenant            `json:"tenant_defaults"` // the budget and timeouts of tenants that set none
 	Rules                []Rule            `json:"rules"`
 	Tenants              map[string]Tenant `json:"tenants"` // keyed by tenant: a role, or a tag from a trusted role
@@ -59,9 +68,11 @@ type Rule struct {
 	Check   string   `json:"check"`
 	Mode    Mode     `json:"mode"`
 	Schemas []string `json:"schemas"` // for schema_allowlist only
-	Cost    float64  `json:"cost"`    // for max_cost only
-	Rows    float64  `json:"rows"`    // for max_scan_rows only
-	Match   Match    `json:"match"`
+	// Functions are the functions deny_functions blocks, by name; none means deniedFunctions, the side-effecting built-ins.
+	Functions []string `json:"functions"`
+	Cost      float64  `json:"cost"` // for max_cost only
+	Rows      float64  `json:"rows"` // for max_scan_rows only
+	Match     Match    `json:"match"`
 }
 
 // Match narrows a rule to some statements: every field that is set must match, so a rule without one matches all.
@@ -81,6 +92,10 @@ type Tenant struct {
 	Budget                   *Budget  `json:"budget"`                      // nil keeps tenant_defaults' budget
 	StatementTimeout         Duration `json:"statement_timeout"`           // the proxy cancels statements running longer; 0 means no limit
 	IdleInTransactionTimeout Duration `json:"idle_in_transaction_timeout"` // the proxy ends sessions idle in a transaction longer
+	TransactionTimeout       Duration `json:"transaction_timeout"`         // the proxy ends sessions whose transaction lasts longer, idle or not
+	// MaxRows and MaxBytes cancel a read run outside a transaction once it has returned more rows or bytes of rows; 0 means no cap.
+	MaxRows  int64 `json:"max_rows"`
+	MaxBytes int64 `json:"max_bytes"`
 }
 
 // Budget is a tenant's allowance of planner cost units; see sched.Budget.
@@ -90,6 +105,8 @@ type Budget struct {
 	Share     float64 `json:"share"`      // weight against other tenants for slots; 0 means 1
 	MinCharge float64 `json:"min_charge"` // the least a statement costs
 	WhenOver  string  `json:"when_over"`  // queue (the default), slow or reject, once the budget is spent
+	// Capacity is the budget as a share of the server's measured capacity, such as 0.2 for a fifth, in place of a fixed rate.
+	Capacity float64 `json:"capacity"`
 }
 
 // Scheduler sets the lanes statements run in.
@@ -116,6 +133,314 @@ type OverloadQueue struct {
 	Mode          string   `json:"mode"`           // "on" (the default) or "off", which keeps every queue first in, first out
 	StandingAfter Duration `json:"standing_after"` // 0 means 1s
 	Timeout       Duration `json:"timeout"`        // 0 means 500ms
+}
+
+// DefaultRunawayWatch is how long a statement that broke its timeout or row cap stays on the watch list.
+const DefaultRunawayWatch = 10 * time.Minute
+
+// Runaway sets what happens to a statement, by fingerprint, after one of its runs was cancelled for its timeout or a cap, as TiDB's
+// runaway queries do.
+type Runaway struct {
+	Action string   `json:"action"` // log (the default) logs it running again, slow runs it in the slow lane, reject turns it away; off watches nothing
+	Watch  Duration `json:"watch"`  // how long it is watched; 0 means 10m
+}
+
+// maxWatched is how many statements the watch list holds; past it, the one whose watch ends soonest goes.
+const maxWatched = 10000
+
+// Watch is the runaway watch list, shared by every session; its zero value is ready.
+type Watch struct {
+	mu      sync.Mutex
+	entries map[watchKey]*WatchEntry
+}
+
+type watchKey struct{ database, fingerprint string }
+
+// WatchEntry is a watched statement.
+type WatchEntry struct {
+	Database, Fingerprint, Query string
+	Reason                       string // the SQLSTATE of the cancel that put it there: 57014 for its timeout, 54000 for a cap
+	Until                        time.Time
+	seen                         bool // it has run again since, which was logged
+}
+
+// add watches a statement for d.
+func (w *Watch) add(database, fingerprint, query, reason string, d time.Duration, now time.Time) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.entries == nil {
+		w.entries = map[watchKey]*WatchEntry{}
+	}
+	maps.DeleteFunc(w.entries, func(_ watchKey, e *WatchEntry) bool { return !now.Before(e.Until) })
+	if len(w.entries) >= maxWatched {
+		var soonest watchKey
+		for k, e := range w.entries {
+			if w.entries[soonest] == nil || e.Until.Before(w.entries[soonest].Until) {
+				soonest = k
+			}
+		}
+		delete(w.entries, soonest)
+	}
+	w.entries[watchKey{database, fingerprint}] = &WatchEntry{Database: database, Fingerprint: fingerprint, Query: query, Reason: reason,
+		Until: now.Add(d)}
+}
+
+// watched returns how long a statement is still watched, and whether this is its first run since it was put there.
+func (w *Watch) watched(database, fingerprint string, now time.Time) (left time.Duration, first, ok bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	e := w.entries[watchKey{database, fingerprint}]
+	if e == nil || !now.Before(e.Until) {
+		return 0, false, false
+	}
+	first, e.seen = !e.seen, true
+	return e.Until.Sub(now), first, true
+}
+
+// empty reports whether nothing is watched, so a statement needn't be fingerprinted to be looked up.
+func (w *Watch) empty() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.entries) == 0
+}
+
+// List returns the statements watched at now, the soonest to leave first.
+func (w *Watch) List(now time.Time) []WatchEntry {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var out []WatchEntry
+	for _, e := range w.entries {
+		if now.Before(e.Until) {
+			out = append(out, *e)
+		}
+	}
+	slices.SortFunc(out, func(a, b WatchEntry) int { return a.Until.Compare(b.Until) })
+	return out
+}
+
+// Remove takes a statement off the watch list and reports whether it was on it.
+func (w *Watch) Remove(database, fingerprint string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	k := watchKey{database, fingerprint}
+	_, ok := w.entries[k]
+	delete(w.entries, k)
+	return ok
+}
+
+// AllowlistConfig sets the learned allowlist, as ProxySQL's firewall whitelist: learn each role's statements, then run only those.
+type AllowlistConfig struct {
+	Mode  string   `json:"mode"`  // learn records each statement of the roles; enforce rejects any not recorded; off (the default) does neither
+	Roles []string `json:"roles"` // the roles it applies to, such as an AI agent's or a reporting role; none means every role
+}
+
+// applies reports whether the allowlist learns or enforces statements of role.
+func (a AllowlistConfig) applies(role string) bool {
+	return (a.Mode == "learn" || a.Mode == "enforce") && (len(a.Roles) == 0 || slices.Contains(a.Roles, role))
+}
+
+// Allowlist holds each role's learned statements, by fingerprint; its zero value is empty and ready.
+type Allowlist struct {
+	mu    sync.Mutex
+	roles map[string]map[string]string // role to fingerprint to the statement's text, with its constants as $1, $2…
+	dirty bool
+}
+
+// AllowlistEntry is one learned statement.
+type AllowlistEntry struct{ Role, Fingerprint, Query string }
+
+// learn records a role's statement and reports whether it is new.
+func (a *Allowlist) learn(role, fingerprint, query string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.roles == nil {
+		a.roles = map[string]map[string]string{}
+	}
+	if a.roles[role] == nil {
+		a.roles[role] = map[string]string{}
+	}
+	if _, ok := a.roles[role][fingerprint]; ok {
+		return false
+	}
+	a.roles[role][fingerprint] = query
+	a.dirty = true
+	return true
+}
+
+// allowed reports whether a role's statement was learned.
+func (a *Allowlist) allowed(role, fingerprint string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, ok := a.roles[role][fingerprint]
+	return ok
+}
+
+// List returns every learned statement, by role and then fingerprint.
+func (a *Allowlist) List() []AllowlistEntry {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []AllowlistEntry
+	for role, prints := range a.roles {
+		for fp, q := range prints {
+			out = append(out, AllowlistEntry{Role: role, Fingerprint: fp, Query: q})
+		}
+	}
+	slices.SortFunc(out, func(x, y AllowlistEntry) int {
+		return cmp.Or(cmp.Compare(x.Role, y.Role), cmp.Compare(x.Fingerprint, y.Fingerprint))
+	})
+	return out
+}
+
+// Changed reports whether anything was learned since the last call, so it needs saving.
+func (a *Allowlist) Changed() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	changed := a.dirty
+	a.dirty = false
+	return changed
+}
+
+// Save writes the allowlist as JSON: role to fingerprint to the statement's text.
+func (a *Allowlist) Save(w io.Writer) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return json.MarshalWrite(w, a.roles, jsontext.WithIndent("  "))
+}
+
+// Load replaces the allowlist with one Save wrote.
+func (a *Allowlist) Load(r io.Reader) error {
+	var roles map[string]map[string]string
+	if err := json.UnmarshalRead(r, &roles); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.roles = roles
+	return nil
+}
+
+// KillKind says what a kill blocks.
+type KillKind string
+
+const (
+	KillTenant      KillKind = "tenant"      // every statement of a tenant
+	KillFingerprint KillKind = "fingerprint" // every statement with a fingerprint, from any tenant
+)
+
+// Kill is a tenant or statement blocked until a time.
+type Kill struct {
+	Kind  KillKind
+	Name  string // the tenant, or the statement's fingerprint
+	Until time.Time
+}
+
+// Kills is the kill switch: tenants and statements blocked by an operator, without a change to the config; its zero value is ready.
+type Kills struct {
+	mu    sync.Mutex
+	until map[Kill]time.Time // keyed by Kind and Name, with Until zero
+}
+
+// Kill blocks kind name until a time, replacing any kill of it.
+func (k *Kills) Kill(kind KillKind, name string, until time.Time) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.until == nil {
+		k.until = map[Kill]time.Time{}
+	}
+	k.until[Kill{Kind: kind, Name: name}] = until
+}
+
+// Unkill lifts a kill and reports whether there was one.
+func (k *Kills) Unkill(kind KillKind, name string) bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	key := Kill{Kind: kind, Name: name}
+	_, ok := k.until[key]
+	delete(k.until, key)
+	return ok
+}
+
+// killed returns how long kind name is still blocked at now.
+func (k *Kills) killed(kind KillKind, name string, now time.Time) (time.Duration, bool) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	until, ok := k.until[Kill{Kind: kind, Name: name}]
+	if !ok || !now.Before(until) {
+		return 0, false
+	}
+	return until.Sub(now), true
+}
+
+// empty reports whether nothing is killed, which spares parsing statements to look them up.
+func (k *Kills) empty() bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	maps.DeleteFunc(k.until, func(_ Kill, until time.Time) bool { return !time.Now().Before(until) })
+	return len(k.until) == 0
+}
+
+// List returns the kills in force at now, the soonest to end first.
+func (k *Kills) List(now time.Time) []Kill {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	var out []Kill
+	for key, until := range k.until {
+		if now.Before(until) {
+			key.Until = until
+			out = append(out, key)
+		}
+	}
+	slices.SortFunc(out, func(a, b Kill) int { return cmp.Or(a.Until.Compare(b.Until), cmp.Compare(a.Name, b.Name)) })
+	return out
+}
+
+// Defaults for learned timeouts.
+const (
+	DefaultTimeoutMultiple = 10
+	DefaultTimeoutMinRuns  = 100
+	DefaultTimeoutFloor    = time.Second
+)
+
+// LearnedTimeouts give each statement a timeout of a multiple of its own p99, within its tenant's statement_timeout.
+type LearnedTimeouts struct {
+	Mode     string   `json:"mode"`     // "on", or "off" (the default)
+	Multiple float64  `json:"multiple"` // of the p99; 0 means 10
+	MinRuns  int64    `json:"min_runs"` // timed runs needed before the p99 is trusted; 0 means 100
+	Floor    Duration `json:"floor"`    // the shortest timeout learned; 0 means 1s
+}
+
+// timeout returns the timeout learned from a statement's p99 over runs; false until it has run min_runs times.
+func (l LearnedTimeouts) timeout(p99 time.Duration, runs int64) (time.Duration, bool) {
+	if runs < cmp.Or(l.MinRuns, DefaultTimeoutMinRuns) || p99 <= 0 {
+		return 0, false
+	}
+	learned := time.Duration(cmp.Or(l.Multiple, DefaultTimeoutMultiple) * float64(p99))
+	return max(learned, cmp.Or(time.Duration(l.Floor), DefaultTimeoutFloor)), true
+}
+
+// Defaults for the login throttle.
+const (
+	DefaultLoginFailures = 10
+	DefaultLoginWindow   = time.Minute
+	DefaultLoginCoolOff  = time.Minute
+)
+
+// LoginThrottle refuses logins at the proxy, before they take a Postgres connection, from an address and role that keep failing.
+type LoginThrottle struct {
+	Mode     string   `json:"mode"`     // "on" (the default) or "off"
+	Failures int      `json:"failures"` // failed logins within window that start a cool-off; 0 means 10
+	Window   Duration `json:"window"`   // 0 means 1m
+	CoolOff  Duration `json:"cool_off"` // how long logins are refused; 0 means 1m
+}
+
+// LoginThrottle returns the login throttle with its defaults filled in; Failures is 0 when it is off.
+func (p *Policy) LoginThrottle() LoginThrottle {
+	t := p.cfg.LoginThrottle
+	if t.Mode == "off" {
+		return LoginThrottle{Mode: "off"}
+	}
+	return LoginThrottle{Mode: "on", Failures: cmp.Or(t.Failures, DefaultLoginFailures),
+		Window: cmp.Or(t.Window, Duration(DefaultLoginWindow)), CoolOff: cmp.Or(t.CoolOff, Duration(DefaultLoginCoolOff))}
 }
 
 // ReplicationLag holds best-effort statements back while a standby lags.
@@ -160,7 +485,15 @@ type Lane struct {
 type Calibration struct {
 	Mode        string  `json:"mode"`        // "on" (the default) charges budgets the calibrated cost; "off" charges the planner's
 	Credibility float64 `json:"credibility"` // runs a plan needs before its own timing counts as much as the server's; 0 means 10
+	ReturnedMB  float64 `json:"returned_mb"` // cost units charged for each MB of rows a statement returns; 0 means 128
+	WALMB       float64 `json:"wal_mb"`      // cost units charged for each MB of WAL a write usually writes; 0 means 128
 }
+
+// DefaultWALMB is the cost of writing a MB of WAL, as for writing it to disk in order.
+const DefaultWALMB = 128
+
+// DefaultReturnedMB is the cost of returning a MB of rows: reading it from disk in order, 128 pages at seq_page_cost 1.
+const DefaultReturnedMB = 128
 
 // PlanFlips sets what happens to a statement whose plan looks like a regression from its usual one.
 type PlanFlips struct {
@@ -219,6 +552,19 @@ var checks = map[string]check{
 		},
 		hint: "Only the schemas allowed for this role may be named.",
 	},
+	"deny_functions": {
+		violatedBy: func(q sqlparse.Query, r Rule) bool {
+			denied := r.Functions
+			if len(denied) == 0 {
+				denied = deniedFunctions
+			}
+			// A schema in front doesn't change what a function does, and a call without one finds it on search_path.
+			return slices.ContainsFunc(q.Functions, func(f string) bool {
+				return slices.ContainsFunc(denied, func(d string) bool { return strings.EqualFold(bareName(d), bareName(f)) })
+			})
+		},
+		hint: "This function changes state outside the statement or reads the server's files, and is not allowed for this role.",
+	},
 	"max_cost": {
 		overBy: func(p plan.Plan, _ func(plan.Table) (float64, bool), r Rule) string {
 			if p.Cost <= r.Cost {
@@ -244,6 +590,26 @@ var checks = map[string]check{
 		},
 		hint: "Add an index that fits the WHERE clause, so the plan does not read whole tables.",
 	},
+}
+
+// deniedFunctions are the built-ins with effects beyond the statement's own rows: ending sessions, reading or writing the server's
+// files, large objects, reaching other servers, changing settings and roles, and WAL control.
+var deniedFunctions = []string{
+	"pg_terminate_backend", "pg_cancel_backend", "pg_reload_conf", "pg_rotate_logfile", "pg_promote",
+	"pg_switch_wal", "pg_create_restore_point", "pg_backup_start", "pg_backup_stop", "pg_logical_emit_message",
+	"pg_read_file", "pg_read_binary_file", "pg_ls_dir", "pg_stat_file", "pg_file_write", "pg_file_rename", "pg_file_unlink",
+	"lo_import", "lo_export", "lo_unlink", "lo_from_bytea", "lo_put",
+	"dblink", "dblink_exec", "dblink_connect", "dblink_connect_u", "dblink_send_query",
+	"set_config", "pg_advisory_lock", "pg_advisory_lock_shared",
+}
+
+// bareName returns a function's name without its schema.
+func bareName(f string) string {
+	_, name, ok := strings.CutLast(f, ".")
+	if !ok {
+		return f
+	}
+	return name
 }
 
 // systemSchema reports whether s is always allowed: drivers and tools read the catalogs, and pg_temp (pg_temp_N) is the session's own.
@@ -291,6 +657,19 @@ func Parse(data []byte) (*Policy, error) {
 func (p *Policy) compile() error {
 	c := &p.cfg
 	var errs []error
+	if a := c.Allowlist; !slices.Contains([]string{"", "learn", "enforce", "off"}, a.Mode) {
+		errs = append(errs, fmt.Errorf("allowlist mode %q: want learn, enforce or off", a.Mode))
+	}
+	if r := c.Runaway; !slices.Contains([]string{"", "log", "slow", "reject", "off"}, r.Action) || r.Watch < 0 {
+		errs = append(errs, fmt.Errorf("runaway: want action log, slow, reject or off, and no negative watch"))
+	}
+	if l := c.LearnedTimeouts; (l.Mode != "" && l.Mode != "on" && l.Mode != "off") || l.Multiple < 0 || (l.Multiple > 0 && l.Multiple < 1) ||
+		l.MinRuns < 0 || l.Floor < 0 {
+		errs = append(errs, fmt.Errorf("learned_timeouts: want mode on or off, a multiple of at least 1 and no negative min_runs or floor"))
+	}
+	if t := c.LoginThrottle; (t.Mode != "" && t.Mode != "on" && t.Mode != "off") || t.Failures < 0 || t.Window < 0 || t.CoolOff < 0 {
+		errs = append(errs, fmt.Errorf("login_throttle: want mode on or off and no negative failures, window or cool_off"))
+	}
 	if c.Unchecked != "" && c.Unchecked != "allow" && c.Unchecked != "reject" {
 		errs = append(errs, fmt.Errorf("unchecked %q: want allow or reject", c.Unchecked))
 	}
@@ -329,6 +708,8 @@ func (p *Policy) compile() error {
 			errs = append(errs, fmt.Errorf("check %s: mode %q: want enforce or warn", r.Check, r.Mode))
 		case (r.Check == "schema_allowlist") != (len(r.Schemas) > 0):
 			errs = append(errs, fmt.Errorf("check %s: schemas are needed by schema_allowlist and allowed only there", r.Check))
+		case r.Check != "deny_functions" && len(r.Functions) > 0:
+			errs = append(errs, fmt.Errorf("check %s: functions are allowed only in deny_functions", r.Check))
 		case !limit(r.Check == "max_cost", r.Cost):
 			errs = append(errs, fmt.Errorf("check %s: a positive cost limit is needed by max_cost and allowed only there", r.Check))
 		case !limit(r.Check == "max_scan_rows", r.Rows):
@@ -350,7 +731,8 @@ func (p *Policy) compile() error {
 	}
 	errs = append(errs, c.TenantDefaults.validate("tenant_defaults"))
 	budgeted := c.TenantDefaults.Budget != nil
-	timed := c.TenantDefaults.StatementTimeout > 0 || c.TenantDefaults.IdleInTransactionTimeout > 0
+	byCapacity := c.TenantDefaults.Budget != nil && c.TenantDefaults.Budget.Capacity > 0
+	timed := c.TenantDefaults.limited()
 	for name, t := range c.Tenants {
 		if !t.Mode.valid() {
 			errs = append(errs, fmt.Errorf("tenant %s: mode %q: want enforce or warn", name, t.Mode))
@@ -360,10 +742,17 @@ func (p *Policy) compile() error {
 		}
 		errs = append(errs, t.validate("tenant "+name))
 		budgeted = budgeted || t.Budget != nil
-		timed = timed || t.StatementTimeout > 0 || t.IdleInTransactionTimeout > 0
+		byCapacity = byCapacity || (t.Budget != nil && t.Budget.Capacity > 0)
+		timed = timed || t.limited()
+	}
+	if byCapacity && c.Scheduler.MaxActive <= 0 {
+		errs = append(errs, errors.New("budgets by capacity need scheduler max_active, the statements the server runs at once"))
 	}
 	if m := c.Calibration.Mode; m != "" && m != "on" && m != "off" {
 		errs = append(errs, fmt.Errorf("calibration mode %q: want on or off", m))
+	}
+	if c.Calibration.ReturnedMB < 0 || c.Calibration.WALMB < 0 {
+		errs = append(errs, errors.New("calibration returned_mb and wal_mb must not be negative"))
 	}
 	if c.Calibration.Credibility < 0 {
 		errs = append(errs, errors.New("calibration credibility must not be negative"))
@@ -410,15 +799,23 @@ func (p *Policy) compile() error {
 	// Fair shares of slots go by cost too, so limited slots need plans as budgets do.
 	p.needsCost = p.costRules || budgeted || slots
 	// A lag hold and a horizon cap act at the slot a statement takes, so every statement must ask for one.
-	p.gated = budgeted || timed || slots || c.ReplicationLag.Max > 0 || c.MVCCHorizon.MaxAge > 0
+	p.gated = budgeted || timed || slots || c.ReplicationLag.Max > 0 || c.MVCCHorizon.MaxAge > 0 || c.LearnedTimeouts.Mode == "on"
 	return errors.Join(errs...)
 }
 
 // validate checks a tenant's budget and timeouts.
+// limited reports whether t sets a timeout or cap, which only a gate can apply.
+func (t Tenant) limited() bool {
+	return t.StatementTimeout > 0 || t.IdleInTransactionTimeout > 0 || t.TransactionTimeout > 0 || t.MaxRows > 0 || t.MaxBytes > 0
+}
+
 func (t Tenant) validate(name string) error {
 	var errs []error
-	if t.StatementTimeout < 0 || t.IdleInTransactionTimeout < 0 {
-		errs = append(errs, fmt.Errorf("%s: statement_timeout and idle_in_transaction_timeout must not be negative", name))
+	if t.MaxRows < 0 || t.MaxBytes < 0 {
+		errs = append(errs, fmt.Errorf("%s: max_rows and max_bytes must not be negative", name))
+	}
+	if t.StatementTimeout < 0 || t.IdleInTransactionTimeout < 0 || t.TransactionTimeout < 0 {
+		errs = append(errs, fmt.Errorf("%s: statement_timeout, idle_in_transaction_timeout and transaction_timeout must not be negative", name))
 	}
 	if _, ok := priorities[t.Priority]; t.Priority != "" && !ok {
 		errs = append(errs, fmt.Errorf("%s: priority %q: want critical, normal or best_effort", name, t.Priority))
@@ -427,8 +824,11 @@ func (t Tenant) validate(name string) error {
 		if b.Rate < 0 || b.Burst < 0 || b.Share < 0 || b.MinCharge < 0 {
 			errs = append(errs, fmt.Errorf("%s: budget rate, burst, share and min_charge must not be negative", name))
 		}
-		if b.Burst > 0 && b.Rate == 0 {
-			errs = append(errs, fmt.Errorf("%s: a budget's burst needs a rate", name))
+		if b.Burst > 0 && b.Rate == 0 && b.Capacity == 0 {
+			errs = append(errs, fmt.Errorf("%s: a budget's burst needs a rate or capacity", name))
+		}
+		if b.Capacity < 0 || b.Capacity > 1 || (b.Capacity > 0 && b.Rate > 0) {
+			errs = append(errs, fmt.Errorf("%s: a budget's capacity is a share from 0 to 1, given in place of a rate", name))
 		}
 		if !slices.Contains([]string{"", string(sched.Queue), string(sched.SlowLane), string(sched.Reject)}, b.WhenOver) {
 			errs = append(errs, fmt.Errorf("%s: budget when_over %q: want queue, slow or reject", name, b.WhenOver))
@@ -535,7 +935,8 @@ func (b *Budget) sched() sched.Budget {
 	if b == nil {
 		return sched.Budget{}
 	}
-	return sched.Budget{Rate: b.Rate, Burst: b.Burst, Share: b.Share, MinCharge: b.MinCharge, WhenOver: sched.Action(b.WhenOver)}
+	return sched.Budget{Rate: b.Rate, Burst: b.Burst, Share: b.Share, MinCharge: b.MinCharge, WhenOver: sched.Action(b.WhenOver),
+		Capacity: b.Capacity}
 }
 
 // tuning returns how the plan history judges.
@@ -550,6 +951,8 @@ func (p *Policy) tenant(name string) Tenant {
 	t.Priority = cmp.Or(t.Priority, d.Priority)
 	t.StatementTimeout = cmp.Or(t.StatementTimeout, d.StatementTimeout)
 	t.IdleInTransactionTimeout = cmp.Or(t.IdleInTransactionTimeout, d.IdleInTransactionTimeout)
+	t.TransactionTimeout = cmp.Or(t.TransactionTimeout, d.TransactionTimeout)
+	t.MaxRows, t.MaxBytes = cmp.Or(t.MaxRows, d.MaxRows), cmp.Or(t.MaxBytes, d.MaxBytes)
 	return t
 }
 
@@ -588,6 +991,18 @@ type Env struct {
 	Tables    TableSizes       // needed by max_scan_rows; nil leaves every table's size unknown
 	Scheduler *sched.Scheduler // shared by every session; nil admits every statement at once
 	Backend   Backend          // told what the session's server connection runs; nil tells no one
+	// WAL gives the WAL a role's statement writes per call in a database, from pg_stat_statements; nil charges writes no WAL.
+	WAL func(database, role, fingerprint string) (bytes float64, ok bool)
+	// P99 gives the p99 of a statement's timed runs by a role and tenant in a database, and how many there were; nil learns no timeouts.
+	P99 func(database, role, tenant, fingerprint string) (time.Duration, int64)
+	// Runaways is the runaway watch list, shared by every session; nil watches nothing.
+	Runaways *Watch
+	// Flipped is told of each new plan flip, for the anomalies it may explain; nil tells no one.
+	Flipped func(database, fingerprint string)
+	// Kills are the tenants and statements an operator has blocked for a while, shared by every session; nil blocks nothing.
+	Kills *Kills
+	// Allowlist is what each role's statements are learned to be, shared by every session; nil learns and enforces nothing.
+	Allowlist *Allowlist
 }
 
 // Backend learns what one session's server connection runs, for checks that look at the whole server, such as the DDL guard.
@@ -629,12 +1044,40 @@ func (p *Policy) priority(who subject) sched.Priority {
 	return prio
 }
 
+// Admin reports whether role may use the admin console, besides superusers.
+func (p *Policy) Admin(role string) bool { return slices.Contains(p.cfg.AdminRoles, role) }
+
 // trusted reports whether role's tags can be believed: they name its statements' tenant and narrow rules.
 func (p *Policy) trusted(role string) bool { return slices.Contains(p.cfg.TrustedRoles, role) }
 
 // Check returns the error to send instead of running sql, or nil, and the gate it passes just before it executes, if any.
 func (c *Checker) Check(sql string, set session.Settings) (*pgproto3.ErrorResponse, session.Gate) {
 	p := c.policy()
+	if l := p.cfg.Allowlist; l.applies(c.role) && c.Env.Allowlist != nil {
+		fp := sqlparse.Fingerprint(sql)
+		switch {
+		case l.Mode == "learn" && fp != "" && !c.Env.Allowlist.allowed(c.role, fp):
+			if c.Env.Allowlist.learn(c.role, fp, sqlparse.Normalize(sql)) {
+				c.log.Info("learned a statement for the allowlist", "query", sqlparse.Normalize(sql))
+			}
+		case l.Mode == "enforce" && !c.Env.Allowlist.allowed(c.role, fp):
+			c.log.Warn("rejected statement", "rule", "allowlist", "query", sqlparse.Normalize(sql))
+			return rejection("42501", "queryguard: statement is not on the role's allowlist",
+				"Only statements learned for this role may run.", "Learn it first with the allowlist in learn mode."), nil
+		}
+	}
+	if k := c.Env.Kills; k != nil && !k.empty() {
+		now := time.Now()
+		tenant := c.tenant(p, sqlparse.Tags(sql))
+		if left, ok := k.killed(KillTenant, tenant, now); ok {
+			c.log.Warn("rejected statement", "rule", "kill", "tenant", tenant)
+			return killed("tenant", left), nil
+		}
+		if left, ok := k.killed(KillFingerprint, sqlparse.Fingerprint(sql), now); ok {
+			c.log.Warn("rejected statement", "rule", "kill", "tenant", tenant, "query", sqlparse.Normalize(sql))
+			return killed("statement", left), nil
+		}
+	}
 	// Without a Backend to tell, nothing needs DDL found, so a policy with nothing else to check needn't parse the statement.
 	guardsDDL := p.guardsDDL && c.Env.Backend != nil
 	if len(p.cfg.Rules) == 0 && !p.gated && !guardsDDL {
@@ -783,12 +1226,49 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 	return func(ctx context.Context, e session.Explain, running bool) session.Admission {
 		t := p.tenant(who.tenant)
 		warn := t.Mode == Warn
-		a := session.Admission{Timeout: time.Duration(t.StatementTimeout), IdleInTransaction: time.Duration(t.IdleInTransactionTimeout)}
+		a := session.Admission{Timeout: time.Duration(t.StatementTimeout), IdleInTransaction: time.Duration(t.IdleInTransactionTimeout),
+			TransactionTimeout: time.Duration(t.TransactionTimeout)}
 		if q.TransactionControl {
 			// A slot may be held by a statement waiting on this transaction's locks, which only its end frees.
 			return a
 		}
+		if q.ReadOnly && !warn {
+			a.MaxRows, a.MaxBytes = t.MaxRows, t.MaxBytes
+		}
+		var fingerprint string
+		runaway, cooled := p.cfg.Runaway, false
+		if w := c.Env.Runaways; w != nil && runaway.Action != "off" {
+			if !w.empty() {
+				fingerprint = sqlparse.Fingerprint(sql)
+				if left, first, ok := w.watched(c.Env.Database, fingerprint, time.Now()); ok {
+					switch {
+					case runaway.Action == "reject" && !warn:
+						c.log.Warn("rejected statement", "rule", "runaway", "tenant", who.tenant, "query", sqlparse.Normalize(sql))
+						return session.Admission{Reject: onWatch(left)}
+					case runaway.Action == "slow":
+						cooled = true
+					case first:
+						c.log.Warn("runaway statement runs again", "tenant", who.tenant, "query", sqlparse.Normalize(sql), "watched_for", left.Round(time.Second))
+					}
+				}
+			}
+			a.Broke = func(i session.Interruption) {
+				// A statement cancelled for its timeout or a cap is a runaway; one cancelled for a lock, by the DDL guard, isn't.
+				if i.Code != "57014" && i.Code != "54000" {
+					return
+				}
+				fp := cmp.Or(fingerprint, sqlparse.Fingerprint(sql))
+				d := cmp.Or(time.Duration(runaway.Watch), DefaultRunawayWatch)
+				w.add(c.Env.Database, fp, sqlparse.Normalize(sql), i.Code, d, time.Now())
+				c.log.Warn("statement put on the runaway watch list", "tenant", who.tenant, "query", sqlparse.Normalize(sql), "code", i.Code,
+					"action", cmp.Or(runaway.Action, "log"), "for", d)
+			}
+		}
 		s := c.Env.Scheduler
+		if s != nil && p.cfg.Calibration.Mode != "off" {
+			perMB := cmp.Or(p.cfg.Calibration.ReturnedMB, DefaultReturnedMB)
+			a.Returned = func(_, bytes int64) { s.Surcharge(who.tenant, float64(bytes)/(1<<20)*perMB) }
+		}
 		// A prepared statement passes its gate at every execution, and the client's wait starts at each.
 		var deadline time.Time
 		if who.wait > 0 && !warn {
@@ -804,7 +1284,7 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 		// The budget is looked at before EXPLAIN, the dearest step, and spent once the cost is known.
 		if s != nil && !warn {
 			if _, err := s.Reserve(ctx, who.tenant); err != nil && !holds.locks() {
-				return c.refuse(err, who, "budget", overBudget(t.Budget))
+				return c.refuse(err, who, "budget", overBudget(t.Budget, s.RetryAfter(who.tenant)))
 			}
 		}
 
@@ -813,7 +1293,7 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 		var usual time.Duration
 		// A session that can't explain the statement here passes no Run, and it is judged without a plan.
 		if q.Explainable && e.Run != nil && (p.costRules || (s != nil && p.needsCost)) {
-			fingerprint := sqlparse.Fingerprint(sql)
+			fingerprint = sqlparse.Fingerprint(sql)
 			pl, rej, ok := c.plan(p, sql, fingerprint, who, warn, e)
 			switch {
 			case rej != nil:
@@ -839,6 +1319,23 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 			ctx, cancel = context.WithDeadline(ctx, start)
 			defer cancel()
 		}
+		if l := p.cfg.LearnedTimeouts; l.Mode == "on" && c.Env.P99 != nil {
+			if fingerprint == "" {
+				fingerprint = sqlparse.Fingerprint(sql)
+			}
+			if learned, ok := l.timeout(c.Env.P99(c.Env.Database, c.role, who.tenant, fingerprint)); ok && (a.Timeout == 0 || learned < a.Timeout) {
+				a.Timeout = learned
+			}
+		}
+		// EXPLAIN leaves out triggers, foreign key checks and index upkeep, which the WAL a write usually writes shows.
+		if !q.ReadOnly && c.Env.WAL != nil && s != nil && p.cfg.Calibration.Mode != "off" {
+			if fingerprint == "" {
+				fingerprint = sqlparse.Fingerprint(sql)
+			}
+			if w, ok := c.Env.WAL(c.Env.Database, c.role, fingerprint); ok {
+				cost += w / (1 << 20) * cmp.Or(p.cfg.Calibration.WALMB, DefaultWALMB)
+			}
+		}
 		if q.DDL || q.Analyzes {
 			// Plans may change once the statement is committed, so they are explained again; forgetting them sooner would let
 			// another session cache an old plan in between.
@@ -861,12 +1358,12 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 			case err != nil && holds.locks():
 				s.Charge(who.tenant, cost)
 			case err != nil:
-				return c.refuse(err, who, "budget", overBudget(t.Budget))
+				return c.refuse(err, who, "budget", overBudget(t.Budget, s.RetryAfter(who.tenant)))
 			default:
 				lane = l
 			}
 		}
-		if flipped {
+		if flipped || cooled {
 			lane = sched.Slow
 		}
 		if !running {
@@ -1012,6 +1509,9 @@ func (c *Checker) learn(p *Policy, sql, fingerprint string, who subject, warn bo
 	}
 	if v.Flip != "" {
 		slow = p.cfg.PlanFlips.Mode != Warn && !warn && c.Env.Scheduler != nil
+		if v.First && c.Env.Flipped != nil {
+			c.Env.Flipped(c.Env.Database, fingerprint)
+		}
 		if v.First {
 			c.log.Warn("plan flip", append([]any{"rule", "plan_flips", "tenant", who.tenant, "fingerprint", fingerprint,
 				"query", sqlparse.Normalize(sql), "why", v.Flip, "cost", pl.Cost, "slow_lane", slow}, c.stale(pl)...)...)
@@ -1176,13 +1676,23 @@ func (c *Checker) unchecked(p *Policy, warn bool, reason string) *pgproto3.Error
 		"QueryGuard rejects statements it cannot check unless unchecked is allow in its config.")
 }
 
-// overBudget is the error for a statement whose tenant's budget is spent.
-func overBudget(b *Budget) *pgproto3.ErrorResponse {
+// overBudget is the error for a statement whose tenant's budget is spent and owes nothing again after retry.
+func overBudget(b *Budget, retry time.Duration) *pgproto3.ErrorResponse {
 	detail := "The tenant's cost budget is spent."
 	if b != nil {
 		detail = fmt.Sprintf("The tenant's cost budget is spent; it refills at %.0f cost units a second.", b.Rate)
 	}
-	return rejection("53000", "queryguard: tenant is over its cost budget", detail, "Retry later, or run fewer or cheaper statements.")
+	return rejection("53000", "queryguard: tenant is over its cost budget", detail, retryHint(retry)+", or run fewer or cheaper statements.")
+}
+
+// retryBase is how long a client turned away for want of a slot is told to wait before trying again.
+const retryBase = time.Second
+
+// retryHint tells the client to retry after d plus up to half again, so clients turned away together don't all come back at once.
+func retryHint(d time.Duration) string {
+	d = max(d, 100*time.Millisecond)
+	d += rand.N(d/2 + 1)
+	return fmt.Sprintf("Retry in about %s", d.Round(100*time.Millisecond))
 }
 
 // busy is the error for a statement that found no free slot in time.
@@ -1192,13 +1702,13 @@ func busy(p *Policy, lane sched.LaneID) *pgproto3.ErrorResponse {
 		wait = cmp.Or(time.Duration(p.cfg.Scheduler.SlowLane.QueueTimeout), sched.DefaultSlowQueueTimeout)
 	}
 	return rejection("53000", "queryguard: too busy to run the statement",
-		fmt.Sprintf("No slot in the %s lane came free within %s.", lane, wait), "Retry later.")
+		fmt.Sprintf("No slot in the %s lane came free within %s.", lane, wait), retryHint(retryBase)+".")
 }
 
 // shed is the error for a best-effort statement turned away while the server is overloaded.
 func shed() *pgproto3.ErrorResponse {
 	return rejection("53000", "queryguard: server overloaded; best-effort statements are shed",
-		"The server is overloaded, so statements of best_effort priority run only when a slot is free.", "Retry later.")
+		"The server is overloaded, so statements of best_effort priority run only when a slot is free.", retryHint(retryBase)+".")
 }
 
 // pastDeadline is the error for a statement that can no longer end before its client's statement_timeout or deadline tag.
@@ -1208,10 +1718,23 @@ func pastDeadline() *pgproto3.ErrorResponse {
 		"Retry later, or allow it more time.")
 }
 
+// killed is the error for a statement of a tenant, or a statement, an operator has blocked for left more.
+func killed(what string, left time.Duration) *pgproto3.ErrorResponse {
+	return rejection("53000", "queryguard: this "+what+" is blocked by an operator",
+		"An operator turned on QueryGuard's kill switch for it.", retryHint(left)+", or ask the operator.")
+}
+
+// onWatch is the error for a statement on the runaway watch list for left more.
+func onWatch(left time.Duration) *pgproto3.ErrorResponse {
+	return rejection("53000", "queryguard: statement is on the runaway watch list",
+		"A recent run of it was cancelled for breaking its timeout or a row cap, so it is turned away while it is watched.",
+		retryHint(left)+", or make it cheaper.")
+}
+
 // heldBack is the error for a best-effort statement held back past its queue timeout, as while a standby lags.
 func heldBack() *pgproto3.ErrorResponse {
 	return rejection("53000", "queryguard: best-effort statements are held back",
-		"Statements of best_effort priority wait while a standby lags too far behind.", "Retry later.")
+		"Statements of best_effort priority wait while a standby lags too far behind.", retryHint(retryBase)+".")
 }
 
 // sameBytes are the client encodings Postgres reads without converting, so its parser sees the bytes QueryGuard's does.
