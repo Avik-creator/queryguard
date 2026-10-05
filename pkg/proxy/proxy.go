@@ -811,7 +811,7 @@ func (s *Server) fleetWants() map[string]fleet.Want {
 	if p == nil || sc == nil {
 		return nil
 	}
-	cfg := p.SchedConfig()
+	cfg := s.byCapacity(p)
 	d := sc.TakeDemand()
 	wants := map[string]fleet.Want{}
 	for _, l := range []struct {
@@ -873,9 +873,13 @@ func (s *Server) applyFleet() {
 	}
 }
 
-// scaled returns cfg with each fleet-wide limit cut to this instance's share, and shut where it has none, as before its first lease.
 // schedConfig is p's scheduler config with budgets by capacity turned into rates and every rate scaled to this instance's lease.
 func (s *Server) schedConfig(p *policy.Policy) sched.Config {
+	return s.scaled(s.byCapacity(p))
+}
+
+// byCapacity is p's scheduler config with budgets by capacity turned into rates, fleet-wide.
+func (s *Server) byCapacity(p *policy.Policy) sched.Config {
 	cfg := p.SchedConfig()
 	capacity := math.Float64frombits(s.capacity.Load())
 	byCapacity := func(b sched.Budget) sched.Budget {
@@ -889,7 +893,7 @@ func (s *Server) schedConfig(p *policy.Policy) sched.Config {
 		cfg.Budgets[t] = byCapacity(b)
 	}
 	cfg.Default = byCapacity(cfg.Default)
-	return s.scaled(cfg)
+	return cfg
 }
 
 // capacityInterval is how often the server's capacity is measured for budgets by capacity.
@@ -917,6 +921,7 @@ func (s *Server) applyCapacity() {
 	}
 }
 
+// scaled returns cfg with each fleet-wide limit cut to this instance's share, and shut where it has none, as before its first lease.
 func (s *Server) scaled(cfg sched.Config) sched.Config {
 	if s.Fleet == nil {
 		return cfg

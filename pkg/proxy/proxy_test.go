@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"math"
 	"net"
 	"os"
 	"slices"
@@ -1230,6 +1231,27 @@ func TestFleetWantsCountRunningSlotsAndLetAStarvedTenantBackIn(t *testing.T) {
 			t.Errorf("acme %+v; want some demand, or it never gets a share back", w)
 		}
 	})
+}
+
+func TestFleetWantsAskForBudgetsByCapacity(t *testing.T) {
+	s := newServer(t, startFakePostgres(t).addr)
+	s.Fleet = &fleet.Fleet{Store: &fleet.Memory{}}
+	s.SetPolicy(mustPolicy(t, `{"scheduler": {"max_active": 4}, "tenant_defaults": {"budget": {"capacity": 0.5}},
+		"tenants": {"acme": {"budget": {"capacity": 0.25}}}}`))
+	for range 10 {
+		s.History.Ran("", "s", plan.Plan{Cost: 1000, Shape: 1}, 100*time.Millisecond, true, plan.Tuning{})
+	}
+	s.applyCapacity()
+	s.scheduler().Surcharge("other", 1)
+
+	// The server does 40000 units a second, so acme's quarter is 10000 and the default half 20000.
+	wants := s.fleetWants()
+	if w := wants["rate:acme"]; math.Abs(w.Capacity-10000) > 1 {
+		t.Errorf("acme wants %+v; want a capacity of 10000", w)
+	}
+	if w := wants["rate:other"]; math.Abs(w.Capacity-20000) > 1 {
+		t.Errorf("other wants %+v; want a capacity of 20000", w)
+	}
 }
 
 // fakeMonitor reports the same activity every second.
