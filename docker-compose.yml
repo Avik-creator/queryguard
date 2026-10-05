@@ -21,11 +21,14 @@ x-postgres: &postgres
   healthcheck:
     # Check over TCP, not the Unix socket: during first-time setup Postgres
     # runs a temporary server on the socket only, which would pass too early.
-    test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d queryguard"]
+    # No shell: a check past its timeout kills the shell, its pg_isready is
+    # reparented to the postmaster (PID 1), and Postgres takes that child's
+    # exit for a crash and restarts.
+    test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "queryguard"]
     # Loading the test data takes a few minutes on first start. Failed checks
     # don't count during start_period, and the first passing check ends it.
     interval: 5s
-    timeout: 3s
+    timeout: 10s
     retries: 5
     start_period: 10m
     start_interval: 2s
