@@ -150,7 +150,8 @@ func (r *backends) get(pid int32) *backend {
 	return r.byPID[pid]
 }
 
-// maxThrottled is how many addresses and roles the login throttle remembers; past it, those whose cool-off and window are over go.
+// maxThrottled is how many addresses and roles the login throttle remembers; past it, those whose cool-off and window are over go,
+// then the one that matters least.
 const maxThrottled = 10000
 
 // loginThrottle counts failed logins by client address and role.
@@ -193,6 +194,9 @@ func (l *loginThrottle) failed(k throttleKey, now time.Time, t policy.LoginThrot
 		if len(l.seen) >= maxThrottled {
 			l.forget(now, t)
 		}
+		if len(l.seen) >= maxThrottled {
+			l.evict(now)
+		}
 		f = &loginFailures{since: now}
 		l.seen[k] = f
 	}
@@ -219,4 +223,21 @@ func (l *loginThrottle) forget(now time.Time, t policy.LoginThrottle) {
 	maps.DeleteFunc(l.seen, func(_ throttleKey, f *loginFailures) bool {
 		return now.After(f.blockedUntil) && now.Sub(f.since) > time.Duration(t.Window)
 	})
+}
+
+// evict drops the entry that matters least: the oldest not cooling off, or else the one whose cool-off ends soonest; the caller holds mu.
+func (l *loginThrottle) evict(now time.Time) {
+	var least throttleKey
+	var worst *loginFailures
+	for k, f := range l.seen {
+		blocked, worstBlocked := now.Before(f.blockedUntil), worst != nil && now.Before(worst.blockedUntil)
+		switch {
+		case worst == nil,
+			!blocked && worstBlocked,
+			!blocked && !worstBlocked && f.since.Before(worst.since),
+			blocked && worstBlocked && f.blockedUntil.Before(worst.blockedUntil):
+			least, worst = k, f
+		}
+	}
+	delete(l.seen, least)
 }

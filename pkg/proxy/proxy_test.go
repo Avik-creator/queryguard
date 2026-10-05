@@ -11,6 +11,7 @@ import (
 	"maps"
 	"math"
 	"net"
+	"net/netip"
 	"os"
 	"slices"
 	"strconv"
@@ -1964,5 +1965,27 @@ func mustBeReady(t *testing.T, conn net.Conn) {
 	t.Helper()
 	if _, ok := receive(t, conn).(*pgproto3.ReadyForQuery); !ok {
 		t.Fatal("no ReadyForQuery")
+	}
+}
+
+func TestLoginThrottleRemembersNoMoreThanItsMax(t *testing.T) {
+	var l loginThrottle
+	rules := policy.LoginThrottle{Failures: 2, Window: policy.Duration(time.Minute), CoolOff: policy.Duration(time.Minute)}
+	now := time.Now()
+	addr := netip.MustParseAddr("192.0.2.1")
+	blocked := throttleKey{addr, "blocked"}
+	l.failed(blocked, now, rules)
+	l.failed(blocked, now, rules)
+
+	// A client trying a new role name each time, within one window.
+	for i := range maxThrottled + 10 {
+		l.failed(throttleKey{addr, "role" + strconv.Itoa(i)}, now, rules)
+	}
+
+	if n := len(l.seen); n > maxThrottled {
+		t.Errorf("remembers %d; want at most %d", n, maxThrottled)
+	}
+	if l.coolingOff(blocked, now) == 0 {
+		t.Error("a cooling-off login was forgotten before ones that only failed once")
 	}
 }
