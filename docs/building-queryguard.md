@@ -5,6 +5,11 @@ each tenant a budget, so one tenant's expensive queries can't starve the
 rest of a shared PostgreSQL server. This post is about how it decides, what
 broke on the way to v1.0, and what the numbers say.
 
+[![QueryGuard in 15 seconds: a rogue tenant's full scan stalls everyone, QueryGuard prices it, and the benchmark's numbers](queryguard.gif)](queryguard.mp4)
+
+*The short version, in 15 seconds. Select it for the [MP4 with sound](queryguard.mp4);
+how it was made and where its numbers come from is [at the end](#the-video).*
+
 ## The problem
 
 Many teams put tenants, services or AI agents on one PostgreSQL server. The
@@ -33,8 +38,9 @@ Every statement goes through five steps on its way to PostgreSQL:
 3. **Calibrate** the planner's cost. Cost units don't map to the same time
    for every plan, so QueryGuard learns, per plan, how long a cost unit takes
    compared with the server as a whole, and charges budgets the corrected
-   cost. The server's own rate weighs each tenant by its runs, so one busy
-   tenant can't drag everyone's charges toward its own.
+   cost. The server's own rate averages the tenants', each counting for its
+   runs up to 100 times its mean cost, so one busy tenant can't drag
+   everyone's charges toward its own.
 4. **Admit** it: take the cost from the tenant's token bucket (burst plus a
    rate), then queue for a slot. Slots are shared fairly, the tenant with the
    least recent use first. An AIMD loop shrinks the number of slots when
@@ -168,9 +174,17 @@ to about 20 µs more. p99 moves far more from run to run than p50 does: on a
 laptop a few hundred microseconds at p99 is often another process, so a
 single p99 cell says less than the three runs behind it.
 
+Most of that is the extra hop any proxy adds. The client talks to
+QueryGuard and QueryGuard talks to PostgreSQL, so every round trip crosses
+two connections where it crossed one, and QueryGuard reads each message
+before passing it on. Here the proxy also shares the laptop's cores with the
+benchmark's client. `select 1` is the worst case, since PostgreSQL does
+almost nothing for it, so the hop is most of what's measured; a statement
+that takes milliseconds hardly notices it.
+
 pgx prepares each statement once, so rules parse it only then, and the cost
 check finds its plan in the cache. Over the simple protocol every run is
-parsed and fingerprinted, which is where the extra microseconds go.
+parsed and fingerprinted, which adds another 10–40 µs to `select 1`.
 
 ### What a rogue tenant costs everyone else
 
@@ -214,6 +228,14 @@ the other missed at 2.69 ms. Which version misses most also moves between
 benches: before the audit's fixes it was 18, in all three runs, and 17 in
 two.
 
+### The trade
+
+Put together: QueryGuard costs every statement 30–44 µs on a quiet server,
+and when one tenant turns rogue it keeps everyone else's p99 at 1.1–3.5 ms
+instead of 5–8 ms, while that tenant runs 5 to 8 full reads instead of 23 to
+45. On a server where no one misbehaves the microseconds are pure cost; the
+point of an admission controller is the day someone does.
+
 ### Reading the raw output
 
 `make bench` writes two files per version and run into `bench/`:
@@ -225,6 +247,18 @@ two.
   scenario, with `innocent p50`, `p99`, and `rogue ran N, refused M`: the
   rogue table. A run that missed the 1.5 times target ends in
   `--- FAIL: TestRogueTenant`, with the scenario and its limit just above.
+
+## The video
+
+The video at the top is one HTML page, drawn frame by frame from a function
+of time with Canvas 2D, a variable font and Web Audio, then captured in
+headless Chromium and encoded with ffmpeg. Its numbers come from the
+benchmark above. The two traffic shots replay PostgreSQL 17's first run:
+innocent p99 of 5.60 ms straight to PostgreSQL and 2.29 ms through
+QueryGuard, with a rogue that ran 7 full reads and was refused 12,037 times.
+Each 15-second scenario is squeezed into 3 seconds, so its counters show
+the run's real totals rather than one tick per statement. The range bars
+span all nine runs and are drawn to scale.
 
 ## Try it
 
