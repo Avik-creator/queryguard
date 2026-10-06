@@ -2,6 +2,7 @@ package compat
 
 import (
 	"context"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -73,6 +74,22 @@ var (
 // rogueBudget lets the rogue tenant spend about a third of one full read of the 10M-row orders table a second.
 const rogueBudget = `{"rate": 50000, "burst": 200000, "min_charge": 100, "when_over": "reject"}`
 
+func TestRogueRegressionAllowsNoise(t *testing.T) {
+	for _, tc := range []struct {
+		base, got time.Duration
+		want      bool
+	}{
+		{2 * time.Millisecond, 3 * time.Millisecond, false},
+		{2 * time.Millisecond, 3700 * time.Microsecond, true},
+		{100 * time.Microsecond, 1050 * time.Microsecond, false},
+		{100 * time.Microsecond, 1200 * time.Microsecond, true},
+	} {
+		if got := regressed(tc.base, tc.got); got != tc.want {
+			t.Errorf("regressed(%v, %v) = %v; want %v", tc.base, tc.got, got, tc.want)
+		}
+	}
+}
+
 // TestRogueTenant is M4's acceptance test: innocent tenants' latency next to a rogue one, with and without QueryGuard (QG_ROGUE=1).
 func TestRogueTenant(t *testing.T) {
 	if os.Getenv("QG_ROGUE") == "" {
@@ -90,6 +107,15 @@ func TestRogueTenant(t *testing.T) {
 	// QueryGuard's scenarios are held against a baseline through it, so they measure the rogue, not the proxy's overhead.
 	direct := runTenants(t, upstream, false, false)
 	proxied := runTenants(t, perRole.addr, false, false)
+	// QG_ROGUE_BASE holds the innocent p99s, in milliseconds, a run of the pull request's base wrote to QG_ROGUE_OUT on the same machine.
+	base, p99s := map[string]float64{}, map[string]float64{}
+	if path := os.Getenv("QG_ROGUE_BASE"); path != "" {
+		if data, err := os.ReadFile(path); err != nil {
+			t.Logf("no base results to compare with: %v", err)
+		} else if err := json.Unmarshal(data, &base); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+	}
 	report := func(name string, r tenantRun) {
 		t.Logf("%-42s innocent p50 %6.2f ms  p99 %7.2f ms  rogue ran %d, refused %d", name, ms(r.p50), ms(r.p99), r.rogueRan, r.rogueRefused)
 	}
@@ -112,8 +138,27 @@ func TestRogueTenant(t *testing.T) {
 		if limit := sc.baseline.p99*3/2 + time.Millisecond; sc.inTarget && got.p99 > limit {
 			t.Errorf("%s: innocent p99 %v; want within %v", sc.name, got.p99, limit)
 		}
+		if !sc.inTarget {
+			continue
+		}
+		p99s[sc.name] = ms(got.p99)
+		if b, ok := base[sc.name]; ok && regressed(time.Duration(b*float64(time.Millisecond)), got.p99) {
+			t.Errorf("%s: innocent p99 %v; the base had %.2f ms, so this change made it worse", sc.name, got.p99, b)
+		}
+	}
+	if path := os.Getenv("QG_ROGUE_OUT"); path != "" {
+		data, err := json.Marshal(p99s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
+
+// regressed reports whether an innocent p99 of got is worse than base by more than two runs on one machine differ.
+func regressed(base, got time.Duration) bool { return got > base*13/10+time.Millisecond }
 
 // tenantRun is what one scenario measured.
 type tenantRun struct {

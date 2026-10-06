@@ -77,3 +77,35 @@ jobs:
       - name: Show Postgres logs
         if: failure()
         run: docker compose logs pg${{ matrix.pg }}
+
+  rogue:
+    name: Rogue benchmark p99 gate
+    # Compares the pull request with its base on one runner, since runners differ more than a regression worth catching.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # The full data set: the rogue tenant's budget is sized against a full read of the 10M-row orders table.
+      - name: Start Postgres 18
+        run: docker compose up -d --wait pg18
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.x"
+          cache-dependency-path: |
+            go.mod
+            go.sum
+
+      - name: Run the benchmark on the base
+        run: |
+          git worktree add ../base ${{ github.event.pull_request.base.sha }}
+          cd ../base
+          # The base may miss its own targets or predate QG_ROGUE_OUT; the head is judged only against numbers it wrote.
+          QG_ROGUE=1 QG_ROGUE_OUT=$RUNNER_TEMP/base.json QG_TEST_UPSTREAM=127.0.0.1:5418 \
+            go test -run TestRogueTenant -count 1 -v -timeout 10m ./test/compat/ || true
+
+      - name: Run the benchmark on the pull request
+        run: QG_ROGUE=1 QG_ROGUE_BASE=$RUNNER_TEMP/base.json QG_TEST_UPSTREAM=127.0.0.1:5418 go test -run TestRogueTenant -count 1 -v -timeout 10m ./test/compat/
