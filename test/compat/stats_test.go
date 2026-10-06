@@ -2,8 +2,11 @@ package compat
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -11,10 +14,12 @@ import (
 	"time"
 
 	"github.com/Avik-creator/queryguard/pkg/plan"
+	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/proxy"
 	"github.com/Avik-creator/queryguard/pkg/sqlparse"
 	"github.com/Avik-creator/queryguard/pkg/stats"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestStatsCountEveryQueryModeByTenant(t *testing.T) {
@@ -231,5 +236,61 @@ func TestLockPileUpRaisesOneAnomalyAndSteadyLoadNone(t *testing.T) {
 	}
 	if len(ended) != len(started) {
 		t.Errorf("after the pile-up %+v; want each anomaly ended", ended)
+	}
+}
+
+func TestReplayedTrafficGetsTheVerdictsEnforceGave(t *testing.T) {
+	const config = `{"trusted_roles": ["postgres"], "tenants": {"warned": {"mode": "warn"}}, "rules": [
+		{"check": "require_where"}, {"check": "deny_ddl"}, {"check": "deny_functions"},
+		{"check": "read_only", "match": {"tenants": ["agent"]}}]}`
+	path := filepath.Join(t.TempDir(), "traffic.jsonl")
+	table := &stats.Table{Traffic: &stats.TrafficLog{Path: path}}
+	qg := startProxyWith(t, func(s *proxy.Server) {
+		s.Policy = mustPolicy(t, config)
+		s.Stats = table
+	})
+	admin := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
+	name := fmt.Sprintf("qg_replay_%d", time.Now().UnixNano())
+	mustExec(t, admin, "create table "+name+" as select g as id, 0 as v from generate_series(1, 100) g")
+	t.Cleanup(func() { admin.Exec(context.Background(), "drop table "+name) })
+
+	// A day's mix, by tenant: reads and writes that run, ones the rules refuse, ones Postgres fails, and a warned tenant's.
+	day := map[string][]string{
+		"app": {"select v from " + name + " where id = 1", "update " + name + " set v = v + 1 where id = 2", "update " + name + " set v = 0",
+			"select pg_terminate_backend(0)", "create index on " + name + " (v)", "select 1/0 from " + name + " where id = 3"},
+		"agent": {"select count(*) from " + name, "insert into " + name + " values (101, 0)", "select set_config('work_mem', '1MB', false)",
+			"select v from " + name + " where id = 4 for update"},
+		"warned": {"update " + name + " set v = 1", "select v from " + name + " where id = 5"},
+	}
+	refused := map[string]int{}
+	var sent int64
+	for tenant, statements := range day {
+		conn := qg.connect(t, "sslmode=disable")
+		for round := range 5 {
+			for _, sql := range statements {
+				mode := []pgx.QueryExecMode{pgx.QueryExecModeCacheStatement, pgx.QueryExecModeSimpleProtocol}[round%2]
+				_, err := conn.Exec(t.Context(), sql+" /*tenant='"+tenant+"'*/", mode)
+				sent++
+				if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == "42501" {
+					refused[policy.RuleName(pgErr.Message)]++
+				}
+			}
+		}
+	}
+
+	var recs []stats.Record
+	waitFor(t, 5*time.Second, func() bool {
+		recs, _, _ = stats.ReadTraffic(path)
+		return int64(len(recs)) >= sent
+	})
+	sim := policy.Simulate(mustPolicy(t, config), nil, recs)
+	got := map[string]int{}
+	for name, r := range sim.Rules {
+		got[name] = r.Count
+	}
+	t.Logf("enforce refused %v", refused)
+	if !maps.Equal(got, refused) || sim.NewlyRejected != 0 || sim.NoLongerRejected != 0 || len(sim.NotSimulated) != 0 {
+		t.Errorf("replay refused %v, newly rejected %d, no longer %d, not simulated %q; want what enforce refused, %v",
+			got, sim.NewlyRejected, sim.NoLongerRejected, sim.NotSimulated, refused)
 	}
 }
