@@ -98,15 +98,84 @@ miss.
   share an address. A cancel for one of the old process's sessions reached
   the new one, which forwarded it to the owner's address, which was its own.
 
+## A fix that made things worse
+
+The benchmark ran again after the audit, and through QueryGuard the rogue
+ran twice as many full reads as before. One of the audit's fixes caused it.
+
+QueryGuard calibrates each plan against the server's time per cost unit, an
+average over tenants weighted by their mean cost. The audit had found that a
+plan of a disabled plan type, which PostgreSQL before 18 prices at 10 billion
+units more, would set that average for everyone, so the fix capped each
+tenant's weight at a mean cost of 1000. But next to a rogue, every innocent
+lookup waits its turn, and hundreds of them, each now weighing nearly as
+much as a full read, pulled the server's time per unit up. A full read then
+looked cheap beside it and was charged about half.
+
+The cap is gone. A plan whose cost carries the 10 billion is left out of the
+server's average instead, the one case the cap was meant for, and a test now
+holds the server's timing to the full read's with four tenants' waiting
+lookups beside it. ROGUE_AFTER_FIX
+
+The lesson is an old one: a fix needs the same test that found the bug and
+the tests that guard what it might break. The unit tests had a rogue and one
+waiting lookup; the benchmark had a rogue and three busy tenants.
+
 ## The numbers
 
-NUMBERS
+Everything here is from `make bench`: three runs on each of PostgreSQL 16,
+17 and 18, with the versions taking turns within each run so that a machine
+growing warmer or busier doesn't favour the first. It ran on an Apple M1,
+with PostgreSQL in Docker (OrbStack) and the proxy in the benchmark's
+process, so these are laptop numbers: the shape matters more than the
+microseconds.
+
+### What the proxy costs
+
+Each query runs 5,000 times, straight to PostgreSQL and through QueryGuard:
+without rules, with TLS from the client, with rules, and with cost rules,
+over pgx's default extended protocol and over the simple one. The tables
+show the median p50 and p99 of the three runs.
+
+OVERHEAD_TABLES
+
+OVERHEAD_SUMMARY
+
+pgx prepares each statement once, so rules parse it only then, and the cost
+check finds its plan in the cache. Over the simple protocol every run is
+parsed and fingerprinted, which is where the extra microseconds go.
+
+### What a rogue tenant costs everyone else
+
+Three innocent tenants run indexed lookups on six connections, next to a
+rogue running full reads of the 10M-row `orders` table on six more, for 15
+seconds a scenario. Through QueryGuard the rogue has a budget of 50,000 cost
+units a second, with 200,000 of burst, against a full read planned at about
+169,000, and 8 slots shared fairly. The test passes when innocent p99
+through QueryGuard stays within 1.5 times the same path's baseline, plus a
+millisecond of slack.
+
+ROGUE_TABLE
+
+ROGUE_SUMMARY
+
+### Reading the raw output
+
+`make bench` writes two files per version and run into `bench/`:
+
+- `bench/overhead-pg<N>-<run>.txt` holds one `BenchmarkOverhead/<query>/<path>`
+  line per query and path; its `p50-µs` and `p99-µs` columns are the overhead
+  tables.
+- `bench/rogue-pg<N>-<run>.txt` holds one `overhead_test.go` line per
+  scenario, with `innocent p50`, `p99`, and `rogue ran N, refused M`: the
+  rogue table. A run that missed the 1.5 times target ends in
+  `--- FAIL: TestRogueTenant`, with the scenario and its limit just above.
 
 ## Try it
 
 ```sh
 make up       # PostgreSQL 16-19 in Docker, with a 10M-row table
-make bench    # the numbers above, into bench/
+make bench    # the numbers above, into bench/ (about 20 minutes)
 ```
 
 The README covers the rest: the rules, budgets, the admin console, the

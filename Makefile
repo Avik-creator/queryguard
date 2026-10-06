@@ -28,7 +28,7 @@ overhead: ## Measure p50/p99 query latency with and without the proxy (PG as for
 rogue: ## Measure innocent tenants' latency next to a rogue tenant, with and without the proxy (PG as for compat)
 	QG_ROGUE=1 QG_TEST_UPSTREAM=127.0.0.1:54$(PG) go test -run TestRogueTenant -count 1 -v -timeout 10m ./test/compat/
 
-bench: ## Run overhead and rogue on PG 16, 17 and 18, three runs each, into bench/ (takes about 40 minutes)
+bench: ## Run overhead and rogue on PG 16, 17 and 18, three runs each, into bench/ (takes about 20 minutes)
 	mkdir -p bench
 	# Versions take turns within each run, so the machine growing busier or warmer doesn't favour the first.
 	for run in 1 2 3; do for pg in 16 17 18; do \
