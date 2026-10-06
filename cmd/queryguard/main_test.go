@@ -357,9 +357,27 @@ func TestTLSWarningsNameEachUnverifiedConnection(t *testing.T) {
 	}
 }
 
+func TestHangupDuringStartupWaitsForTheHandler(t *testing.T) {
+	// logrotate's postrotate can signal a process still loading its config.
+	hup := catchHangups()
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	reloaded := make(chan struct{}, 1)
+	stop := onHangup(hup, slog.New(slog.DiscardHandler), func() { reloaded <- struct{}{} })
+	defer stop()
+	select {
+	case <-reloaded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the SIGHUP sent during startup never reached the handler")
+	}
+}
+
 func TestHangupWithoutConfigDoesNotStopTheProcess(t *testing.T) {
 	reloaded := make(chan struct{}, 1)
-	stop := onHangup(slog.New(slog.DiscardHandler), func() { reloaded <- struct{}{} })
+	stop := onHangup(catchHangups(), slog.New(slog.DiscardHandler), func() { reloaded <- struct{}{} })
 	defer stop()
 	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
 		t.Fatal(err)

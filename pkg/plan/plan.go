@@ -697,10 +697,16 @@ func (m *Monitor) Run(ctx context.Context, report func(Activity)) {
 		}
 		failed = 0
 		// Lock wait time counts only once a wait ends, so its growth over a second is how many sessions waited on average.
-		if !lastAt.IsZero() && a.finishedWaitMS >= last.finishedWaitMS {
-			a.FinishedWaits = (a.finishedWaitMS - last.finishedWaitMS) / float64(time.Since(lastAt).Milliseconds())
+		switch elapsed := time.Since(lastAt); {
+		case lastAt.IsZero() || a.finishedWaitMS < last.finishedWaitMS:
+			last, lastAt = a, time.Now()
+		case elapsed >= cmp.Or(m.Interval, DefaultMonitorInterval)/2:
+			a.FinishedWaits = (a.finishedWaitMS - last.finishedWaitMS) / (elapsed.Seconds() * 1000)
+			last, lastAt = a, time.Now()
+		default:
+			// A reading just after the last, as when a slow one left a tick waiting, is too soon to give a rate of its own.
+			a.FinishedWaits = last.FinishedWaits
 		}
-		last, lastAt = a, time.Now()
 		if time.Since(statementsAt) >= cmp.Or(m.StatementsEvery, DefaultStatementsInterval) {
 			statementsAt = time.Now()
 			rctx, cancel := context.WithTimeout(ctx, catalogTimeout)

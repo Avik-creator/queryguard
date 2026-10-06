@@ -78,15 +78,15 @@ type Fleet struct {
 	name     string
 	reply    Reply
 	leases   map[string]held
-	capacity map[string]float64 // each resource's capacity, as last wanted
 	crowded  bool               // more instances than MaxInstances were live at the last renewal
 }
 
 // held is a lease in use.
 type held struct {
-	grant float64
-	seq   int64
-	sent  time.Time // when the request that got it went out, which is before the store started it
+	grant    float64
+	seq      int64
+	sent     time.Time // when the request that got it went out, which is before the store started it
+	capacity float64   // the capacity that request gave, which the store counts the fallback share of
 }
 
 // Run renews the instance's leases every Interval with what wants returns, calling changed (if not nil) after each renewal,
@@ -114,12 +114,6 @@ func (f *Fleet) renew(ctx context.Context, wants map[string]Want) {
 	for r, l := range f.leases {
 		req.Applied[r] = l.seq
 	}
-	if f.capacity == nil {
-		f.capacity = map[string]float64{}
-	}
-	for r, w := range wants {
-		f.capacity[r] = w.Capacity
-	}
 	f.mu.Unlock()
 
 	// A reply that comes after the next renewal is due is of no use.
@@ -146,13 +140,14 @@ func (f *Fleet) renew(ctx context.Context, wants map[string]Want) {
 		f.leases = map[string]held{}
 	}
 	for r, g := range reply.Grants {
-		f.leases[r] = held{grant: g, seq: reply.Seq, sent: sent}
+		f.leases[r] = held{grant: g, seq: reply.Seq, sent: sent, capacity: wants[r].Capacity}
 	}
 }
 
 // Share returns how much of resource the instance may use now: its lease's grant while the lease lasts; then, while the store
 // can't be reached, as much of it as fits the fallback share, capacity ÷ MaxInstances, which the store keeps counting for an
-// instance it hasn't heard from in DeadAfter; and nothing after that.
+// instance it hasn't heard from in DeadAfter; and nothing after that. Each ends here two Intervals early, since what Share
+// returns is used until the next renewal ends.
 func (f *Fleet) Share(resource string) float64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -160,12 +155,12 @@ func (f *Fleet) Share(resource string) float64 {
 	if !ok {
 		return 0
 	}
-	now := time.Now()
+	now, early := time.Now(), min(2*f.interval(), f.ttl()/2)
 	switch {
-	case now.Before(l.sent.Add(f.ttl())):
+	case now.Before(l.sent.Add(f.ttl() - early)):
 		return l.grant
-	case now.Before(l.sent.Add(f.deadAfter())):
-		return min(l.grant, f.capacity[resource]/float64(f.maxInstances()))
+	case now.Before(l.sent.Add(f.deadAfter() - early)):
+		return min(l.grant, l.capacity/float64(f.maxInstances()))
 	}
 	return 0
 }

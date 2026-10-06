@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -978,6 +979,24 @@ func TestRateIsTheBudgetInForce(t *testing.T) {
 			t.Errorf("Rate(%s) = %v; want %v", tenant, got, want)
 		}
 	}
+}
+
+func TestDemandOfForgottenTenantsIsForgotten(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Without a fleet nothing takes the demand, so it must not keep every tenant ever charged.
+		s := New(Config{})
+		for i := range maxTenants {
+			s.Charge("old"+strconv.Itoa(i), 1)
+		}
+		time.Sleep(time.Hour)
+		for i := range maxTenants {
+			s.Charge("new"+strconv.Itoa(i), 1)
+		}
+
+		if n := len(s.demand.Spent); n > maxTenants+1 {
+			t.Errorf("demand kept for %d tenants; want no more than the %d tenants kept", n, maxTenants)
+		}
+	})
 }
 
 func TestRetryAfterAHugeDebtIsLong(t *testing.T) {

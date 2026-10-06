@@ -102,6 +102,48 @@ func TestLostStoreKeepsWhatFitsTheFallbackShareThenNothing(t *testing.T) {
 	})
 }
 
+func TestLeaseRunsOutHereBeforeTheStoreGivesItAway(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &faulty{Store: &Memory{}}
+		f := &Fleet{Store: store, Name: "a", MaxInstances: 4}
+		go f.Run(t.Context(), wanting(100, 100), nil)
+		time.Sleep(1500 * time.Millisecond)
+		store.down.Store(true)
+
+		// The last renewal went out at 1s. A share read now is used until the next renewal ends, up to two intervals on, by
+		// when the store counts the lease as run out.
+		time.Sleep(DefaultTTL - 2*DefaultInterval)
+		if got := f.Share("rate:acme"); got != 25 {
+			t.Errorf("share two intervals before the store's lease ends = %v; want the fallback share, 100/4", got)
+		}
+		time.Sleep(DefaultDeadAfter - DefaultTTL)
+		if got := f.Share("rate:acme"); got != 0 {
+			t.Errorf("share two intervals before the store forgets the instance = %v; want 0", got)
+		}
+	})
+}
+
+func TestFallbackShareIsOfTheCapacityTheStoreGot(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &faulty{Store: &Memory{}}
+		f := &Fleet{Store: store, Name: "a", MaxInstances: 4}
+		var capacity atomic.Int64
+		capacity.Store(8)
+		go f.Run(t.Context(), func() map[string]Want {
+			return map[string]Want{"rate:acme": {Capacity: float64(capacity.Load()), Demand: 100}}
+		}, nil)
+		time.Sleep(1500 * time.Millisecond)
+		store.down.Store(true)
+		// The store never hears of the new capacity, so it still counts this instance at 8/4.
+		capacity.Store(40)
+
+		time.Sleep(DefaultTTL)
+		if got := f.Share("rate:acme"); got != 2 {
+			t.Errorf("fallback share = %v; want 2, a quarter of the capacity the store last got", got)
+		}
+	})
+}
+
 func TestInstancesGetDistinctIDsAndKnowEachOther(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		store := &Memory{}

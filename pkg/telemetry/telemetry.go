@@ -278,7 +278,17 @@ func (r *Registry) CounterFunc(name, help string, collect func(emit func(v float
 
 func (c *collected) write(w *bufio.Writer) {
 	c.header(w)
-	c.collect(func(v float64, values ...string) { c.sample(w, "", c.fit(values), nil, v) })
+	n, rest, folded := 0, 0.0, false
+	c.collect(func(v float64, values ...string) {
+		if n++; n > maxSeries {
+			rest, folded = rest+v, true
+			return
+		}
+		c.sample(w, "", c.fit(values), nil, v)
+	})
+	if folded {
+		c.sample(w, "", other(len(c.labels)), nil, rest)
+	}
 }
 
 // counter returns the counter called name, or nil.

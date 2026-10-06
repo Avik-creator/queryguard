@@ -666,6 +666,38 @@ func TestMonitorTurnsFinishedLockWaitTimeIntoARate(t *testing.T) {
 	})
 }
 
+func TestMonitorRateOfReadingsAtOnceIsNoFlood(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var polls atomic.Int32
+		m := &Monitor{read: func(context.Context, []Table) (Activity, error) {
+			switch polls.Add(1) {
+			case 2:
+				// A slow read leaves a tick waiting, so the next read starts as soon as this one ends.
+				time.Sleep(2*DefaultMonitorInterval - time.Millisecond)
+				return Activity{}, nil
+			case 3:
+				return Activity{finishedWaitMS: 1000}, nil
+			}
+			return Activity{}, nil
+		}}
+		var mu sync.Mutex
+		var got []int
+		go m.Run(t.Context(), func(a Activity) {
+			mu.Lock()
+			defer mu.Unlock()
+			got = append(got, a.LockWaits())
+		})
+
+		time.Sleep(4 * DefaultMonitorInterval)
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(got) < 3 || got[2] > 1000 {
+			t.Errorf("lock waits %v; want a third reading, of no more than the 1000ms waited", got)
+		}
+	})
+}
+
 func TestMonitorSkipsFailedReads(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var polls atomic.Int32

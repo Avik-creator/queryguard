@@ -630,7 +630,10 @@ func (s *Scheduler) forgetIdle() {
 	}
 	for name := range s.tenants {
 		if t := s.refresh(name); !waiting[name] && t.tokens >= s.budget(name).Burst && t.usage < 1 {
+			// Without a fleet nothing takes the demand, so it goes with the tenant.
 			delete(s.tenants, name)
+			delete(s.demand.Spent, name)
+			delete(s.demand.Starved, name)
 		}
 	}
 }

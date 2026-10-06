@@ -170,6 +170,7 @@ func newLogger(opts options, console io.Writer) (*slog.Logger, *telemetry.Regist
 }
 
 func run(opts options, log *slog.Logger, metrics *telemetry.Registry, decisions *telemetry.File) error {
+	hup := catchHangups()
 	certs, err := loadCertificates(opts.tlsCert, opts.tlsKey, opts.requireTLS)
 	if err != nil {
 		return err
@@ -260,7 +261,7 @@ func run(opts options, log *slog.Logger, metrics *telemetry.Registry, decisions 
 		}()
 	}
 	s.Monitor = newMonitor(catalog, s, log)
-	stopHangup := onHangup(log, func() { hangup(s, opts.config, catalog, certs, decisions, log) })
+	stopHangup := onHangup(hup, log, func() { hangup(s, opts.config, catalog, certs, decisions, log) })
 	defer stopHangup()
 	if err := s.Serve(ctx, ln); err != nil {
 		return err
@@ -768,10 +769,15 @@ func reload(s *proxy.Server, path string, catalog *plan.Catalog) error {
 	return nil
 }
 
-// onHangup runs f at each SIGHUP until stop is called; meanwhile a SIGHUP no longer ends the process, as Go's default would.
-func onHangup(log *slog.Logger, f func()) (stop func()) {
+// catchHangups starts catching SIGHUP, which by Go's default ends the process, keeping one for onHangup to handle.
+func catchHangups() chan os.Signal {
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
+	return hup
+}
+
+// onHangup runs f at each SIGHUP caught on hup until stop is called.
+func onHangup(hup chan os.Signal, log *slog.Logger, f func()) (stop func()) {
 	done := make(chan struct{})
 	go safe.Loop(context.Background(), log, "SIGHUP", func(context.Context) {
 		for {

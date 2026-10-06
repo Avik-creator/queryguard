@@ -56,6 +56,25 @@ qg_hits_total 12
 	}
 }
 
+func TestGaugeFoldsLabelSetsPastTheCap(t *testing.T) {
+	var r Registry
+	r.Gauge("qg_running", "Statements running.", func(emit func(float64, ...string)) {
+		for i := range maxSeries + 5 {
+			emit(1, strconv.Itoa(i))
+		}
+	}, "tenant")
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+
+	if n := strings.Count(rec.Body.String(), "qg_running{"); n != maxSeries+1 {
+		t.Errorf("wrote %d series; want %d and one for the rest", n, maxSeries)
+	}
+	if !strings.Contains(rec.Body.String(), `qg_running{tenant="_other"} 5`) {
+		t.Error("the series past the cap aren't added up under _other")
+	}
+}
+
 func TestStalledScrapeHoldsUpNoObservation(t *testing.T) {
 	var r Registry
 	took := r.Histogram("qg_seconds", "Statement time.", []float64{0.1, 1}, "tenant")
