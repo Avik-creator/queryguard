@@ -8,8 +8,11 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http/httptest"
 	"os"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +22,7 @@ import (
 	"github.com/Avik-creator/queryguard/pkg/plan"
 	"github.com/Avik-creator/queryguard/pkg/policy"
 	"github.com/Avik-creator/queryguard/pkg/proxy"
+	"github.com/Avik-creator/queryguard/pkg/telemetry"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -946,6 +950,79 @@ func TestRowCappedReadLeavesItsSessionUsable(t *testing.T) {
 		t.Errorf("read %d rows in a transaction, %v; want all 2000", n, rows.Err())
 	}
 	mustExec(t, conn, "commit")
+}
+
+func TestOverloadShrinksTheLimitAndShedsBestEffort(t *testing.T) {
+	metrics := &telemetry.Registry{}
+	qg := startProxyWith(t, func(s *proxy.Server) {
+		s.Policy = mustPolicy(t, `{"trusted_roles": ["postgres"], "tenants": {"batch": {"priority": "best_effort"}},
+			"scheduler": {"max_active": 8, "queue_timeout": "10s", "adaptive": {"floor": 2}}}`)
+		s.Metrics = metrics
+	})
+	limit := func() int {
+		w := httptest.NewRecorder()
+		metrics.ServeHTTP(w, nil)
+		m := regexp.MustCompile(`(?m)^queryguard_admission_limit (\d+)`).FindStringSubmatch(w.Body.String())
+		if m == nil {
+			t.Fatalf("no admission limit in %s", w.Body)
+		}
+		n, _ := strconv.Atoi(m[1])
+		return n
+	}
+
+	// Sixteen sessions, half of them best effort, keep the proxy's eight slots full.
+	var shedApp, shedBatch atomic.Int64
+	ctx, stop := context.WithCancel(t.Context())
+	var load sync.WaitGroup
+	defer func() { stop(); load.Wait() }()
+	for i := range 16 {
+		tenant := []string{"app", "batch"}[i%2]
+		conn := qg.connect(t, "sslmode=disable")
+		load.Go(func() {
+			for ctx.Err() == nil {
+				_, err := conn.Exec(ctx, "select sum(g) from generate_series(1, 300000) g /*tenant='"+tenant+"'*/")
+				if err != nil && strings.Contains(err.Error(), "best-effort statements are shed") {
+					map[string]*atomic.Int64{"app": &shedApp, "batch": &shedBatch}[tenant].Add(1)
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+		})
+	}
+	time.Sleep(3 * time.Second)
+	if got := limit(); got != 8 || shedBatch.Load() != 0 {
+		t.Fatalf("calm: limit %d, %d shed; want 8 and none", got, shedBatch.Load())
+	}
+
+	// Sessions straight to Postgres keep its CPUs busy, so the proxy's statements run several times slower than they settled at.
+	overload, endOverload := context.WithCancel(ctx)
+	var burners sync.WaitGroup
+	for range 24 {
+		conn := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
+		burners.Go(func() {
+			for overload.Err() == nil {
+				conn.Exec(overload, "select sum(g) from generate_series(1, 3000000) g")
+			}
+		})
+	}
+	lowest := 8
+	for end := time.Now().Add(10 * time.Second); time.Now().Before(end); time.Sleep(250 * time.Millisecond) {
+		lowest = min(lowest, limit())
+	}
+	held := limit()
+	endOverload()
+	burners.Wait()
+	if lowest != 2 || held > 3 || shedBatch.Load() == 0 {
+		t.Errorf("overload: limit fell to %d and was %d at its end, %d best-effort statements shed; want the floor, 2, held, and some shed",
+			lowest, held, shedBatch.Load())
+	}
+
+	// Calm again, the limit grows back one a second and shedding stops.
+	waitFor(t, 15*time.Second, func() bool { return limit() == 8 })
+	shed := shedBatch.Load()
+	time.Sleep(time.Second)
+	if shedBatch.Load() != shed || shedApp.Load() != 0 {
+		t.Errorf("calm again: %d more best-effort statements shed, %d normal ones; want none", shedBatch.Load()-shed, shedApp.Load())
+	}
 }
 
 // requirePG19 skips the test unless conn's server is PostgreSQL 19 or later.
