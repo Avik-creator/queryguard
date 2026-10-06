@@ -324,6 +324,19 @@ func TestHistoryServerTimingWeighsTenantsByCost(t *testing.T) {
 	}
 }
 
+func TestHistoryServerTimingOutlastsOnePlanOfHugeCost(t *testing.T) {
+	var h History
+	for range 100 {
+		h.Ran("shop", "full", Plan{Cost: 169_000, Shape: 1}, time.Second, true, Tuning{})
+	}
+	// With a plan type disabled, PostgreSQL before 18 adds 1e10 to the cost of any plan that must use it anyway.
+	h.Ran("odd", "disabled", Plan{Cost: 1e10, Shape: 2}, 10*time.Millisecond, true, Tuning{})
+
+	if c, _ := h.CostOf(time.Second); c > 169_000*1.5 {
+		t.Errorf("CostOf(1s) = %.0f after one plan of huge cost; want about 169000", c)
+	}
+}
+
 func TestHistoryCostOfTime(t *testing.T) {
 	var h History
 	if c, ok := h.CostOf(time.Second); ok {

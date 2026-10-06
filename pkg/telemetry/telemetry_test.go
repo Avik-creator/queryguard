@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRegistryWritesPrometheusText(t *testing.T) {
@@ -51,6 +54,48 @@ qg_hits_total 12
 	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain; version=0.0.4") {
 		t.Errorf("Content-Type %q; want Prometheus's text format", ct)
 	}
+}
+
+func TestStalledScrapeHoldsUpNoObservation(t *testing.T) {
+	var r Registry
+	took := r.Histogram("qg_seconds", "Statement time.", []float64{0.1, 1}, "tenant")
+	for i := range 200 {
+		took.Observe(1, strconv.Itoa(i))
+	}
+	w := &stalledWriter{header: http.Header{}, writing: make(chan struct{}, 1), release: make(chan struct{})}
+	defer close(w.release)
+	go r.ServeHTTP(w, httptest.NewRequest("GET", "/metrics", nil))
+	<-w.writing
+
+	// Every statement observes its time, so a scraper that stops reading mustn't stop them.
+	done := make(chan struct{})
+	go func() {
+		took.Observe(1, "acme")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Observe waited for a scrape that stopped reading")
+	}
+}
+
+// stalledWriter is a response whose reader stops reading until release is closed.
+type stalledWriter struct {
+	header  http.Header
+	writing chan struct{} // gets a value once a write is stuck
+	release chan struct{}
+}
+
+func (w *stalledWriter) Header() http.Header { return w.header }
+func (w *stalledWriter) WriteHeader(int)     {}
+func (w *stalledWriter) Write(b []byte) (int, error) {
+	select {
+	case w.writing <- struct{}{}:
+	default:
+	}
+	<-w.release
+	return len(b), nil
 }
 
 func TestCounterFoldsLabelSetsPastItsCap(t *testing.T) {

@@ -980,6 +980,16 @@ func TestRateIsTheBudgetInForce(t *testing.T) {
 	}
 }
 
+func TestRetryAfterAHugeDebtIsLong(t *testing.T) {
+	s := New(Config{Budgets: map[string]Budget{"acme": {Rate: 1, Burst: 1, WhenOver: Reject}}})
+	// A plan type disabled before PostgreSQL 18 costs 1e10 for each node that needs it.
+	s.Charge("acme", 1e20)
+
+	if d := s.RetryAfter("acme"); d < 24*time.Hour {
+		t.Errorf("RetryAfter = %v; want a very long time", d)
+	}
+}
+
 func TestSurchargeTakesExactlyItsCost(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := New(Config{Budgets: map[string]Budget{"acme": {Rate: 10, Burst: 10, MinCharge: 5, WhenOver: Reject}}})

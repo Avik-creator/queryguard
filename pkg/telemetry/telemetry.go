@@ -179,10 +179,14 @@ func (c *Counter) value(values ...string) float64 {
 
 func (c *Counter) write(w *bufio.Writer) {
 	c.header(w)
+	// A scraper that stops reading would hold the lock that every statement counted needs, so the series are copied first.
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	series := make([]counterSeries, 0, len(c.series))
 	for _, k := range slices.Sorted(maps.Keys(c.series)) {
-		s := c.series[k]
+		series = append(series, *c.series[k])
+	}
+	c.mu.Unlock()
+	for _, s := range series {
 		c.sample(w, "", s.values, nil, s.v)
 	}
 }
@@ -232,10 +236,16 @@ func (h *Histogram) Observe(v float64, values ...string) {
 
 func (h *Histogram) write(w *bufio.Writer) {
 	h.header(w)
+	// A scraper that stops reading would hold the lock that every statement timed needs, so the series are copied first.
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	series := make([]histogramSeries, 0, len(h.series))
 	for _, k := range slices.Sorted(maps.Keys(h.series)) {
-		s := h.series[k]
+		s := *h.series[k]
+		s.counts = slices.Clone(s.counts)
+		series = append(series, s)
+	}
+	h.mu.Unlock()
+	for _, s := range series {
 		var total uint64
 		for i, n := range s.counts {
 			total += n

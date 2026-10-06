@@ -245,7 +245,7 @@ func (s *Scheduler) wait(ctx context.Context, tenant string, cost float64, charg
 			case SlowLane:
 				lane = Slow
 			default:
-				wait := time.Duration(math.Ceil(-t.tokens / b.Rate * float64(time.Second)))
+				wait := repayTime(t.tokens, b.Rate)
 				s.mu.Unlock()
 				if dl, ok := ctx.Deadline(); ok && time.Now().Add(wait).After(dl) {
 					return 0, context.DeadlineExceeded
@@ -314,6 +314,11 @@ func (s *Scheduler) Tenants() []TenantState {
 	return out
 }
 
+// repayTime returns how long a debt of -tokens takes to repay at rate, capped where a Duration would overflow.
+func repayTime(tokens, rate float64) time.Duration {
+	return time.Duration(min(math.Ceil(-tokens/rate*float64(time.Second)), 1<<62))
+}
+
 // RetryAfter returns how long until tenant owes nothing at its budget's rate; 0 when it owes nothing or has no budget.
 func (s *Scheduler) RetryAfter(tenant string) time.Duration {
 	s.mu.Lock()
@@ -322,7 +327,7 @@ func (s *Scheduler) RetryAfter(tenant string) time.Duration {
 	if b.Rate <= 0 || t.tokens >= 0 {
 		return 0
 	}
-	return time.Duration(math.Ceil(-t.tokens / b.Rate * float64(time.Second)))
+	return repayTime(t.tokens, b.Rate)
 }
 
 // Rate returns tenant's budget rate in force: 0 without a budget, below 0 while it is shut.

@@ -277,7 +277,7 @@ func serveMetrics(addr string, metrics *telemetry.Registry, log *slog.Logger) (s
 	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", metrics)
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 30 * time.Second}
 	go func() {
 		if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
 			log.Error("metrics server stopped", "err", err)
