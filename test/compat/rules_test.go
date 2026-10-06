@@ -941,8 +941,7 @@ func (b *lockedBuffer) String() string {
 }
 
 func TestRepackTakesTheUncheckedPathOnPG19(t *testing.T) {
-	direct := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
-	requirePG19(t, direct)
+	direct := requirePG19(t)
 	name := fmt.Sprintf("qg_repack_%d", time.Now().UnixNano())
 	mustExec(t, direct, "create table "+name+" (id int primary key)")
 	t.Cleanup(func() { direct.Exec(context.Background(), "drop table "+name) })
@@ -964,9 +963,7 @@ func TestRepackTakesTheUncheckedPathOnPG19(t *testing.T) {
 }
 
 func TestMonitorCountsFinishedLockWaitsOnPG19(t *testing.T) {
-	upstream := os.Getenv("QG_TEST_UPSTREAM")
-	locker, waiter := connectTo(t, upstream, "sslmode=disable"), connectTo(t, upstream, "sslmode=disable")
-	requirePG19(t, locker)
+	locker, waiter := requirePG19(t), connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
 	name := fmt.Sprintf("qg_lockstat_%d", time.Now().UnixNano())
 	mustExec(t, locker, "create table "+name+" (id int)")
 	t.Cleanup(func() { locker.Exec(context.Background(), "drop table "+name) })
@@ -1105,9 +1102,13 @@ func TestOverloadShrinksTheLimitAndShedsBestEffort(t *testing.T) {
 	}
 }
 
-// requirePG19 skips the test unless conn's server is PostgreSQL 19 or later.
-func requirePG19(t testing.TB, conn *pgx.Conn) {
+// requirePG19 skips the test unless QG_TEST_UPSTREAM is PostgreSQL 19 or later, and returns a connection to it.
+func requirePG19(t testing.TB) *pgx.Conn {
 	t.Helper()
+	if os.Getenv("QG_TEST_UPSTREAM") == "" {
+		t.Skip("set QG_TEST_UPSTREAM to a PostgreSQL 19 host:port, for example 127.0.0.1:5419 after make up")
+	}
+	conn := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
 	var version int
 	if err := conn.QueryRow(t.Context(), "select current_setting('server_version_num')::int").Scan(&version); err != nil {
 		t.Fatal(err)
@@ -1115,4 +1116,5 @@ func requirePG19(t testing.TB, conn *pgx.Conn) {
 	if version < 190000 {
 		t.Skipf("needs PostgreSQL 19, the server is %d", version)
 	}
+	return conn
 }
