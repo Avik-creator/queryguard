@@ -520,11 +520,10 @@ func (s *Server) loginThrottle() policy.LoginThrottle {
 func logAnomalies(log *slog.Logger, anomalies []stats.Anomaly) {
 	for _, a := range anomalies {
 		if a.Ended {
-			log.Info("anomaly ended", "signal", a.Signal, "value", a.Value, "baseline", a.Baseline)
+			log.Info("anomaly ended", "signals", a.Signals)
 			continue
 		}
-		log.Warn("anomaly", "signal", a.Signal, "value", a.Value, "baseline", a.Baseline, "statements", a.Statements, "flips", a.Flips,
-			"lock_waits", a.LockWaits)
+		log.Warn("anomaly", "signals", a.Signals, "statements", a.Statements, "flips", a.Flips, "lock_waits", a.LockWaits)
 	}
 }
 

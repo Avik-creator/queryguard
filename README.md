@@ -722,12 +722,13 @@ averaged over about 30 minutes, which an anomalous minute doesn't join. A
 minute is anomalous when a signal is above three mean deviations of its
 baseline, twice the baseline, and a floor (50 ms, 2% or 5%). Two such minutes
 in a row start an anomaly and two normal ones end it, so one spike raises
-nothing. The log names what is behind it: the statements with the most slow
-runs or errors that minute, the plans that flipped, and the most sessions
-waiting on locks at once.
+nothing. One incident is one anomaly: a signal that rises while another is
+up joins it, and it ends once every signal is back. The log names what is
+behind it: the statements with slow runs or errors that minute, most first,
+the plans that flipped, and the most sessions waiting on locks at once.
 
 ```
-level=WARN msg=anomaly signal=p99 value=2.1 baseline=0.012 statements="[select * from orders where note like $1]" flips=[] lock_waits=7
+level=WARN msg=anomaly signals="[p99=0.3 (baseline 0.0011) slow=0.1 (baseline 0)]" statements="[select id from jobs where id = $1]" flips=[] lock_waits=8
 ```
 
 ### Recorded traffic and the policy simulator

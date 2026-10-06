@@ -269,7 +269,7 @@ func TestAnomalyNeedsTwoMinutesAboveTheBaselineAndEndsAfterTwoBelow(t *testing.T
 	var tb Table
 	now := time.Now()
 	for i := range 15 {
-		minuteOf(&tb, 100, 2, 0, 10*time.Millisecond)
+		minuteOf(&tb, 100, 10, 0, 10*time.Millisecond)
 		if got := tb.Minute(now.Add(time.Duration(i) * time.Minute)); len(got) != 0 {
 			t.Fatalf("steady minute %d raised %+v", i, got)
 		}
@@ -280,7 +280,7 @@ func TestAnomalyNeedsTwoMinutesAboveTheBaselineAndEndsAfterTwoBelow(t *testing.T
 	if got := tb.Minute(now.Add(15 * time.Minute)); len(got) != 0 {
 		t.Fatalf("one slow minute raised %+v; want nothing until a second", got)
 	}
-	minuteOf(&tb, 100, 2, 0, 10*time.Millisecond)
+	minuteOf(&tb, 100, 10, 0, 10*time.Millisecond)
 	tb.Minute(now.Add(16 * time.Minute))
 
 	minuteOf(&tb, 100, 20, 0, 2*time.Second)
@@ -289,34 +289,72 @@ func TestAnomalyNeedsTwoMinutesAboveTheBaselineAndEndsAfterTwoBelow(t *testing.T
 	tb.LockWaits(7)
 	minuteOf(&tb, 100, 20, 0, 2*time.Second)
 	got := tb.Minute(now.Add(18 * time.Minute))
-	var p99 *Anomaly
-	for i := range got {
-		if got[i].Signal == "p99" {
-			p99 = &got[i]
-		}
+	if len(got) != 1 || got[0].Ended || !hasSignal(got[0], "p99") || !hasSignal(got[0], "slow") {
+		t.Fatalf("two slow minutes raised %+v; want one anomaly, with p99 and slow above their baselines", got)
 	}
-	if p99 == nil || p99.Ended {
-		t.Fatalf("two slow minutes raised %+v; want a p99 anomaly", got)
+	// The fast statement ran no slow runs, so it isn't named.
+	if a := got[0]; !slices.Equal(a.Statements, []string{"select * from orders where note like $1"}) {
+		t.Errorf("anomaly names %q; want only the slow statement", a.Statements)
 	}
-	if len(p99.Statements) == 0 || p99.Statements[0] != "select * from orders where note like $1" {
-		t.Errorf("anomaly names %q; want the slow statement first", p99.Statements)
-	}
-	if len(p99.Flips) != 1 || p99.LockWaits != 7 {
-		t.Errorf("anomaly flips %q, lock waits %d; want the flipped statement and 7", p99.Flips, p99.LockWaits)
+	if a := got[0]; len(a.Flips) != 1 || a.LockWaits != 7 {
+		t.Errorf("anomaly flips %q, lock waits %d; want the flipped statement and 7", a.Flips, a.LockWaits)
 	}
 
-	minuteOf(&tb, 100, 2, 0, 10*time.Millisecond)
+	minuteOf(&tb, 100, 10, 0, 10*time.Millisecond)
 	if got := tb.Minute(now.Add(19 * time.Minute)); len(got) != 0 {
 		t.Fatalf("first normal minute gave %+v; want the anomaly to last", got)
 	}
-	minuteOf(&tb, 100, 2, 0, 10*time.Millisecond)
+	minuteOf(&tb, 100, 10, 0, 10*time.Millisecond)
 	ended := tb.Minute(now.Add(20 * time.Minute))
-	if !slices.ContainsFunc(ended, func(a Anomaly) bool { return a.Signal == "p99" && a.Ended }) {
-		t.Errorf("two normal minutes gave %+v; want the p99 anomaly ended", ended)
+	if len(ended) != 1 || !ended[0].Ended || !hasSignal(ended[0], "p99") {
+		t.Errorf("two normal minutes gave %+v; want the one anomaly ended", ended)
 	}
-	if a := tb.Anomalies(); !slices.ContainsFunc(a, func(a Anomaly) bool { return a.Signal == "p99" }) {
-		t.Errorf("Anomalies = %+v; want the p99 one remembered", a)
+	if a := tb.Anomalies(); len(a) != 2 || a[0].Ended || !a[1].Ended {
+		t.Errorf("Anomalies = %+v; want its start and end remembered", a)
 	}
+}
+
+func TestASignalRisingDuringAnAnomalyJoinsIt(t *testing.T) {
+	var tb Table
+	now := time.Now()
+	for i := range 15 {
+		minuteOf(&tb, 100, 10, 0, 10*time.Millisecond)
+		tb.Minute(now.Add(time.Duration(i) * time.Minute))
+	}
+	var got []Anomaly
+	for i := range 2 {
+		minuteOf(&tb, 100, 20, 0, 2*time.Second)
+		got = append(got, tb.Minute(now.Add(time.Duration(15+i)*time.Minute))...)
+	}
+	// Failures start while the slow runs go on: the same incident, so nothing new is raised.
+	for i := range 2 {
+		minuteOf(&tb, 100, 20, 30, 2*time.Second)
+		got = append(got, tb.Minute(now.Add(time.Duration(17+i)*time.Minute))...)
+	}
+	if len(got) != 1 || got[0].Ended {
+		t.Fatalf("got %+v; want only the anomaly the slow runs started", got)
+	}
+	// It ends once every signal is back: the slow runs stop first, the failures two minutes later.
+	var ended []Anomaly
+	for i := range 2 {
+		minuteOf(&tb, 100, 10, 30, 10*time.Millisecond)
+		ended = append(ended, tb.Minute(now.Add(time.Duration(19+i)*time.Minute))...)
+	}
+	if len(ended) != 0 {
+		t.Fatalf("with failures still high got %+v; want the anomaly to last", ended)
+	}
+	for i := range 2 {
+		minuteOf(&tb, 100, 10, 0, 10*time.Millisecond)
+		ended = append(ended, tb.Minute(now.Add(time.Duration(21+i)*time.Minute))...)
+	}
+	if len(ended) != 1 || !ended[0].Ended || !hasSignal(ended[0], "errors") {
+		t.Errorf("got %+v; want the anomaly ended as the failures stop", ended)
+	}
+}
+
+// hasSignal reports whether a names signal.
+func hasSignal(a Anomaly, signal string) bool {
+	return slices.ContainsFunc(a.Signals, func(r Reading) bool { return r.Signal == signal })
 }
 
 func TestErrorRateAnomalyNamesTheFailingStatement(t *testing.T) {
@@ -332,7 +370,7 @@ func TestErrorRateAnomalyNamesTheFailingStatement(t *testing.T) {
 		got = tb.Minute(now.Add(time.Duration(15+i) * time.Minute))
 	}
 
-	if len(got) != 1 || got[0].Signal != "errors" || got[0].Statements[0] != "insert into orders values ($1)" {
+	if len(got) != 1 || !hasSignal(got[0], "errors") || !slices.Equal(got[0].Statements, []string{"insert into orders values ($1)"}) {
 		t.Errorf("got %+v; want an errors anomaly naming the insert", got)
 	}
 }

@@ -119,6 +119,7 @@ type Table struct {
 	queryPrints  map[int64]string // pg_stat_statements query ID to fingerprint
 	now          minute           // this minute's traffic, for anomalies
 	baselines    map[string]*baseline
+	incident     bool // an anomaly has started and not ended
 	anomalies    []Anomaly
 	flips        []Flip
 }
@@ -444,15 +445,24 @@ var signals = []struct {
 	{"slow", 0.05},
 }
 
-// Anomaly is a signal that stayed well above its baseline, or its end.
+// Anomaly is one incident: signals that stayed well above their baselines, until all are back; or its end.
 type Anomaly struct {
-	Signal          string    // p99 (seconds), errors (the share of statements that failed) or slow (the share far slower than their usual)
-	At              time.Time // the end of the minute that started or ended it
-	Ended           bool
+	Signals    []Reading // those that started it, or those whose return ended it
+	At         time.Time // the end of the minute that started or ended it
+	Ended      bool
+	Statements []string // the statements behind it, most first
+	Flips      []string // statements whose plan flipped that minute
+	LockWaits  int      // the most sessions waiting on locks at once that minute
+}
+
+// Reading is one signal's value in a minute, against its baseline.
+type Reading struct {
+	Signal          string // p99 (seconds), errors (the share of statements that failed) or slow (the share far slower than their usual)
 	Value, Baseline float64
-	Statements      []string // the statements behind it, most first
-	Flips           []string // statements whose plan flipped that minute
-	LockWaits       int      // the most sessions waiting on locks at once that minute
+}
+
+func (r Reading) String() string {
+	return fmt.Sprintf("%s=%g (baseline %g)", r.Signal, r.Value, r.Baseline)
 }
 
 // minute is one minute's traffic.
@@ -555,7 +565,7 @@ func (t *Table) Minute(now time.Time) []Anomaly {
 		"errors": float64(m.errors) / float64(m.calls),
 		"slow":   float64(m.slow) / float64(m.calls),
 	}
-	var out []Anomaly
+	var raised, cleared []Reading
 	for _, sig := range signals {
 		b := t.baselines[sig.name]
 		if b == nil {
@@ -577,14 +587,25 @@ func (t *Table) Minute(now time.Time) []Anomaly {
 			b.dev += (math.Abs(v-b.mean) - b.dev) / w
 			b.n++
 		}
-		switch {
+		switch r := (Reading{Signal: sig.name, Value: v, Baseline: b.mean}); {
 		case !b.active && b.above >= raiseAfter:
 			b.active = true
-			out = append(out, t.anomaly(sig.name, now, false, v, b.mean, m))
+			raised = append(raised, r)
 		case b.active && b.below >= clearAfter:
 			b.active = false
-			out = append(out, t.anomaly(sig.name, now, true, v, b.mean, m))
+			cleared = append(cleared, r)
 		}
+	}
+	// A signal rising during an incident is part of it, so an incident starts and ends one anomaly.
+	var out []Anomaly
+	active := slices.ContainsFunc(slices.Collect(maps.Values(t.baselines)), func(b *baseline) bool { return b.active })
+	switch {
+	case !t.incident && len(raised) > 0:
+		t.incident = true
+		out = append(out, t.anomaly(raised, now, false, m))
+	case t.incident && !active:
+		t.incident = false
+		out = append(out, t.anomaly(cleared, now, true, m))
 	}
 	t.anomalies = append(t.anomalies, out...)
 	if extra := len(t.anomalies) - keptAnomalies; extra > 0 {
@@ -593,27 +614,37 @@ func (t *Table) Minute(now time.Time) []Anomaly {
 	return out
 }
 
-// anomaly describes signal in minute m, naming the statements behind it; the caller holds mu.
-func (t *Table) anomaly(signal string, at time.Time, ended bool, v, base float64, m minute) Anomaly {
-	a := Anomaly{Signal: signal, At: at, Ended: ended, Value: v, Baseline: base, LockWaits: m.lockWaits}
+// anomaly describes readings in minute m, naming the statements behind them; the caller holds mu.
+func (t *Table) anomaly(readings []Reading, at time.Time, ended bool, m minute) Anomaly {
+	a := Anomaly{Signals: readings, At: at, Ended: ended, LockWaits: m.lockWaits}
 	if ended {
 		return a
 	}
 	keys := slices.Collect(maps.Keys(m.byKey))
-	weight := func(k key) (int64, time.Duration) {
+	errs := slices.ContainsFunc(readings, func(r Reading) bool { return r.Signal == "errors" })
+	slow := slices.ContainsFunc(readings, func(r Reading) bool { return r.Signal != "errors" })
+	weight := func(k key) (n int64, took time.Duration) {
 		r := m.byKey[k]
-		if signal == "errors" {
-			return r.errors, 0
+		if errs {
+			n += r.errors
 		}
-		return r.slow, r.took
+		if slow {
+			n, took = n+r.slow, r.took
+		}
+		return n, took
 	}
 	slices.SortFunc(keys, func(x, y key) int {
 		xn, xt := weight(x)
 		yn, yt := weight(y)
 		return cmp.Or(cmp.Compare(yn, xn), cmp.Compare(yt, xt), cmp.Compare(x.fingerprint, y.fingerprint))
 	})
+	// Once some statements failed or ran slow, the rest only shared the minute with them.
+	var most int64
+	if len(keys) > 0 {
+		most, _ = weight(keys[0])
+	}
 	for _, k := range keys {
-		if n, took := weight(k); (n == 0 && took == 0) || len(a.Statements) == namedStatements {
+		if n, took := weight(k); (n == 0 && (most > 0 || took == 0)) || len(a.Statements) == namedStatements {
 			break
 		}
 		if r := t.rows[k]; r != nil && !slices.Contains(a.Statements, r.query) {

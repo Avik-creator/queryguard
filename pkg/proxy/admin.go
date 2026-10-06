@@ -278,14 +278,18 @@ func (s *Server) adminShow(what string, rest []string) (result, error) {
 		}
 		return r, nil
 	case "anomalies":
-		r := result{columns: []string{"at", "signal", "state", "value", "baseline", "statements", "flips", "lock_waits"}, tag: "SHOW"}
+		r := result{columns: []string{"at", "state", "signals", "statements", "flips", "lock_waits"}, tag: "SHOW"}
 		if s.Stats != nil {
 			for _, a := range s.Stats.Anomalies() {
 				state := "started"
 				if a.Ended {
 					state = "ended"
 				}
-				r.rows = append(r.rows, []string{a.At.Format(time.RFC3339), a.Signal, state, num(a.Value), num(a.Baseline),
+				signals := make([]string, len(a.Signals))
+				for i, reading := range a.Signals {
+					signals[i] = reading.String()
+				}
+				r.rows = append(r.rows, []string{a.At.Format(time.RFC3339), state, strings.Join(signals, "; "),
 					strings.Join(a.Statements, "; "), strings.Join(a.Flips, "; "), strconv.Itoa(a.LockWaits)})
 			}
 		}

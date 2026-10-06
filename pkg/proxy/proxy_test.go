@@ -880,12 +880,14 @@ func retryAfterSpending(s *Server, tenant string, cost float64) time.Duration {
 func TestAnomaliesAreLoggedWithWhatIsBehindThem(t *testing.T) {
 	var logs bytes.Buffer
 	logAnomalies(slog.New(slog.NewTextHandler(&logs, nil)), []stats.Anomaly{
-		{Signal: "p99", Value: 2, Baseline: 0.01, Statements: []string{"select * from orders where note like $1"}, Flips: []string{"select $1"}, LockWaits: 7},
-		{Signal: "errors", Ended: true, Value: 0.001, Baseline: 0.001},
+		{Signals: []stats.Reading{{Signal: "p99", Value: 2, Baseline: 0.01}, {Signal: "slow", Value: 0.1}},
+			Statements: []string{"select * from orders where note like $1"}, Flips: []string{"select $1"}, LockWaits: 7},
+		{Signals: []stats.Reading{{Signal: "errors", Value: 0.001, Baseline: 0.001}}, Ended: true},
 	})
 
-	for _, want := range []string{`msg=anomaly signal=p99 value=2 baseline=0.01`, `statements="[select * from orders where note like $1]"`,
-		`flips="[select $1]"`, `lock_waits=7`, `msg="anomaly ended" signal=errors`} {
+	for _, want := range []string{`msg=anomaly signals="[p99=2 (baseline 0.01) slow=0.1 (baseline 0)]"`,
+		`statements="[select * from orders where note like $1]"`, `flips="[select $1]"`, `lock_waits=7`,
+		`msg="anomaly ended" signals="[errors=0.001 (baseline 0.001)]"`} {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("log %q; want %q", logs.String(), want)
 		}
