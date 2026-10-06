@@ -5,19 +5,24 @@ speaks the Postgres wire protocol. It estimates what each query will cost before
 it runs and gives every tenant a budget, so one tenant's expensive queries can't
 starve everyone else.
 
-> **Status:** early development. Milestones M1 to M7 are done: QueryGuard
-> relays sessions, cancel requests and TLS; blocks statements by rule or by
-> their planned cost; gives each tenant a cost budget, a fair share of the
-> server and time limits; learns from how long statements take, to correct
-> their costs and to catch plans that suddenly get worse; adapts to the
-> server's load, cancels DDL stuck in a lock queue, and shares its limits
-> across instances; and keeps query stats, flags anomalies and runaway
-> statements, and has an admin console with a kill switch, a learned
-> allowlist and a policy simulator.
+> **Status:** heading for v1.0. QueryGuard relays sessions, cancel requests
+> and TLS; blocks statements by rule or by their planned cost; gives each
+> tenant a cost budget, a fair share of the server and time limits; learns
+> from how long statements take, to correct their costs and to catch plans
+> that suddenly get worse; adapts to the server's load, cancels DDL stuck in a
+> lock queue, and shares its limits across instances; keeps query stats,
+> flags anomalies and runaway statements, and has an admin console with a
+> kill switch, a learned allowlist and a policy simulator; exports Prometheus
+> metrics and a log of its decisions; ships a preset for AI agents; and
+> restarts without dropping sessions. See [related work](docs/related-work.md)
+> for how it compares with other tools.
 
 ## Planned features
 
-- Prometheus metrics and a log of every decision.
+For v1.1: index suggestions tested with HypoPG, a report of unused and
+duplicate indexes and of bloat, OpenTelemetry spans from sqlcommenter's
+`traceparent`, PostgreSQL 19's plan advice for flipped plans, CEL rules,
+budgets by time of day, usage export and webhook alerts.
 
 ## Requirements
 
@@ -29,6 +34,15 @@ starve everyone else.
 ```sh
 go build -o bin/queryguard ./cmd/queryguard
 ./bin/queryguard -version
+```
+
+Building needs cgo and a C compiler, since QueryGuard reads SQL with
+PostgreSQL's own parser (libpg_query). Or build the image, which listens on
+port 6543 and carries the presets under `/presets`:
+
+```sh
+docker build --build-arg VERSION=$(git describe --tags --always) -t queryguard .
+docker run --rm -p 6543:6543 queryguard -listen :6543 -upstream db.internal:5432
 ```
 
 ## TLS
@@ -49,7 +63,12 @@ requests, which carry no password, are still accepted without it.
 
 TLS to PostgreSQL is set with `-upstream-sslmode` (`disable`, `require` or
 `verify-full`, with the same meanings as in libpq) and `-upstream-ca` for a
-private CA.
+private CA. QueryGuard warns at startup when `-upstream-sslmode=require`
+accepts any certificate, and when `-catalog-dsn` or `-state-dsn` doesn't set
+`sslmode=verify-full`, since a man in the middle could then read their
+passwords. `kill -HUP` reads the certificate and key again, so a renewed
+certificate needs no restart; one that fails to load is logged and the old
+one stays.
 
 ### SCRAM channel binding
 
@@ -62,7 +81,11 @@ checks its own, so with TLS on both sides:
 | The same certificate and key as PostgreSQL | Work, with channel binding end to end |
 | A different certificate | Fail with "SCRAM channel binding negotiation error"; set `channel_binding=disable` |
 
-Clients connecting to QueryGuard without TLS always work.
+Clients connecting to QueryGuard without TLS always work. When PostgreSQL
+refuses a login for this reason, QueryGuard adds a hint saying which of the
+two fixes to make. To give QueryGuard PostgreSQL's own certificate, point
+`-tls-cert` and `-tls-key` at the same files as `ssl_cert_file` and
+`ssl_key_file`.
 
 ## Rules
 
@@ -150,6 +173,40 @@ Rules catch mistakes, such as a forgotten `WHERE` or an index build that
 blocks writes to a busy table. They are not a security boundary: functions,
 views and triggers run SQL that QueryGuard never sees. Grant each role only
 the privileges it needs in PostgreSQL itself.
+
+## AI agents
+
+`presets/ai-agent.json` is a config for a role an AI agent logs in as, such as
+one behind a Postgres MCP server: the agent may only read, gets no
+side-effecting built-ins, no statement planned above a million cost units,
+15 seconds a statement, 1,000 rows or 1 MB a read, a minute a transaction,
+and a learned allowlist. Statements QueryGuard can't read are refused.
+
+Read-only modes in such servers have been bypassed by ending the transaction
+they opened (`COMMIT; DROP …`), by `BEGIN READ WRITE`, by turning
+`default_transaction_read_only` off, by `set_config`, by `COPY … TO PROGRAM`,
+and by functions that write, such as `nextval` or `lo_import`.
+`presets/ai-agent-bypass.sql` holds 72 such statements and ordinary reads;
+every release checks that the preset refuses the first and allows the second:
+
+```sh
+queryguard test -config presets/ai-agent.json presets/ai-agent-bypass.sql
+```
+
+QueryGuard is one layer. Give the agent a database role that can only read
+as well, so a statement that gets past the parser still can't write:
+
+```sql
+CREATE ROLE agent LOGIN PASSWORD '…' IN ROLE pg_read_all_data;
+ALTER ROLE agent SET default_transaction_read_only = on;
+```
+
+`queryguard test -config file.json` checks a config without starting the
+proxy. With corpus files it runs each case as `-role` (`agent`) in
+`-database` (`postgres`) and prints every case it gets wrong as
+`file:line: want reject, got allow: …`, exiting with status 1. A case is a
+`-- reject` line, optionally naming the rule, or `-- allow`, then the
+statement up to the next case.
 
 ## Cost rules
 
@@ -583,7 +640,8 @@ lists the watch and `UNWATCH` ends one early.
 `kill -HUP` makes QueryGuard read its `-config` file again. A file that isn't
 valid is logged and ignored, and the one in force stays. A valid one applies
 to new and open sessions alike, and tenants keep what they owe and their
-recent use.
+recent use. The same signal reloads the TLS certificate and reopens
+`-decision-log`, for log rotation; without `-config` it does only that.
 
 ## Learning from how statements run
 
@@ -784,6 +842,31 @@ PGPASSWORD=... queryguard admin -addr 127.0.0.1:6543 -user postgres kill tenant 
 Kills, the watch list and the stats live in memory, so a restart clears
 them, and each instance of a fleet has its own.
 
+## Metrics and the decision log
+
+With `-metrics-listen 127.0.0.1:9187`, QueryGuard serves Prometheus metrics at
+`/metrics`:
+
+| Metric | What it counts |
+| --- | --- |
+| `queryguard_statements_total{tenant,result}` | statements by result: `ok`, `error` (from PostgreSQL), `rejected` (by QueryGuard) or `not_run` |
+| `queryguard_statement_duration_seconds{tenant}` | histogram of how long statements took |
+| `queryguard_decisions_total{rule,message}` | every decision a rule made, such as a rejection or a cap |
+| `queryguard_sessions`, `queryguard_connections_starting` | open sessions, and connections still logging in |
+| `queryguard_admission_limit` | the fast lane's limit now, as the adaptive limit sets it |
+| `queryguard_tenant_running{tenant}`, `queryguard_tenant_budget_units{tenant}` | statements running and budget left, by tenant |
+| `queryguard_capacity_units_per_second` | the server's measured capacity |
+| `queryguard_plan_cache_hits_total`, `_misses_total`, `queryguard_explain_seconds_total` | the plan cache and time spent explaining |
+| `queryguard_build_info{version}` | the running version |
+
+A metric keeps at most 1,000 label sets; the rest add up under `_other`, so a
+flood of tenants can't grow it without end.
+
+With `-decision-log decisions.jsonl`, every log line a rule writes, such as a
+rejected statement, a capped tenant or a cancelled DDL, also goes to that file
+as one JSON object a line, with its rule and what it applied to: the tenant
+and, for a statement, its fingerprint and text with the constants as `$1`. `kill -HUP` reopens it after rotation.
+
 ## Learned allowlist
 
 For a role that should only ever run a known set of statements, such as an
@@ -816,6 +899,27 @@ behind a NAT from locking out the others.
 ```
 
 `"mode": "off"` turns it off.
+
+## Rolling restarts
+
+On `SIGTERM` or `SIGINT` QueryGuard stops accepting connections and ends
+each session as soon as it is idle outside a transaction, with the error
+PostgreSQL sends when it shuts down (`57P01`), so poolers and drivers
+reconnect. A session busy in a statement or transaction may go on for
+`-shutdown-timeout` (30s). To restart without refusing anyone, start every
+instance with `-reuse-port`, start the new process on the same `-listen`,
+wait until it is ready, then signal the old one:
+
+```sh
+./bin/queryguard -reuse-port -config queryguard.json &  # new
+kill -TERM "$old_pid"
+```
+
+Both listen at once while the old one drains (`SO_REUSEPORT`; Linux, macOS
+and the BSDs). On Linux, connections the kernel has already queued for the
+old process's socket are dropped when it closes, so start the new one first
+and give it a moment. Under load in the compatibility tests, a restart this
+way dropped none of 400 transactions across 8 sessions.
 
 ## Connection caps
 
@@ -851,21 +955,63 @@ client sets, directly or in `options`, is kept. Change it with `-client-check-in
 server's setting alone, and is needed on platforms where PostgreSQL rejects a
 non-zero value.
 
+## Failure model
+
+QueryGuard sits in the path of every statement, so what happens when a part
+of it fails decides whether it is safe to run:
+
+| What fails | What happens |
+| --- | --- |
+| A QueryGuard process | Its sessions end; clients reconnect, through a load balancer, to another instance. Limits shared through `-state-dsn` hold across the rest. A planned restart drains instead (see Rolling restarts) |
+| PostgreSQL | Logins and statements get PostgreSQL's own errors, relayed as they are; QueryGuard keeps running and retries nothing on its own |
+| `EXPLAIN` for a cost rule or budget | The statement goes to PostgreSQL, which reports its own error if there is one; a statement is never refused because it couldn't be planned |
+| The parser, on a statement it can't read (such as PostgreSQL 19's `REPACK`) | `unchecked` decides: `reject` (the default) refuses it, `allow` runs it unchecked; both are logged |
+| `-catalog-dsn` | Readings are skipped; after three failures in a row QueryGuard acts as if the server were idle, so no hold or cap outlasts the readings it came from |
+| `-state-dsn`, the fleet store | Each instance runs on its last share for a minute, then stops admitting statements that count against shared limits, so the fleet never admits more than the total |
+| A panic in a session | That session's connection closes and the panic is logged with its stack; other sessions go on |
+| Stats, anomalies and the traffic log | Fed through a bounded queue that drops what doesn't fit and counts it, so a session never waits on them |
+| Everything learned | Calibration, plan history and stats live in memory and start again after a restart; the allowlist is saved to `-allowlist-file` |
+
+QueryGuard is not a security boundary on its own. It reads SQL as
+PostgreSQL's parser does, but a role that can write can still write if a
+statement gets past a rule; give roles only the privileges they need, and use
+QueryGuard to keep them within their share.
+
+Replication connections (`replication=database` or `true`) are relayed, but
+their commands, such as `START_REPLICATION`, aren't SQL the parser reads:
+with rules they are refused unless `unchecked` is `allow`, and streaming
+replication through QueryGuard is untested. Point replicas and logical
+replication subscribers at PostgreSQL directly.
+
 ## Compatibility
 
 `make compat` runs these clients through QueryGuard against a real PostgreSQL
-(`PG=16`, `17` or `18`; start the servers with `make up`), and CI runs it on
-all three versions:
+(`PG=16`, `17`, `18` or `19`; start the servers with `make up`), and CI runs it
+on all four, with PostgreSQL 19 (a beta) allowed to fail:
 
 | Client | Checked |
 | --- | --- |
-| pgx 5.11 | plaintext, TLS, direct TLS, protocol 3.2, prepared statements, COPY, cancel on 3.0, 3.2 and 3.2 over TLS, keepalive settings; rejections in all three query modes, in a transaction and in a pipeline; warn mode; connection cap; cost rules in all three query modes and in a transaction, errors from `EXPLAIN`, the plan cache, table sizes; budgets that reject and that queue, busy slots, statement and idle-in-transaction timeouts, cancel on disconnect, tenant tags; plan flips from a dropped index and from a forced generic plan, stale statistics |
+| pgx 5.11 | plaintext, TLS, direct TLS, protocol 3.2, prepared statements, COPY, cancel on 3.0, 3.2 and 3.2 over TLS, keepalive settings; SCRAM over TLS on both sides, with and without channel binding; a rolling restart under load; rejections in all three query modes, in a transaction and in a pipeline; warn mode; connection cap; cost rules in all three query modes and in a transaction, errors from `EXPLAIN`, the plan cache, table sizes; budgets that reject and that queue, busy slots, statement and idle-in-transaction timeouts, cancel on disconnect, tenant tags; plan flips from a dropped index and from a forced generic plan, stale statistics |
+| pgproto3 | an `OAUTHBEARER` login on PostgreSQL 18, with a test validator, good token and bad |
 | psql 18 | plaintext, TLS, direct TLS, protocol 3.2, Ctrl-C; rejection, in a transaction; costly statement |
 | node-postgres 8 | plaintext, TLS, parameters, cancel; rejection, in a transaction; costly statement, with and without parameters |
 | psycopg 3.3 (libpq 18) | plaintext, TLS, direct TLS, protocol 3.2, parameters, cancel, cancel over TLS; rejection, in a transaction and in a pipeline; costly statement, prepared and not |
 
 Every client also checks that its cancel key is the proxy's own, not the
 server's, and that the connection stays usable after a rejection.
+
+What earlier versions showed only in unit tests or against a fake PostgreSQL
+is checked under real load too: the adaptive limit falling to its floor
+while sessions straight to PostgreSQL burn its CPUs, shedding best-effort
+statements and never normal ones, and growing back once calm; a job queue
+that keeps moving while overlapping reports are capped to one at a time; stats
+call counts equal to `pg_stat_statements`' across eight sessions; a lock
+pile-up raising one anomaly where twelve steady minutes raised none; a day's
+mixed traffic replayed through the simulator giving the verdicts enforce mode
+gave; a read past the row cap cancelled in every query mode with its session
+still usable; and ten wrong passwords after the throttle's limit refused
+without a connection to PostgreSQL. On PostgreSQL 19, `REPACK` takes the
+`unchecked` path and finished lock waits come from `pg_stat_lock`.
 
 ## Overhead
 
