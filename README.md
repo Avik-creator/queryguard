@@ -449,7 +449,10 @@ control does (AIMD: additive increase, multiplicative decrease):
 A statement's usual time is the average of its plan's last 50 runs, once the
 plan has run five times, so a slow report is not one tenant's normal
 analytics query but statements taking longer than they themselves usually
-do. Lock waits come from `pg_stat_activity` over `-catalog-dsn`. A good
+do. For overload, that average moves on over about ten minutes rather than
+50 runs, which a busy server fills in seconds: a sustained overload keeps
+the limit down instead of soon looking normal, while a server that has
+become slower for good is taken as it is after some minutes. Lock waits come from `pg_stat_activity` over `-catalog-dsn`. A good
 ceiling is about four times the database's CPU cores.
 
 ### Long statements and the slow lane

@@ -1593,8 +1593,8 @@ func (c *Checker) learn(p *Policy, sql, fingerprint string, who subject, warn bo
 	}
 	return cost, slow, v.Usual, func(took time.Duration, finished bool) {
 		if s := c.Env.Scheduler; s != nil && took > 0 {
-			if finished && v.Usual > 0 {
-				s.Finished(float64(took) / float64(v.Usual))
+			if finished && v.Settled > 0 {
+				s.Finished(float64(took) / float64(v.Settled))
 			}
 			// The plan's cost was a guess; what the statement took, failed or not, is what it cost.
 			if actual, ok := history.CostOf(took); ok && p.cfg.Calibration.Mode != "off" {

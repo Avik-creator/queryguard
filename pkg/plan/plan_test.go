@@ -255,6 +255,31 @@ func TestHistoryCalibratesByMeasuredTime(t *testing.T) {
 	}
 }
 
+func TestHistorySettledTimingTakesMinutesToMove(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var h History
+		p := Plan{Cost: 1000, Shape: 1}
+		ran := func(n int, took, every time.Duration) {
+			for range n {
+				h.Ran("", "s", p, took, true, Tuning{})
+				time.Sleep(every)
+			}
+		}
+		ran(100, 10*time.Millisecond, 10*time.Millisecond)
+
+		// A thousand runs three times slower within seconds, as under overload, move the usual time but barely the settled one.
+		ran(1000, 30*time.Millisecond, 5*time.Millisecond)
+		if v := h.Judge("s", p, Tuning{}); v.Usual < 29*time.Millisecond || v.Settled > 11*time.Millisecond {
+			t.Errorf("usual %v, settled %v; want about 30ms and still about 10ms", v.Usual, v.Settled)
+		}
+		// Kept up for half an hour, the slower time is the settled one too.
+		ran(1800, 30*time.Millisecond, time.Second)
+		if v := h.Judge("s", p, Tuning{}); v.Settled < 28*time.Millisecond {
+			t.Errorf("settled %v after half an hour at 30ms; want about 30ms", v.Settled)
+		}
+	})
+}
+
 func TestHistoryLearnsCostOnlyFromLongRuns(t *testing.T) {
 	var h History
 	quick, long := Plan{Cost: 100, Shape: 1}, Plan{Cost: 100, Shape: 2}

@@ -33,9 +33,10 @@ const (
 
 // How History learns: a plan's timing averages its last runs, and the server's its last many more.
 const (
-	minRuns      = 5    // runs of a plan before a change from it, or a run far slower than it, is flagged
-	planWindow   = 50   // runs a plan's timing is averaged over
-	globalWindow = 1000 // runs a tenant's timing is averaged over
+	minRuns      = 5                // runs of a plan before a change from it, or a run far slower than it, is flagged
+	planWindow   = 50               // runs a plan's timing is averaged over
+	settleTime   = 10 * time.Minute // about how long a plan runs at a new speed before that is its settled timing
+	globalWindow = 1000             // runs a tenant's timing is averaged over
 	// tenantRuns is how many runs a tenant's timing needs to count fully in the server's; past it, no tenant counts more than another.
 	tenantRuns = 100
 	maxTenants = 1000 // tenants whose timing is kept; the one least recently run goes first
@@ -241,6 +242,8 @@ type Verdict struct {
 	Flip   string        // why the plan looks like a regression from the statement's usual one, or ""
 	First  bool          // the flip is new, so worth logging
 	Usual  time.Duration // how long the plan usually runs, once it has run often enough to say; else 0
+	// Settled is Usual over minutes rather than runs, so overload, which fills planWindow in seconds, still shows as overload.
+	Settled time.Duration
 }
 
 // statement is what History knows about one statement, by plan shape.
@@ -256,6 +259,8 @@ type shape struct {
 	weight            float64 // runs, each fading with Tuning.Quarantine as half-life
 	updated           time.Time
 	logRatio          float64 // the mean of ln(seconds ÷ cost) over about planWindow runs, to tell a slow run
+	settled           float64 // logRatio averaged over about settleTime, once planWindow runs have filled it
+	settledAt         time.Time
 	samples           int
 	costRatio         float64 // the same over runs long enough to learn costs from
 	costSamples       int
@@ -286,6 +291,7 @@ func (h *History) Judge(key string, p Plan, t Tuning) Verdict {
 	v.Factor = h.factor(sh, t)
 	if sh.samples >= minRuns {
 		v.Usual = time.Duration(math.Exp(sh.logRatio) * max(p.Cost, 1) * float64(time.Second))
+		v.Settled = time.Duration(math.Exp(sh.settled) * max(p.Cost, 1) * float64(time.Second))
 	}
 	switch usual := st.usual(t); {
 	case sh.slow:
@@ -323,6 +329,12 @@ func (h *History) Ran(tenant, key string, p Plan, took time.Duration, finished b
 	sh.weight++
 	sh.samples++
 	sh.logRatio += (ratio - sh.logRatio) / float64(min(sh.samples, planWindow))
+	if now := time.Now(); sh.samples <= planWindow {
+		sh.settled, sh.settledAt = sh.logRatio, now
+	} else {
+		sh.settled += (sh.logRatio - sh.settled) * -math.Expm1(-now.Sub(sh.settledAt).Seconds()/settleTime.Seconds())
+		sh.settledAt = now
+	}
 	if took >= learnFloor {
 		sh.costSamples++
 		sh.costRatio += (ratio - sh.costRatio) / float64(min(sh.costSamples, planWindow))
