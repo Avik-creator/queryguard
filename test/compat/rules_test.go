@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -118,6 +119,65 @@ func TestWrongPasswordIsRefusedQuietly(t *testing.T) {
 	if got := logs.String(); got != "" {
 		t.Errorf("proxy logged %q; want nothing", got)
 	}
+}
+
+func TestRepeatedWrongPasswordsStopReachingPostgres(t *testing.T) {
+	upstream, dials := countingForwarder(t, os.Getenv("QG_TEST_UPSTREAM"))
+	qg := startProxyWith(t, func(s *proxy.Server) { s.Upstream = proxy.Dialer{Addr: upstream} })
+	wrong := func() error {
+		_, err := pgx.Connect(t.Context(), "host=127.0.0.1 port="+port(qg)+" user=postgres dbname=queryguard sslmode=disable password=wrong")
+		return err
+	}
+
+	// The default throttle lets policy.DefaultLoginFailures failures through to Postgres, then refuses at the proxy.
+	for range policy.DefaultLoginFailures {
+		if err := wrong(); sqlState(err) != "28P01" {
+			t.Fatalf("got %v; want Postgres's 28P01", err)
+		}
+	}
+	reached := dials.Load()
+	if reached != policy.DefaultLoginFailures {
+		t.Fatalf("%d logins reached Postgres; want each of the %d failures", reached, policy.DefaultLoginFailures)
+	}
+	for range 10 {
+		if err := wrong(); sqlState(err) != "28000" || !strings.Contains(err.Error(), "too many failed logins") {
+			t.Fatalf("got %v; want the proxy's 28000 too many failed logins", err)
+		}
+	}
+	if extra := dials.Load() - reached; extra != 0 {
+		t.Errorf("%d of the 10 refused logins reached Postgres; want none", extra)
+	}
+}
+
+// countingForwarder relays TCP connections to addr, returning its own address and a count of the connections it made.
+func countingForwarder(t testing.TB, addr string) (string, *atomic.Int64) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	var dials atomic.Int64
+	go func() {
+		for {
+			client, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer client.Close()
+				server, err := net.Dial("tcp", addr)
+				if err != nil {
+					return
+				}
+				defer server.Close()
+				dials.Add(1)
+				go io.Copy(server, client)
+				io.Copy(client, server)
+			}()
+		}
+	}()
+	return ln.Addr().String(), &dials
 }
 
 // costConfig sets both cost rules at half of what a full read of orders takes, whatever the size of the test data, so
@@ -860,6 +920,32 @@ func TestMonitorCountsFinishedLockWaitsOnPG19(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the monitor saw no finished lock wait in 10s")
 	}
+}
+
+func TestRowCappedReadLeavesItsSessionUsable(t *testing.T) {
+	conn := startPolicyProxy(t, `{"tenant_defaults": {"max_rows": 1000}}`).connect(t, "sslmode=disable")
+	for _, mode := range []pgx.QueryExecMode{pgx.QueryExecModeCacheStatement, pgx.QueryExecModeExec, pgx.QueryExecModeSimpleProtocol} {
+		_, err := conn.Exec(t.Context(), "select id from orders", mode)
+		if sqlState(err) != "54000" || !strings.Contains(err.Error(), "more than 1000 rows") {
+			t.Errorf("%s: got %v; want 54000 for more than 1000 rows", mode, err)
+		}
+		expectSelectOne(t, conn)
+	}
+
+	// Inside a transaction a cancel would abort it, so the cap doesn't apply there.
+	mustExec(t, conn, "begin")
+	rows, err := conn.Query(t.Context(), "select id from orders limit 2000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for rows.Next() {
+		n++
+	}
+	if rows.Err() != nil || n != 2000 {
+		t.Errorf("read %d rows in a transaction, %v; want all 2000", n, rows.Err())
+	}
+	mustExec(t, conn, "commit")
 }
 
 // requirePG19 skips the test unless conn's server is PostgreSQL 19 or later.
