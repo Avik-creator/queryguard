@@ -10,7 +10,7 @@ starve everyone else.
 *QueryGuard in 15 seconds. The numbers are from `make bench`, below. Select
 the preview for the [MP4 with sound](docs/queryguard.mp4).*
 
-> **Status:** heading for v1.0. QueryGuard relays sessions, cancel requests
+> **Status:** v1.0. QueryGuard relays sessions, cancel requests
 > and TLS; blocks statements by rule or by their planned cost; gives each
 > tenant a cost budget, a fair share of the server and time limits; learns
 > from how long statements take, to correct their costs and to catch plans
@@ -42,8 +42,14 @@ go build -o bin/queryguard ./cmd/queryguard
 ```
 
 Building needs cgo and a C compiler, since QueryGuard reads SQL with
-PostgreSQL's own parser (libpg_query). Or build the image, which listens on
-port 6543 and carries the presets under `/presets`:
+PostgreSQL's own parser (libpg_query). Or run the image, for amd64 and arm64,
+which listens on port 6543 and carries the presets under `/presets`:
+
+```sh
+docker run --rm -p 6543:6543 ghcr.io/avik-creator/queryguard:v1.0.0 -listen :6543 -upstream db.internal:5432
+```
+
+or build it yourself:
 
 ```sh
 docker build --build-arg VERSION=$(git describe --tags --always) -t queryguard .

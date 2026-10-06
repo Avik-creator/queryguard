@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Writes the image to GitHub's container registry; nothing else.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: Image ${{ matrix.arch }}
+    # Each architecture builds on its own runner, since cgo under emulation takes far longer.
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build, check and push the ${{ matrix.arch }} image
+        run: |
+          image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}-${{ matrix.arch }}
+          docker build --build-arg VERSION=$GITHUB_REF_NAME \
+            --label org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY \
+            --label org.opencontainers.image.version=$GITHUB_REF_NAME \
+            --label "org.opencontainers.image.description=Admission control for a shared PostgreSQL" \
+            -t $image .
+          test "$(docker run --rm $image -version)" = "queryguard $GITHUB_REF_NAME"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push $image
+
+  manifest:
+    name: Multi-arch tag
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Join both images under the version, and under latest for a final release
+        run: |
+          image=ghcr.io/${GITHUB_REPOSITORY,,}
+          tags="-t $image:$GITHUB_REF_NAME"
+          case "$GITHUB_REF_NAME" in *-*) ;; *) tags="$tags -t $image:latest" ;; esac
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker buildx imagetools create $tags $image:$GITHUB_REF_NAME-amd64 $image:$GITHUB_REF_NAME-arm64
+          docker buildx imagetools inspect $image:$GITHUB_REF_NAME
