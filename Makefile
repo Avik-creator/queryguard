@@ -19,7 +19,7 @@ build: ## Build bin/queryguard
 test: ## Run the tests with the race detector
 	go test -race ./...
 
-compat: ## Run real clients through the proxy against Postgres (PG=16, 17 or 18; default 18)
+compat: ## Run real clients through the proxy against Postgres (PG=16, 17, 18 or 19; default 18)
 	QG_TEST_UPSTREAM=127.0.0.1:54$(PG) go test -race -count=1 ./test/compat/
 
 overhead: ## Measure p50/p99 query latency with and without the proxy (PG as for compat)

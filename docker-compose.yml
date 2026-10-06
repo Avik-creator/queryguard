@@ -1,5 +1,5 @@
 # Local Postgres servers for development and integration tests: one per
-# supported major version. PG19 joins as experimental once it is released.
+# supported major version, plus PG19 as experimental while it is in beta.
 
 # Settings shared by every server, merged in below with "<<: *postgres".
 x-postgres: &postgres
@@ -90,15 +90,26 @@ services:
       - ./testdata/oauth/pg_hba.conf:/queryguard/pg_hba.conf:ro
       - pg18:/var/lib/postgresql
 
+  # Experimental: the parser QueryGuard uses doesn't read PG19-only syntax such as REPACK yet.
+  pg19:
+    <<: *postgres
+    image: postgres:19beta4
+    ports: ["127.0.0.1:5419:5432"]
+    volumes:
+      - ./testdata/initdb:/docker-entrypoint-initdb.d:ro
+      - ./testdata/schema.sql:/queryguard/schema.sql:ro
+      - pg19:/var/lib/postgresql
+
   # Puts network faults between QueryGuard and a server, for the tests of the
   # fleet store: its proxies listen on 554NN for the server on 54NN.
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:2.12.0
     ports:
       - "127.0.0.1:8474:8474"
-      - "127.0.0.1:55416-55418:55416-55418"
+      - "127.0.0.1:55416-55419:55416-55419"
 
 volumes:
   pg16:
   pg17:
   pg18:
+  pg19:

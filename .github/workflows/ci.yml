@@ -40,11 +40,13 @@ jobs:
   postgres:
     name: Postgres ${{ matrix.pg }}
     runs-on: ubuntu-latest
+    # PG19 is in beta, so its failures show without failing the run.
+    continue-on-error: ${{ matrix.pg == 19 }}
     strategy:
       # Keep testing the other versions when one fails.
       fail-fast: false
       matrix:
-        pg: [16, 17, 18]
+        pg: [16, 17, 18, 19]
     env:
       # A small data set so the load takes seconds, not minutes.
       QG_CUSTOMERS: 10000
