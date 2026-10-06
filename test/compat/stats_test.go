@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -155,5 +156,80 @@ func TestStatsCallsMatchPgStatStatementsUnderLoad(t *testing.T) {
 	if calls-errs != want || errs != workers*rounds/4 || table.Dropped() != 0 {
 		t.Errorf("QueryGuard counted %d calls with %d errors (%d dropped); want %d calls, %d without an error as pg_stat_statements has",
 			calls, errs, table.Dropped(), workers*rounds, want)
+	}
+}
+
+func TestLockPileUpRaisesOneAnomalyAndSteadyLoadNone(t *testing.T) {
+	table := &stats.Table{}
+	qg := startProxyWith(t, func(s *proxy.Server) {
+		s.Stats = table
+		s.Monitor = &plan.Monitor{DSN: catalogDSN(t) + " dbname=queryguard", Interval: 50 * time.Millisecond}
+	})
+	admin := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
+	name := fmt.Sprintf("qg_anomaly_%d", time.Now().UnixNano())
+	mustExec(t, admin, "create table "+name+" as select g as id from generate_series(1, 100) g")
+	t.Cleanup(func() { admin.Exec(context.Background(), "drop table "+name) })
+	blocked := "select id from " + name + " where id = $1"
+	const workers, perWorker = 8, 10
+	conns := make([]*pgx.Conn, workers)
+	for i := range conns {
+		conns[i] = qg.connect(t, "sslmode=disable")
+	}
+
+	// Each of the test's minutes is a burst of statements, half on the table a pile-up blocks; Minute ends it.
+	var sent int64
+	minute := func(pileUp bool) []stats.Anomaly {
+		if pileUp {
+			mustExec(t, admin, "begin")
+			mustExec(t, admin, "lock table "+name+" in access exclusive mode")
+		}
+		var wg sync.WaitGroup
+		for _, conn := range conns {
+			wg.Go(func() {
+				for i := range perWorker {
+					if i%2 == 0 {
+						conn.Exec(t.Context(), blocked, i)
+					} else {
+						conn.Exec(t.Context(), "select id from customers where id = $1", i)
+					}
+				}
+			})
+		}
+		if pileUp {
+			time.Sleep(300 * time.Millisecond)
+			mustExec(t, admin, "rollback")
+		}
+		wg.Wait()
+		sent += workers * perWorker
+		waitFor(t, 5*time.Second, func() bool {
+			var calls int64
+			for _, r := range table.Rows() {
+				calls += r.Calls
+			}
+			return calls >= sent
+		})
+		return table.Minute(time.Now())
+	}
+
+	for i := range 12 {
+		if got := minute(false); len(got) > 0 {
+			t.Fatalf("steady minute %d raised %+v; want nothing", i, got)
+		}
+	}
+	var started []stats.Anomaly
+	for range 2 {
+		started = append(started, minute(true)...)
+	}
+	var ended []stats.Anomaly
+	for range 3 {
+		ended = append(ended, minute(false)...)
+	}
+
+	t.Logf("pile-up: %+v; after: %+v", started, ended)
+	if len(started) != 1 || started[0].Ended || !slices.Contains(started[0].Statements, sqlparse.Normalize(blocked)) || started[0].LockWaits == 0 {
+		t.Errorf("pile-up raised %+v; want one anomaly naming %q, with lock waits", started, blocked)
+	}
+	if len(ended) != len(started) {
+		t.Errorf("after the pile-up %+v; want each anomaly ended", ended)
 	}
 }
