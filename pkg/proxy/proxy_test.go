@@ -1149,43 +1149,57 @@ func TestLimitsTheTenantHoldingTheOldestSnapshot(t *testing.T) {
 		config   string
 		readings []plan.Activity
 		capped   bool
+		gap      time.Duration // between readings
 	}{
 		"old snapshot, nothing watched": {`{"mvcc_horizon": {"max_age": "1m"}}`,
-			[]plan.Activity{{Horizon: old}}, true},
+			[]plan.Activity{{Horizon: old}}, true, 0},
 		"young snapshot": {`{"mvcc_horizon": {"max_age": "1m"}}`,
-			[]plan.Activity{{Horizon: plan.Snapshot{PID: 7, Age: 30 * time.Second}}}, false},
+			[]plan.Activity{{Horizon: plan.Snapshot{PID: 7, Age: 30 * time.Second}}}, false, 0},
 		"watched queue's dead tuples grow": {`{"mvcc_horizon": {"max_age": "1m", "watch": ["public.jobs"], "max_dead_tuples": 1000}}`,
-			[]plan.Activity{{Horizon: old, DeadTuples: map[plan.Table]float64{jobs: 100}}, {Horizon: old, DeadTuples: map[plan.Table]float64{jobs: 5000}}}, true},
+			[]plan.Activity{{Horizon: old, DeadTuples: map[plan.Table]float64{jobs: 100}}, {Horizon: old, DeadTuples: map[plan.Table]float64{jobs: 5000}}}, true, 0},
 		"watched queue stays clean": {`{"mvcc_horizon": {"max_age": "1m", "watch": ["public.jobs"], "max_dead_tuples": 1000}}`,
-			[]plan.Activity{{Horizon: old, DeadTuples: map[plan.Table]float64{jobs: 100}}, {Horizon: old, DeadTuples: map[plan.Table]float64{jobs: 200}}}, false},
-		"snapshot released": {`{"mvcc_horizon": {"max_age": "1m"}}`,
-			[]plan.Activity{{Horizon: old}, {}}, false},
+			[]plan.Activity{{Horizon: old, DeadTuples: map[plan.Table]float64{jobs: 100}}, {Horizon: old, DeadTuples: map[plan.Table]float64{jobs: 200}}}, false, 0},
+		"snapshot released for twice max_age": {`{"mvcc_horizon": {"max_age": "1m"}}`,
+			[]plan.Activity{{Horizon: old}, {}}, false, 2 * time.Minute},
+		// The capped tenant's next statement holds the horizon with a younger snapshot, so a moment's young horizon ends nothing.
+		"snapshot just released": {`{"mvcc_horizon": {"max_age": "1m"}}`,
+			[]plan.Activity{{Horizon: old}, {Horizon: plan.Snapshot{PID: 8, Age: time.Second}}}, true, 10 * time.Second},
+		"queue grows across the tenant's snapshots": {`{"mvcc_horizon": {"max_age": "1m", "watch": ["public.jobs"], "max_dead_tuples": 1000}}`,
+			[]plan.Activity{{Horizon: old, DeadTuples: map[plan.Table]float64{jobs: 100}},
+				{Horizon: plan.Snapshot{PID: 8, Age: 2 * time.Minute}, DeadTuples: map[plan.Table]float64{jobs: 5000}}}, true, 0},
 		"tenant in warn mode": {`{"mvcc_horizon": {"max_age": "1m"}, "tenants": {"analytics": {"mode": "warn"}}}`,
-			[]plan.Activity{{Horizon: old}}, false},
+			[]plan.Activity{{Horizon: old}}, false, 0},
 	} {
 		t.Run(name, func(t *testing.T) {
-			s := &Server{Logger: slog.New(slog.DiscardHandler)}
-			s.SetPolicy(mustPolicy(t, strings.Replace(tc.config, "{", `{"scheduler": {"max_active": 4, "queue_timeout": "10ms"}, `, 1)))
-			holder := &backend{}
-			defer s.backends.add(7, holder)()
-			holder.Running("analytics", false)
+			synctest.Test(t, func(t *testing.T) {
+				s := &Server{Logger: slog.New(slog.DiscardHandler)}
+				s.SetPolicy(mustPolicy(t, strings.Replace(tc.config, "{", `{"scheduler": {"max_active": 4, "queue_timeout": "10ms"}, `, 1)))
+				for _, pid := range []int32{7, 8} {
+					holder := &backend{}
+					defer s.backends.add(pid, holder)()
+					holder.Running("analytics", false)
+				}
 
-			for _, a := range tc.readings {
-				s.observe(a)
-			}
+				for i, a := range tc.readings {
+					if i > 0 {
+						time.Sleep(tc.gap)
+					}
+					s.observe(a)
+				}
 
-			first, err := s.scheduler().Acquire(t.Context(), "analytics", sched.Fast, sched.Normal)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer first()
-			second, err := s.scheduler().Acquire(t.Context(), "analytics", sched.Fast, sched.Normal)
-			if second != nil {
-				second()
-			}
-			if capped := errors.Is(err, sched.ErrBusy); capped != tc.capped {
-				t.Errorf("second statement = %v; want capped to one at a time: %v", err, tc.capped)
-			}
+				first, err := s.scheduler().Acquire(t.Context(), "analytics", sched.Fast, sched.Normal)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer first()
+				second, err := s.scheduler().Acquire(t.Context(), "analytics", sched.Fast, sched.Normal)
+				if second != nil {
+					second()
+				}
+				if capped := errors.Is(err, sched.ErrBusy); capped != tc.capped {
+					t.Errorf("second statement = %v; want capped to one at a time: %v", err, tc.capped)
+				}
+			})
 		})
 	}
 }

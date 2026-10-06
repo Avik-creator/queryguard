@@ -286,7 +286,9 @@ job queue then fills with dead rows, and every poll for the next job reads
 through them. With `mvcc_horizon`, once the backend holding the oldest
 snapshot has held it longer than `max_age`, and the dead rows of the tables in
 `watch` have grown by more than `max_dead_tuples` (1000) since, its tenant
-runs one statement at a time until it lets go:
+runs one statement at a time until the horizon has stayed younger than
+`max_age` for twice that, since each of its next statements is young for a
+while before it holds the horizon back again:
 
 ```json
 "mvcc_horizon": {"max_age": "1m", "watch": ["public.jobs"], "max_dead_tuples": 10000}

@@ -120,8 +120,8 @@ type Server struct {
 	// Only the Monitor's goroutine uses these.
 	observed   time.Time              // when it last reported
 	lagging    bool                   // a standby lags, so best-effort statements are held
-	horizonPID int32                  // the backend whose snapshot is past max_age, or 0
-	deadBase   map[plan.Table]float64 // the watched tables' dead tuples when that snapshot passed max_age
+	horizonOld time.Time              // when the horizon was last seen past max_age
+	deadBase   map[plan.Table]float64 // the watched tables' dead tuples when it passed max_age, after twice that young
 	capped     string                 // the tenant limited to one statement at a time for holding that snapshot, or ""
 
 	// fleetMu guards these, which say what the Fleet asks for.
@@ -805,15 +805,22 @@ func (s *Server) watchLag(sc *sched.Scheduler, p *policy.Policy, a plan.Activity
 func (s *Server) watchHorizon(sc *sched.Scheduler, p *policy.Policy, a plan.Activity) {
 	h := p.Horizon()
 	var tenant string
-	if h.MaxAge > 0 && a.Horizon.PID != 0 && a.Horizon.Age > time.Duration(h.MaxAge) {
-		if a.Horizon.PID != s.horizonPID {
-			s.horizonPID, s.deadBase = a.Horizon.PID, maps.Clone(a.DeadTuples)
+	switch now := time.Now(); {
+	case h.MaxAge > 0 && a.Horizon.PID != 0 && a.Horizon.Age > time.Duration(h.MaxAge):
+		if s.deadBase == nil {
+			s.deadBase = maps.Clone(a.DeadTuples)
 		}
-		if b := s.backends.get(a.Horizon.PID); b != nil && (len(h.Watch) == 0 || grown(s.deadBase, a.DeadTuples) > h.MaxDeadTuples) {
-			tenant, _ = b.state()
+		s.horizonOld = now
+		if b := s.backends.get(a.Horizon.PID); b != nil {
+			if holder, _ := b.state(); holder == s.capped || len(h.Watch) == 0 || grown(s.deadBase, a.DeadTuples) > h.MaxDeadTuples {
+				tenant = holder
+			}
 		}
-	} else {
-		s.horizonPID, s.deadBase = 0, nil
+	// The capped tenant's next statement is young for max_age before it holds the horizon back again, so the cap lasts twice that.
+	case s.capped != "" && now.Sub(s.horizonOld) < 2*time.Duration(h.MaxAge):
+		tenant = s.capped
+	case now.Sub(s.horizonOld) >= 2*time.Duration(h.MaxAge):
+		s.deadBase = nil
 	}
 	if tenant == s.capped {
 		return
