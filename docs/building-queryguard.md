@@ -115,7 +115,8 @@ looked cheap beside it and was charged about half.
 The cap is gone. A plan whose cost carries the 10 billion is left out of the
 server's average instead, the one case the cap was meant for, and a test now
 holds the server's timing to the full read's with four tenants' waiting
-lookups beside it. ROGUE_AFTER_FIX
+lookups beside it. Run again, the rogue was back to 5 to 8 full reads a
+run, against 7 to 8 before the audit and 8 to 21 with the cap.
 
 The lesson is an old one: a fix needs the same test that found the bug and
 the tests that guard what it might break. The unit tests had a rogue and one
@@ -137,9 +138,35 @@ without rules, with TLS from the client, with rules, and with cost rules,
 over pgx's default extended protocol and over the simple one. The tables
 show the median p50 and p99 of the three runs.
 
-OVERHEAD_TABLES
+`select 1`, p50 / p99 in µs:
 
-OVERHEAD_SUMMARY
+| Path | PostgreSQL 16 | PostgreSQL 17 | PostgreSQL 18 |
+| --- | --- | --- | --- |
+| direct | 126 / 202 | 128 / 207 | 124 / 193 |
+| QueryGuard | 161 / 207 | 158 / 294 | 167 / 416 |
+| QueryGuard, TLS from the client | 159 / 208 | 173 / 279 | 169 / 240 |
+| QueryGuard with rules | 168 / 218 | 159 / 230 | 169 / 258 |
+| QueryGuard with rules, simple protocol | 180 / 265 | 186 / 348 | 198 / 310 |
+| QueryGuard with cost rules | 171 / 352 | 181 / 371 | 174 / 371 |
+| QueryGuard with cost rules, simple protocol | 184 / 352 | 191 / 371 | 214 / 526 |
+
+1,000 rows (about 50 KB), p50 / p99 in µs:
+
+| Path | PostgreSQL 16 | PostgreSQL 17 | PostgreSQL 18 |
+| --- | --- | --- | --- |
+| direct | 1,096 / 1,319 | 1,077 / 1,668 | 1,128 / 1,546 |
+| QueryGuard | 1,223 / 1,471 | 1,215 / 1,525 | 1,284 / 1,725 |
+| QueryGuard, TLS from the client | 1,228 / 1,470 | 1,206 / 1,399 | 1,292 / 1,825 |
+| QueryGuard with rules | 1,234 / 1,642 | 1,204 / 1,414 | 1,304 / 1,964 |
+| QueryGuard with rules, simple protocol | 1,301 / 1,731 | 1,241 / 1,584 | 1,346 / 2,063 |
+| QueryGuard with cost rules | 1,274 / 2,010 | 1,250 / 1,803 | 1,361 / 2,044 |
+| QueryGuard with cost rules, simple protocol | 1,390 / 2,956 | 1,284 / 1,679 | 1,408 / 2,081 |
+
+The proxy adds 30–44 µs to a round trip at p50, and 127–156 µs, about
+12%, to the 1,000-row result. Rules add under 10 µs and the cost check up
+to about 20 µs more. p99 moves far more from run to run than p50 does: on a
+laptop a few hundred microseconds at p99 is often another process, so a
+single p99 cell says less than the three runs behind it.
 
 pgx prepares each statement once, so rules parse it only then, and the cost
 check finds its plan in the cache. Over the simple protocol every run is
@@ -155,9 +182,37 @@ units a second, with 200,000 of burst, against a full read planned at about
 through QueryGuard stays within 1.5 times the same path's baseline, plus a
 millisecond of slack.
 
-ROGUE_TABLE
+Innocent p99 in ms, as the range over three runs, with the rogue's
+completed full reads in brackets:
 
-ROGUE_SUMMARY
+| Scenario | PostgreSQL 16 | PostgreSQL 17 | PostgreSQL 18 |
+| --- | --- | --- | --- |
+| Baseline, straight to Postgres | 0.54–0.98 | 0.61–0.91 | 0.75–1.05 |
+| Baseline, QueryGuard | 0.84–1.26 | 1.02–1.19 | 1.08–1.46 |
+| Rogue, straight to Postgres | 4.69–7.10 (23–45) | 5.33–8.08 (23–33) | 5.83–6.29 (26) |
+| Rogue, QueryGuard, a role per tenant | 1.14–2.30 (7) | 2.07–3.53 (7) | 2.40–2.52 (8) |
+| Rogue, QueryGuard, shared role and tags | 1.15–3.23 (8) | 2.30–2.89 (5–8) | 1.63–2.53 (8) |
+
+Without QueryGuard the rogue runs 23 to 45 full reads and raises innocent
+p99 to 5–8 ms, six to ten times its baseline. Through QueryGuard it runs 5
+to 8, is refused 10,800 to 13,800 times, and innocent p99 stays at 1.1–3.5
+ms. Its budget, 200,000 units of burst plus 15 seconds at 50,000, pays for
+about five and a half reads at their planned cost; each charge is then
+trued up from how long the read took, so the count moves a little with the
+machine.
+
+Four of the nine runs missed the test's target in one scenario: PostgreSQL
+16 in one run of three, 17 in all three, 18 in none, by 0.1 to 0.8 ms.
+Those misses are not the rogue getting past its budget, since it ran 5 to 8
+reads in them as in the runs that passed. QueryGuard decides how often the
+rogue reads, not how heavy each read is: an admitted full read still takes
+the CPU and disk while it runs, and the lookups that arrive during it are
+the slowest 1%, which is what p99 measures. With PostgreSQL in a VM on a
+laptop, a scenario this close to its limit passes in one run and misses in
+the next; in PostgreSQL 17's first run one scenario passed at 2.29 ms and
+the other missed at 2.69 ms. Which version misses most also moves between
+benches: before the audit's fixes it was 18, in all three runs, and 17 in
+two.
 
 ### Reading the raw output
 

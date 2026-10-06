@@ -1041,63 +1041,114 @@ without a connection to PostgreSQL. On PostgreSQL 19, `REPACK` takes the
 
 ## Overhead
 
+`make bench` runs `make overhead` and `make rogue` three times on each of
+PostgreSQL 16, 17 and 18, the versions taking turns within each run so that
+a machine growing warmer or busier doesn't favour the first. It takes about
+20 minutes. These numbers are from an Apple M1, with PostgreSQL in Docker
+(OrbStack) and the proxy in the benchmark's process, so they are laptop
+numbers: the shape matters more than the microseconds.
+
 `make overhead` times 5,000 runs of each query straight to PostgreSQL and
-through QueryGuard: without rules, with the rules from the compatibility
-tests, and with the cost rules. Ranges are over three runs on an Apple M1,
-with PostgreSQL 18 in Docker (OrbStack) and the proxy in the benchmark's
-process:
+through QueryGuard: without rules, with TLS from the client, with the rules
+from the compatibility tests, and with the cost rules, over pgx's default
+extended protocol and over the simple one. Each cell is the median of the
+three runs.
 
-| Query | Path | p50 | p99 |
+`select 1`, p50 / p99 in µs:
+
+| Path | PostgreSQL 16 | PostgreSQL 17 | PostgreSQL 18 |
 | --- | --- | --- | --- |
-| `select 1` | direct | 134–140 µs | 269–395 µs |
-| `select 1` | QueryGuard | 161–166 µs | 242–285 µs |
-| `select 1` | QueryGuard, TLS from the client | 155–161 µs | 241–278 µs |
-| `select 1` | QueryGuard with rules | 145–159 µs | 236–261 µs |
-| `select 1` | QueryGuard with rules, simple protocol | 173–180 µs | 266–330 µs |
-| `select 1` | QueryGuard with cost rules | 158–164 µs | 245–316 µs |
-| `select 1` | QueryGuard with cost rules, simple protocol | 178–182 µs | 257–351 µs |
-| 1,000 rows (about 50 KB) | direct | 932–933 µs | 1,253–1,263 µs |
-| 1,000 rows (about 50 KB) | QueryGuard | 1,032–1,096 µs | 1,321–1,433 µs |
-| 1,000 rows (about 50 KB) | QueryGuard, TLS from the client | 1,035–1,074 µs | 1,355–4,754 µs |
-| 1,000 rows (about 50 KB) | QueryGuard with rules | 1,029–1,034 µs | 1,319–1,420 µs |
-| 1,000 rows (about 50 KB) | QueryGuard with rules, simple protocol | 1,092–1,093 µs | 1,488–1,609 µs |
-| 1,000 rows (about 50 KB) | QueryGuard with cost rules | 1,034–1,103 µs | 1,393–1,546 µs |
-| 1,000 rows (about 50 KB) | QueryGuard with cost rules, simple protocol | 1,100–1,168 µs | 1,537–1,675 µs |
+| direct | 126 / 202 | 128 / 207 | 124 / 193 |
+| QueryGuard | 161 / 207 | 158 / 294 | 167 / 416 |
+| QueryGuard, TLS from the client | 159 / 208 | 173 / 279 | 169 / 240 |
+| QueryGuard with rules | 168 / 218 | 159 / 230 | 169 / 258 |
+| QueryGuard with rules, simple protocol | 180 / 265 | 186 / 348 | 198 / 310 |
+| QueryGuard with cost rules | 171 / 352 | 181 / 371 | 174 / 371 |
+| QueryGuard with cost rules, simple protocol | 184 / 352 | 191 / 371 | 214 / 526 |
 
-The proxy adds about 20–30 µs to a round trip at p50, and 10–18% to the
-1,000-row result. pgx prepares each statement once, so rules parse it only
-then, and the cost check finds its plan in the cache: neither adds anything
-measurable. With the simple protocol every run is parsed, which adds up to
-about 20 µs for `select 1` and 60 µs for the 1,000-row query; the cost check
-adds a few microseconds more, for the fingerprint. Each of these runs
-explains a statement only once, so they show the cache's cost, not
-`EXPLAIN`'s; the proxy logs the time spent explaining every minute. The
-4.8 ms p99 came from one noisy run; the other two were under 1.4 ms. These
-are laptop numbers; the full benchmark matrix comes with v1.0.
+1,000 rows (about 50 KB), p50 / p99 in µs:
+
+| Path | PostgreSQL 16 | PostgreSQL 17 | PostgreSQL 18 |
+| --- | --- | --- | --- |
+| direct | 1,096 / 1,319 | 1,077 / 1,668 | 1,128 / 1,546 |
+| QueryGuard | 1,223 / 1,471 | 1,215 / 1,525 | 1,284 / 1,725 |
+| QueryGuard, TLS from the client | 1,228 / 1,470 | 1,206 / 1,399 | 1,292 / 1,825 |
+| QueryGuard with rules | 1,234 / 1,642 | 1,204 / 1,414 | 1,304 / 1,964 |
+| QueryGuard with rules, simple protocol | 1,301 / 1,731 | 1,241 / 1,584 | 1,346 / 2,063 |
+| QueryGuard with cost rules | 1,274 / 2,010 | 1,250 / 1,803 | 1,361 / 2,044 |
+| QueryGuard with cost rules, simple protocol | 1,390 / 2,956 | 1,284 / 1,679 | 1,408 / 2,081 |
+
+The proxy adds 30–44 µs to a round trip at p50, and 127–156 µs, about
+12%, to the 1,000-row result. Rules add under 10 µs and the cost check up
+to about 20 µs more. p99 moves far more from run to run than p50 does: on a
+laptop a few hundred microseconds at p99 is often another process, so a
+single p99 cell says less than the three runs behind it.
+
+pgx prepares each statement once, so rules parse it only then, and the cost
+check finds its plan in the cache. Over the simple protocol every run is
+parsed and fingerprinted, which adds another 10–40 µs to `select 1`. Each of
+these runs explains a statement only once, so they show the cache's cost,
+not `EXPLAIN`'s; the proxy logs the time spent explaining every minute.
 
 ## A rogue tenant
 
 `make rogue` runs three innocent tenants doing indexed lookups (six
 connections) next to a rogue one running full reads of the 10M-row `orders`
 table (six connections), for 15 seconds a scenario. Through QueryGuard the
-rogue gets a budget of 50,000 cost units a second (a full read is planned at
-about 169,000), with 8 slots shared fairly. Apple M1, PostgreSQL 18 in Docker:
+rogue gets a budget of 50,000 cost units a second with 200,000 of burst (a
+full read is planned at about 169,000), and 8 slots shared fairly. The test
+passes when innocent p99 through QueryGuard stays within 1.5 times the same
+path's baseline, plus a millisecond of slack.
 
-| Scenario | Innocent p50 | Innocent p99 | Rogue statements run |
+Innocent p99 in ms, as the range over three runs, with the rogue's
+completed full reads in brackets:
+
+| Scenario | PostgreSQL 16 | PostgreSQL 17 | PostgreSQL 18 |
 | --- | --- | --- | --- |
-| No rogue, straight to PostgreSQL | 0.27 ms | 0.57 ms | |
-| No rogue, through QueryGuard | 0.35 ms | 0.74 ms | |
-| Rogue, straight to PostgreSQL | 0.44 ms | 4.18 ms | 52 |
-| Rogue, QueryGuard, a role per tenant | 0.40 ms | 1.10 ms | 6 (14,044 refused) |
-| Rogue, QueryGuard, one shared role and tags | 0.42 ms | 1.06 ms | 6 (13,994 refused) |
+| Baseline, straight to Postgres | 0.54–0.98 | 0.61–0.91 | 0.75–1.05 |
+| Baseline, QueryGuard | 0.84–1.26 | 1.02–1.19 | 1.08–1.46 |
+| Rogue, straight to Postgres | 4.69–7.10 (23–45) | 5.33–8.08 (23–33) | 5.83–6.29 (26) |
+| Rogue, QueryGuard, a role per tenant | 1.14–2.30 (7) | 2.07–3.53 (7) | 2.40–2.52 (8) |
+| Rogue, QueryGuard, shared role and tags | 1.15–3.23 (8) | 2.30–2.89 (5–8) | 1.63–2.53 (8) |
 
-Without QueryGuard the rogue raises innocent p99 more than sevenfold. Through
-it, innocent p99 stays within 1.5 times the same path's baseline, the target
-the test checks, and the rogue runs exactly what its budget allows: 200,000
-units of burst plus 15 seconds at 50,000 pay for six full reads. Its full
-reads are nearly the only runs long enough to calibrate costs by, so their factor
-stays 1, and no innocent lookup was taken for a plan flip. These are laptop
-numbers; the full benchmark comes with v1.0.
+Without QueryGuard the rogue runs 23 to 45 full reads and raises innocent
+p99 to 5–8 ms, six to ten times its baseline. Through QueryGuard it runs 5
+to 8, is refused 10,800 to 13,800 times, and innocent p99 stays at 1.1–3.5
+ms. Its budget, 200,000 units of burst plus 15 seconds at 50,000, pays for
+about five and a half reads at their planned cost; each charge is then
+trued up from how long the read took, so the count moves a little with the
+machine.
+
+Four of the nine runs missed the test's target in one scenario: PostgreSQL
+16 in one run of three, 17 in all three, 18 in none, by 0.1 to 0.8 ms.
+Those misses are not the rogue getting past its budget, since it ran 5 to 8
+reads in them as in the runs that passed. QueryGuard decides how often the
+rogue reads, not how heavy each read is: an admitted full read still takes
+the CPU and disk while it runs, and the lookups that arrive during it are
+the slowest 1%, which is what p99 measures. With PostgreSQL in a VM on a
+laptop, a scenario this close to its limit passes in one run and misses in
+the next; in PostgreSQL 17's first run one scenario passed at 2.29 ms and
+the other missed at 2.69 ms. Which version misses most also moves between
+benches: before the audit's fixes it was 18, in all three runs, and 17 in
+two.
+
+## Running the benchmark
+
+```sh
+make up       # PostgreSQL 16-19 in Docker, with a 10M-row table
+make bench    # three runs on 16, 17 and 18, into bench/ (about 20 minutes)
+make rogue PG=17      # one version, one run
+```
+
+`make bench` writes two files per version and run into `bench/`:
+
+- `bench/overhead-pg<N>-<run>.txt` holds one `BenchmarkOverhead/<query>/<path>`
+  line per query and path; its `p50-µs` and `p99-µs` columns are the overhead
+  tables.
+- `bench/rogue-pg<N>-<run>.txt` holds one `overhead_test.go` line per
+  scenario, with `innocent p50`, `p99`, and `rogue ran N, refused M`: the
+  rogue table. A run that missed the target ends in
+  `--- FAIL: TestRogueTenant`, with the scenario and its limit just above.
 
 ## License
 
