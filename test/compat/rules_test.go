@@ -25,6 +25,7 @@ import (
 	"github.com/Avik-creator/queryguard/pkg/telemetry"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 // rulesConfig blocks UPDATE and DELETE without WHERE and only logs DDL, so tests can still make temp tables.
@@ -723,6 +724,78 @@ func TestIdleInTransactionEndsSession(t *testing.T) {
 
 	if _, err := conn.Exec(ctx, "select 1"); err == nil {
 		t.Error("a statement ran in a transaction left idle past its limit")
+	}
+}
+
+func TestIdleInTransactionEndsSessionAfterExtendedCopy(t *testing.T) {
+	conn := startPolicyProxy(t, `{"tenant_defaults": {"idle_in_transaction_timeout": "300ms"}}`).connect(t, "sslmode=disable")
+	ctx := t.Context()
+	if _, err := conn.Exec(ctx, "create temp table qg_ecopy (id int)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "begin"); err != nil {
+		t.Fatal(err)
+	}
+	hj, err := conn.PgConn().Hijack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hj.Conn.Close()
+	hj.Conn.SetDeadline(time.Now().Add(10 * time.Second))
+	fe := hj.Frontend
+	until := func(done func(pgproto3.BackendMessage) bool) {
+		t.Helper()
+		for {
+			msg, err := fe.Receive()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if e, ok := msg.(*pgproto3.ErrorResponse); ok {
+				t.Fatalf("%s: %s", e.Code, e.Message)
+			}
+			if done(msg) {
+				return
+			}
+		}
+	}
+
+	// As libpq's PQexecParams sends it: Postgres ignores this Sync while it takes the data, and answers the one after CopyDone.
+	fe.SendParse(&pgproto3.Parse{Query: "copy qg_ecopy from stdin"})
+	fe.SendBind(&pgproto3.Bind{})
+	fe.SendDescribe(&pgproto3.Describe{ObjectType: 'P'})
+	fe.SendExecute(&pgproto3.Execute{})
+	fe.SendSync(&pgproto3.Sync{})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	until(func(m pgproto3.BackendMessage) bool { _, ok := m.(*pgproto3.CopyInResponse); return ok })
+	fe.Send(&pgproto3.CopyData{Data: []byte("1\n")})
+	fe.Send(&pgproto3.CopyDone{})
+	fe.SendSync(&pgproto3.Sync{})
+	if err := fe.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	until(func(m pgproto3.BackendMessage) bool { _, ok := m.(*pgproto3.ReadyForQuery); return ok })
+
+	time.Sleep(time.Second)
+	fe.SendQuery(&pgproto3.Query{String: "select 1"})
+	if err := fe.Flush(); err != nil {
+		return
+	}
+	for {
+		msg, err := fe.Receive()
+		if err != nil {
+			return
+		}
+		switch m := msg.(type) {
+		case *pgproto3.ErrorResponse:
+			if m.Code != "25P03" {
+				t.Errorf("got %s %s; want the idle-in-transaction timeout", m.Code, m.Message)
+			}
+			return
+		case *pgproto3.ReadyForQuery:
+			t.Fatal("a statement ran in a transaction left idle past its limit after COPY")
+		}
 	}
 }
 

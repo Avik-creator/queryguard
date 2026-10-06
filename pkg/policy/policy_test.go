@@ -167,10 +167,10 @@ func TestStatementTooLongToCheck(t *testing.T) {
 	allow := mustParse(t, `{"rules": [{"check": "require_where"}], "unchecked": "allow"}`).Checker("alice", discard)
 	reject := mustParse(t, `{"rules": [{"check": "require_where"}]}`).Checker("alice", discard)
 
-	if got := allow.CheckTooLong(1 << 30); got != nil {
+	if got := allow.CheckUnread("It is too long to read: 1073741824 bytes."); got != nil {
 		t.Errorf("unchecked allow got %v; want allowed", got)
 	}
-	if got := reject.CheckTooLong(1 << 30); got == nil || got.Code != "42501" {
+	if got := reject.CheckUnread("It is too long to read: 1073741824 bytes."); got == nil || got.Code != "42501" {
 		t.Errorf("unchecked reject got %v; want 42501", got)
 	}
 }

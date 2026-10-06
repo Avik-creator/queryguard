@@ -142,10 +142,31 @@ func TestForwardsCopyData(t *testing.T) {
 	h.serverGets(&pgproto3.CopyData{Data: []byte("1\n")}, &pgproto3.CopyDone{})
 }
 
+func TestExtendedCopyEndsIdle(t *testing.T) {
+	h := start(t, fakeChecker{})
+	copyIn := []encoder{&pgproto3.Parse{Query: "copy notes from stdin"}, &pgproto3.Bind{}, &pgproto3.Describe{ObjectType: 'P'}, &pgproto3.Execute{}, &pgproto3.Sync{}}
+	h.send(copyIn...)
+	h.serverGets(copyIn...)
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, &pgproto3.NoData{}, &pgproto3.CopyInResponse{})
+	h.clientGets(&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, &pgproto3.NoData{}, &pgproto3.CopyInResponse{})
+
+	// Postgres ignores a Sync sent during COPY, as libpq's was above, and answers only the one after CopyDone.
+	h.send(&pgproto3.CopyData{Data: []byte("1\n")}, &pgproto3.CopyDone{}, &pgproto3.Sync{})
+	h.serverGets(&pgproto3.CopyData{Data: []byte("1\n")}, &pgproto3.CopyDone{}, &pgproto3.Sync{})
+	h.reply(&pgproto3.CommandComplete{CommandTag: []byte("COPY 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.clientGets(&pgproto3.CommandComplete{CommandTag: []byte("COPY 1")}, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+
+	// Nothing is outstanding now, so the proxy can answer by itself again.
+	h.send(&pgproto3.Query{String: "bad"})
+
+	h.clientGets(rejected, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+	h.serverGetsNothingBefore(&pgproto3.Query{String: "select 'next'"})
+}
+
 func TestStatementTooLongToCheck(t *testing.T) {
 	long := "select '" + strings.Repeat("x", maxCheckedLen) + "'"
 	for _, allow := range []bool{true, false} {
-		h := start(t, fakeChecker{allowTooLong: allow})
+		h := start(t, fakeChecker{allowUnread: allow})
 		buf, _ := (&pgproto3.Query{String: long}).Encode(nil)
 
 		// The proxy streams the message on while the test is still writing it, so the write can't block the reads below.
@@ -158,6 +179,31 @@ func TestStatementTooLongToCheck(t *testing.T) {
 			h.serverGetsNothingBefore(&pgproto3.Query{String: "select 'next'"})
 		}
 	}
+}
+
+func TestFunctionCallGoesAsAStatementThatCannotBeChecked(t *testing.T) {
+	call := &pgproto3.FunctionCall{Function: 2245, ArgFormatCodes: []uint16{}, Arguments: [][]byte{[]byte("1")}}
+	for _, allow := range []bool{true, false} {
+		h := start(t, fakeChecker{allowUnread: allow})
+
+		h.send(call)
+
+		if allow {
+			h.serverGets(call)
+		} else {
+			h.clientGets(rejected, &pgproto3.ReadyForQuery{TxStatus: 'I'})
+			h.serverGetsNothingBefore(&pgproto3.Query{String: "select 'next'"})
+		}
+	}
+}
+
+func TestFunctionCallInTransactionIsRejectedThroughPostgres(t *testing.T) {
+	h := start(t, fakeChecker{})
+	h.begin()
+
+	h.send(&pgproto3.FunctionCall{Function: 2245, Arguments: [][]byte{[]byte("1")}})
+
+	h.serverGets(&pgproto3.Query{String: wantDo})
 }
 
 func TestTellsCheckerTheReportedSettings(t *testing.T) {
@@ -246,6 +292,26 @@ func TestPassesOnPostgresErrorFromExplainingQuery(t *testing.T) {
 	h.clientGets(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "42P01", Message: "relation \"nowhere\" does not exist", Position: 18},
 		&pgproto3.ReadyForQuery{TxStatus: 'I'})
 	h.serverGetsNothingBefore(&pgproto3.Query{String: "select 'next'"})
+}
+
+func TestRefusedExplainLeavesTheSessionIdle(t *testing.T) {
+	a := newAdmitter()
+	a.idle = 50 * time.Millisecond
+	h := start(t, fakeChecker{admit: a})
+	h.begin()
+
+	h.send(&pgproto3.Query{String: "select slot plan from nowhere"})
+	h.serverGets(&pgproto3.Query{String: explainPrefix + "select slot plan from nowhere"})
+	expect(t, a.running, false)
+	h.reply(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "42P01", Message: "relation \"nowhere\" does not exist", Position: int32(len(explainPrefix)) + 23},
+		&pgproto3.ReadyForQuery{TxStatus: 'E'})
+	h.clientGets(&pgproto3.ErrorResponse{Severity: "ERROR", Code: "42P01", Message: "relation \"nowhere\" does not exist", Position: 23},
+		&pgproto3.ReadyForQuery{TxStatus: 'E'})
+
+	// Nothing runs, so the slot goes back and the transaction left open is timed as idle.
+	expect(t, a.released, struct{}{})
+	h.clientGets(&pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "25P03",
+		Message: "queryguard: terminating connection due to idle-in-transaction timeout"})
 }
 
 func TestExplainsBindWithItsValues(t *testing.T) {
@@ -543,6 +609,37 @@ func TestNoCancelForStatementWithinItsTimeout(t *testing.T) {
 	expectNone(t, h.cancels, "cancelled an idle session")
 }
 
+func TestStatementWithoutATimeoutIsNotCancelledWhenTheOneBeforeItEnds(t *testing.T) {
+	a := newAdmitter()
+	a.timeout = time.Hour
+	h := start(t, fakeChecker{admit: a})
+	msgs := []encoder{&pgproto3.Parse{Name: "a", Query: "select slot"}, &pgproto3.Parse{Name: "b", Query: "select free"},
+		&pgproto3.Bind{PreparedStatement: "a"}, &pgproto3.Execute{}, &pgproto3.Bind{PreparedStatement: "b"}, &pgproto3.Execute{}, &pgproto3.Sync{}}
+
+	h.send(msgs...)
+	h.serverGets(msgs...)
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, &pgproto3.CommandComplete{CommandTag: []byte("SELECT 1")})
+
+	expectNone(t, h.cancels, "cancelled the second statement, which has no timeout")
+}
+
+func TestTimeoutCountsFromTheExecute(t *testing.T) {
+	a := newAdmitter()
+	a.timeout = 100 * time.Millisecond
+	h := start(t, fakeChecker{admit: a})
+	h.send(&pgproto3.Parse{Query: "select slot, pg_sleep(60)"}, &pgproto3.Bind{}, &pgproto3.Flush{})
+	h.serverGets(&pgproto3.Parse{Query: "select slot, pg_sleep(60)"}, &pgproto3.Bind{}, &pgproto3.Flush{})
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.BindComplete{})
+	h.clientGets(&pgproto3.ParseComplete{}, &pgproto3.BindComplete{})
+
+	// The statement is bound but not running yet, so this wait mustn't use up its timeout.
+	time.Sleep(200 * time.Millisecond)
+	h.send(&pgproto3.Execute{}, &pgproto3.Sync{})
+	h.serverGets(&pgproto3.Execute{}, &pgproto3.Sync{})
+
+	expect(t, h.cancels, struct{}{})
+}
+
 func TestEndsSessionIdleInTransaction(t *testing.T) {
 	a := newAdmitter()
 	a.idle = 50 * time.Millisecond
@@ -836,13 +933,13 @@ var postgresError = &pgproto3.ErrorResponse{Severity: "ERROR", Code: "42601", Me
 // loginSettings are the settings the harness's login reports.
 var loginSettings = Settings{StandardConformingStrings: "on", ClientEncoding: "UTF8"}
 
-// fakeChecker rejects "bad", costs "plan" (rejecting "big" plans), admits "slot" as admit says, and holds "wait" until its wait ends.
+// fakeChecker rejects "bad", costs "plan" (rejecting "big" plans), admits "slot" as admit says (explaining it too with "plan") and "free" with no limits, and rejects "wait" once its wait ends.
 type fakeChecker struct {
-	allowTooLong bool
-	seen         chan<- Settings // gets the settings of each checked statement, when set
-	generic      chan<- bool     // gets whether each plan explained was generic, when set
-	values       chan<- string   // gets the values digest of each plan explained, when set
-	admit        *admitter       // admits "slot" statements, when set
+	allowUnread bool
+	seen        chan<- Settings // gets the settings of each checked statement, when set
+	generic     chan<- bool     // gets whether each plan explained was generic, when set
+	values      chan<- string   // gets the values digest of each plan explained, when set
+	admit       *admitter       // admits "slot" statements, when set
 }
 
 // admitter admits statements with a slot and limits, recording each gate's running and each release.
@@ -854,6 +951,7 @@ type admitter struct {
 	running           chan bool     // gets running from each gate
 	released          chan struct{} // gets a value when a slot is freed
 	waited            chan error    // gets why each "wait" statement's wait ended
+	hold              chan struct{} // ends each "wait" statement's wait when closed
 	ran               chan run      // gets how each admitted statement ran
 	settled           chan struct{} // gets a value when an admitted statement's transaction has ended
 	idled             chan struct{} // gets a value when the server is idle after an admitted statement
@@ -879,14 +977,23 @@ func (c fakeChecker) Check(sql string, set Settings) (*pgproto3.ErrorResponse, G
 	case strings.Contains(sql, "bad"):
 		return rejected, nil
 	case strings.Contains(sql, "wait"):
-		return nil, func(ctx context.Context, _ Explain, _ bool) Admission {
-			<-ctx.Done()
-			c.admit.waited <- ctx.Err()
+		return nil, func(ctx context.Context, _ Explain, running bool) Admission {
+			if c.admit != nil {
+				c.admit.running <- running
+			}
+			select {
+			case <-ctx.Done():
+				c.admit.waited <- ctx.Err()
+			case <-c.admit.hold:
+			}
 			return Admission{Reject: tooCostly}
 		}
 	case strings.Contains(sql, "slot"):
-		return nil, func(_ context.Context, _ Explain, running bool) Admission {
+		return nil, func(_ context.Context, e Explain, running bool) Admission {
 			c.admit.running <- running
+			if strings.Contains(sql, "plan") && e.Run != nil {
+				e.Run()
+			}
 			a := Admission{Timeout: c.admit.timeout, IdleInTransaction: c.admit.idle, TransactionTimeout: c.admit.tx,
 				MaxRows: c.admit.maxRows, MaxBytes: c.admit.maxBytes, Returned: func(rows, bytes int64) { c.admit.returned <- [2]int64{rows, bytes} },
 				Broke: func(i Interruption) { c.admit.broke <- i.Code },
@@ -898,6 +1005,8 @@ func (c fakeChecker) Check(sql string, set Settings) (*pgproto3.ErrorResponse, G
 			}
 			return a
 		}
+	case strings.Contains(sql, "free"):
+		return nil, func(context.Context, Explain, bool) Admission { return Admission{} }
 	case !strings.Contains(sql, "plan"):
 		return nil, nil
 	}
@@ -919,8 +1028,8 @@ func (c fakeChecker) Check(sql string, set Settings) (*pgproto3.ErrorResponse, G
 	}
 }
 
-func (c fakeChecker) CheckTooLong(int) *pgproto3.ErrorResponse {
-	if c.allowTooLong {
+func (c fakeChecker) CheckUnread(string) *pgproto3.ErrorResponse {
+	if c.allowUnread {
 		return nil
 	}
 	return rejected
@@ -1123,7 +1232,7 @@ func TestPanicInAStatementTimerEndsOnlyThatSession(t *testing.T) {
 type panicChecker struct{}
 
 func (panicChecker) Check(string, Settings) (*pgproto3.ErrorResponse, Gate) { panic("bug") }
-func (panicChecker) CheckTooLong(int) *pgproto3.ErrorResponse               { panic("bug") }
+func (panicChecker) CheckUnread(string) *pgproto3.ErrorResponse             { panic("bug") }
 
 // relayWith runs Relay with opts and a login that succeeds at once; done gets what it returns.
 func relayWith(t *testing.T, opts Options) (client, pg net.Conn, done <-chan error) {
@@ -1462,6 +1571,61 @@ func TestCancelsAPreparedReadPastItsRowCap(t *testing.T) {
 	expect(t, h.cancels, struct{}{})
 }
 
+func TestExecutesOfASuspendedPortalShareItsRowCap(t *testing.T) {
+	a := newAdmitter()
+	a.maxRows = 2
+	h := start(t, fakeChecker{admit: a})
+	row := &pgproto3.DataRow{Values: [][]byte{[]byte("x")}}
+	msgs := []encoder{&pgproto3.Parse{Query: "select slot from big"}, &pgproto3.Bind{},
+		&pgproto3.Execute{MaxRows: 1}, &pgproto3.Execute{MaxRows: 1}, &pgproto3.Execute{MaxRows: 1}, &pgproto3.Sync{}}
+
+	h.send(msgs...)
+	h.serverGets(msgs...)
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, row, &pgproto3.PortalSuspended{}, row, &pgproto3.PortalSuspended{}, row)
+
+	expect(t, h.cancels, struct{}{})
+}
+
+func TestRowsOfASuspendedPortalAddUp(t *testing.T) {
+	a := newAdmitter()
+	h := start(t, fakeChecker{admit: a})
+	h.begin()
+	row := &pgproto3.DataRow{Values: [][]byte{[]byte("x")}}
+
+	// A driver fetching a cursor's rows in pages runs one Execute for each page.
+	h.send(&pgproto3.Parse{Query: "select slot from big"}, &pgproto3.Bind{}, &pgproto3.Execute{MaxRows: 1}, &pgproto3.Sync{})
+	h.serverGets(&pgproto3.Parse{Query: "select slot from big"}, &pgproto3.Bind{}, &pgproto3.Execute{MaxRows: 1}, &pgproto3.Sync{})
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, row, &pgproto3.PortalSuspended{}, &pgproto3.ReadyForQuery{TxStatus: 'T'})
+	h.clientGets(&pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, row, &pgproto3.PortalSuspended{}, &pgproto3.ReadyForQuery{TxStatus: 'T'})
+	h.send(&pgproto3.Execute{}, &pgproto3.Sync{})
+	h.serverGets(&pgproto3.Execute{}, &pgproto3.Sync{})
+	h.reply(row, row, &pgproto3.CommandComplete{CommandTag: []byte("SELECT 3")}, &pgproto3.ReadyForQuery{TxStatus: 'T'})
+
+	select {
+	case got := <-a.returned:
+		if got[0] != 3 {
+			t.Errorf("returned %v; want the 3 rows of all its pages", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the statement's rows were never reported")
+	}
+}
+
+func TestRebindingThePortalDropsTheOldStatementsLimits(t *testing.T) {
+	a := newAdmitter()
+	a.maxRows = 2
+	h := start(t, fakeChecker{admit: a})
+	row := &pgproto3.DataRow{Values: [][]byte{[]byte("x")}}
+	msgs := []encoder{&pgproto3.Parse{Name: "a", Query: "select slot from big"}, &pgproto3.Parse{Name: "b", Query: "select * from small"},
+		&pgproto3.Bind{PreparedStatement: "a"}, &pgproto3.Bind{PreparedStatement: "b"}, &pgproto3.Execute{}, &pgproto3.Sync{}}
+
+	h.send(msgs...)
+	h.serverGets(msgs...)
+	h.reply(&pgproto3.ParseComplete{}, &pgproto3.ParseComplete{}, &pgproto3.BindComplete{}, &pgproto3.BindComplete{}, row, row, row)
+
+	expectNone(t, h.cancels, "cancelled the statement bound last by the limits of the one it replaced")
+}
+
 func TestLeavesAReadAfterAnotherInTheSameSyncUncut(t *testing.T) {
 	a := newAdmitter()
 	a.maxRows = 2
@@ -1620,6 +1784,20 @@ func TestDrainWaitsForTheTransactionToEnd(t *testing.T) {
 	if !errors.Is(h.err, ErrDrained) {
 		t.Errorf("Relay returned %v; want ErrDrained", h.err)
 	}
+}
+
+func TestDrainEndsASessionOnceTheStatementItQueuedIsRejected(t *testing.T) {
+	a, drain := newAdmitter(), make(chan struct{})
+	a.hold = make(chan struct{})
+	h := startWith(t, Options{Check: fakeChecker{admit: a}, Drain: drain})
+	h.send(&pgproto3.Query{String: "select wait"})
+	expect(t, a.running, false)
+
+	close(drain)
+	time.Sleep(50 * time.Millisecond)
+	close(a.hold)
+
+	h.clientGets(tooCostly, &pgproto3.ReadyForQuery{TxStatus: 'I'}, drainedError)
 }
 
 func TestDrainEndsASessionThatLogsInWhileDraining(t *testing.T) {

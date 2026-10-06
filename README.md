@@ -163,6 +163,9 @@ rejects a statement it cannot check, with the reason in the error's detail:
   PostgreSQL may then read the text differently from the parser. While an
   earlier statement in a pipeline is still running, QueryGuard can't know
   these settings yet and treats them as unknown.
+- a fast-path function call, as libpq's `PQfn` and the large-object
+  functions of libpq, psycopg2 and pgJDBC send, which names its function only
+  by number
 
 `"unchecked": "allow"` lets these statements run and logs them, but then any
 rule can be sidestepped by writing a statement the parser can't read.

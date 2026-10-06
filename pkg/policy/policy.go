@@ -1725,10 +1725,10 @@ func (p *Policy) matches(i int, who subject) bool {
 	return client && listed(m.Roles, who.role) && listed(m.Tenants, who.tenant) && listed(m.ApplicationNames, who.app)
 }
 
-// CheckTooLong decides on a statement too long to read, as for one the parser can't read.
-func (c *Checker) CheckTooLong(size int) *pgproto3.ErrorResponse {
+// CheckUnread decides on a message it can't read as SQL, as for a statement the parser can't read.
+func (c *Checker) CheckUnread(why string) *pgproto3.ErrorResponse {
 	p := c.policy()
-	return c.unchecked(p, p.cfg.Tenants[c.role].Mode == Warn, fmt.Sprintf("It is too long to read: %d bytes.", size))
+	return c.unchecked(p, p.cfg.Tenants[c.role].Mode == Warn, why)
 }
 
 // unchecked logs a statement that could not be checked, and why, and rejects it unless unchecked is allow or no rule applies.
