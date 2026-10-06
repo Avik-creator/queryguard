@@ -247,6 +247,29 @@ func TestRefusedLoginCarriesPostgresCode(t *testing.T) {
 	}
 }
 
+func TestRefusedRunsBeforeTheClientSeesTheRefusal(t *testing.T) {
+	refusal := &pgproto3.ErrorResponse{Severity: "FATAL", Code: "28P01", Message: "password authentication failed"}
+	var code string
+	client := writerFunc(func(p []byte) (int, error) {
+		// A client that reconnects the moment it reads the refusal must find the failure already counted.
+		if code != "28P01" {
+			t.Errorf("client got the refusal before Refused ran (code %q)", code)
+		}
+		return len(p), nil
+	})
+
+	RelayStartup(client, bytes.NewReader(encode(t, refusal)), StartupOptions{Refused: func(c string) { code = c }})
+
+	if code != "28P01" {
+		t.Errorf("Refused got %q; want 28P01", code)
+	}
+}
+
+// writerFunc is an io.Writer made of a function.
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
 func TestRelayAuthRepliesStopsAtTheFirstOtherMessage(t *testing.T) {
 	password, sasl := encode(t, &pgproto3.PasswordMessage{Password: "secret"}), encode(t, &pgproto3.SASLResponse{Data: []byte("proof")})
 	query := encode(t, &pgproto3.Query{String: "show kills"})

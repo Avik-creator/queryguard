@@ -36,6 +36,8 @@ type StartupOptions struct {
 	Report         func(name, value string)                                       // gets each ParameterStatus; nil ignores them
 	// Authenticated runs once AuthenticationOk has reached the client; an *Error it returns goes to the client as FATAL and ends the login.
 	Authenticated func() *Error
+	// Refused gets the SQLSTATE of an ErrorResponse that ends the login, before the client sees it; nil ignores it.
+	Refused func(code string)
 }
 
 // passwordMessageType is the client's password, SASL and GSSAPI replies during login.
@@ -91,7 +93,7 @@ func RelayStartup(client io.Writer, server io.Reader, opts StartupOptions) error
 		case typ == parameterStatusType && opts.Report != nil:
 			err = relayParameter(client, server, head, size, opts.Report)
 		case typ == errorResponseType && size <= maxPacketLen:
-			return relayRefusal(client, server, head, size, hidBinding)
+			return relayRefusal(client, server, head, size, hidBinding, opts.Refused)
 		default:
 			err = forward(client, server, head[:], size)
 		}
@@ -118,14 +120,19 @@ func (e *LoginRefusedError) Is(target error) bool { return target == ErrLoginRef
 const bindingHint = "QueryGuard ends TLS, so SCRAM channel binding can't reach Postgres: connect with channel_binding=disable, " +
 	"or give QueryGuard Postgres's own certificate and key."
 
-// relayRefusal forwards the ErrorResponse that ends a login, with a hint when hidBinding led to a protocol violation, and returns it as a LoginRefusedError.
-func relayRefusal(client io.Writer, server io.Reader, head [5]byte, size int64, hidBinding bool) error {
+// relayRefusal forwards the ErrorResponse that ends a login, after passing its code to refused, with a hint when hidBinding led to a
+// protocol violation, and returns it as a LoginRefusedError.
+func relayRefusal(client io.Writer, server io.Reader, head [5]byte, size int64, hidBinding bool, refused func(code string)) error {
 	body := make([]byte, size)
 	if _, err := io.ReadFull(server, body); err != nil {
 		return unexpected(err)
 	}
 	var e pgproto3.ErrorResponse
-	if err := e.Decode(body); err != nil {
+	err := e.Decode(body)
+	if refused != nil && err == nil {
+		refused(e.Code)
+	}
+	if err != nil {
 		if _, err := client.Write(append(head[:], body...)); err != nil {
 			return err
 		}

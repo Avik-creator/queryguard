@@ -440,6 +440,13 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	opts := wire.StartupOptions{
 		ChannelBinding: sameCertificate(client, server, s.TLSConfig),
 		Authenticated:  authenticated,
+		// A wrong password and a pg_hba.conf rejection count, before the client can try again; a server starting up or full doesn't.
+		Refused: func(code string) {
+			if (code == "28P01" || code == "28000") && throttle.Failures > 0 && s.throttle.failed(key, time.Now(), throttle) {
+				log.Warn("refusing logins after repeated failures", "client", client.RemoteAddr(), "role", role,
+					"failures", throttle.Failures, "cool_off", time.Duration(throttle.CoolOff))
+			}
+		},
 		IssueKey: func(key *pgproto3.BackendKeyData) *pgproto3.BackendKeyData {
 			serverKey.Store(key)
 			forget()
@@ -492,13 +499,6 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 		}})
 	forget()
 	unfile()
-	// A wrong password and a pg_hba.conf rejection count; a server that is starting up or full doesn't.
-	if e, ok := errors.AsType[*wire.LoginRefusedError](err); ok && (e.Code == "28P01" || e.Code == "28000") && throttle.Failures > 0 {
-		if s.throttle.failed(key, time.Now(), throttle) {
-			log.Warn("refusing logins after repeated failures", "client", client.RemoteAddr(), "role", role,
-				"failures", throttle.Failures, "cool_off", time.Duration(throttle.CoolOff))
-		}
-	}
 	// A login refused over the cap was logged when it was refused, and Postgres logs the logins it refuses.
 	switch _, refused := errors.AsType[*wire.Error](err); {
 	case isPanic(err):
