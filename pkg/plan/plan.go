@@ -381,19 +381,21 @@ func (h *History) tenant(tenant string) *timing {
 	g := h.tenants[tenant]
 	if g == nil {
 		if len(h.tenants) >= maxTenants {
-			var oldest string
-			for k, o := range h.tenants {
-				if oldest == "" || o.used.Before(h.tenants[oldest].used) {
-					oldest = k
-				}
-			}
-			delete(h.tenants, oldest)
+			evict(h.tenants, func(a, b *timing) int { return a.used.Compare(b.used) })
 		}
 		g = &timing{}
 		h.tenants[tenant] = g
 	}
 	g.used = time.Now()
 	return g
+}
+
+// evict drops the tenth of m that sorts first, at least one, so a full map is gone through only once for many new entries.
+func evict[K comparable, V any](m map[K]V, compare func(a, b V) int) {
+	keys := slices.SortedFunc(maps.Keys(m), func(a, b K) int { return compare(m[a], m[b]) })
+	for _, k := range keys[:max(1, len(keys)/10)] {
+		delete(m, k)
+	}
 }
 
 // statement returns key's record, making it, and room for it, when new; the caller holds mu.
@@ -404,14 +406,8 @@ func (h *History) statement(key string) *statement {
 	st := h.statements[key]
 	if st == nil {
 		if len(h.statements) >= cmp.Or(h.Size, DefaultSize) {
-			// The statement least recently seen goes.
-			var oldest string
-			for k, s := range h.statements {
-				if oldest == "" || s.used.Before(h.statements[oldest].used) {
-					oldest = k
-				}
-			}
-			delete(h.statements, oldest)
+			// The statements least recently seen go.
+			evict(h.statements, func(a, b *statement) int { return a.used.Compare(b.used) })
 		}
 		st = &statement{shapes: map[uint64]*shape{}}
 		h.statements[key] = st

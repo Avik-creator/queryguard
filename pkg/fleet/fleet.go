@@ -74,11 +74,11 @@ type Fleet struct {
 	DeadAfter    time.Duration // how long after its last renewal an instance may still use its fallback share
 	Log          *slog.Logger
 
-	mu       sync.Mutex
-	name     string
-	reply    Reply
-	leases   map[string]held
-	crowded  bool               // more instances than MaxInstances were live at the last renewal
+	mu      sync.Mutex
+	name    string
+	reply   Reply
+	leases  map[string]held
+	crowded bool // more instances than MaxInstances were live at the last renewal
 }
 
 // held is a lease in use.

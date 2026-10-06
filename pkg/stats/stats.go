@@ -97,7 +97,7 @@ type row struct {
 
 // Table gathers statements into rows; it is safe for concurrent use, and its zero value is ready.
 type Table struct {
-	Max       int                           // rows kept; the least called row goes to make room; 0 means DefaultMax
+	Max       int                           // rows kept; the least called tenth goes to make room; 0 means DefaultMax
 	ErrorText bool                          // keep each code's last error text, which can carry row values
 	Tenant    func(role, sql string) string // the tenant a statement runs for; nil means its role
 	// Traffic, when set, gets a record of each statement, for the policy simulator.
@@ -262,15 +262,13 @@ func (t *Table) makeRoom() {
 	if len(t.rows) < t.max() {
 		return
 	}
-	var least key
-	var fewest *row
-	for k, r := range t.rows {
-		if fewest == nil || r.calls < fewest.calls {
-			least, fewest = k, r
-		}
+	// Finding the least called rows means going through them all, so a tenth go at once, not one for each new row.
+	keys := slices.SortedFunc(maps.Keys(t.rows), func(a, b key) int { return cmp.Compare(t.rows[a].calls, t.rows[b].calls) })
+	n := max(1, len(keys)/10)
+	for _, k := range keys[:n] {
+		delete(t.rows, k)
 	}
-	delete(t.rows, least)
-	t.evicted++
+	t.evicted += int64(n)
 }
 
 func inc(m map[string]int64, code string) map[string]int64 {

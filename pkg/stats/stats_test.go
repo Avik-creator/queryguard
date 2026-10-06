@@ -134,6 +134,17 @@ func TestLeastCalledRowGoesWhenFull(t *testing.T) {
 	}
 }
 
+func TestFullTableMakesRoomForATenthAtOnce(t *testing.T) {
+	tb := Table{Max: 100}
+	// Names ending in digits share a fingerprint, as partitions do, so each table is named in letters.
+	for i := range 101 {
+		tb.add(Statement{Database: "shop", Role: "app", SQL: "select a from t" + string(rune('a'+i/26)) + string(rune('a'+i%26))})
+	}
+	if n := len(tb.Rows()); n != 91 || tb.Evicted() != 10 {
+		t.Errorf("%d rows, %d evicted; want 91 rows, a tenth gone to make room", n, tb.Evicted())
+	}
+}
+
 func TestRecordIsTakenUpByRun(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var tb Table

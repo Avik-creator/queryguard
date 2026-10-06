@@ -769,7 +769,7 @@ own. A multi-statement query string is one row. The percentiles come from
 buckets about 2% apart, so they are within 1% of the true value.
 
 QueryGuard keeps up to `-stats-max` rows (5000, as `pg_stat_statements.max`)
-and drops the least called one to make room; `-stats-max 0` keeps none. Error
+and drops the least called tenth to make room; `-stats-max 0` keeps none. Error
 text can carry row values, so only the codes are kept unless
 `-stats-error-text` is set. Statements are parsed off the sessions' path; if
 that falls behind, statements are dropped from the stats rather than slowing

@@ -554,6 +554,17 @@ func TestHistoryStaysWithinSize(t *testing.T) {
 	}
 }
 
+func TestFullHistoryMakesRoomForATenthAtOnce(t *testing.T) {
+	// Finding the least recently seen means going through them all, so it is done for many at once, not for each new one.
+	h := History{Size: 100}
+	for i := range 101 {
+		h.Ran("", strconv.Itoa(i), Plan{Cost: 1, Shape: 1}, time.Millisecond, true, Tuning{})
+	}
+	if n := len(h.statements); n != 91 {
+		t.Errorf("history holds %d statements; want 91, a tenth gone to make room", n)
+	}
+}
+
 func TestCacheForget(t *testing.T) {
 	c := &Cache{RefreshOneIn: -1}
 	calls := 0
