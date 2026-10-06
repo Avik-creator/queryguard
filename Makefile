@@ -30,7 +30,8 @@ rogue: ## Measure innocent tenants' latency next to a rogue tenant, with and wit
 
 bench: ## Run overhead and rogue on PG 16, 17 and 18, three runs each, into bench/ (takes about 40 minutes)
 	mkdir -p bench
-	for pg in 16 17 18; do for run in 1 2 3; do \
+	# Versions take turns within each run, so the machine growing busier or warmer doesn't favour the first.
+	for run in 1 2 3; do for pg in 16 17 18; do \
 		$(MAKE) --no-print-directory overhead PG=$$pg | tee bench/overhead-pg$$pg-$$run.txt; \
 		$(MAKE) --no-print-directory rogue PG=$$pg | tee bench/rogue-pg$$pg-$$run.txt; \
 	done; done
