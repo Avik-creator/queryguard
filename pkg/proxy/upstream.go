@@ -48,13 +48,12 @@ func (d Dialer) Cancel(ctx context.Context, req *pgproto3.CancelRequest) error {
 		return err
 	}
 	defer conn.Close()
+	// A stuck server mustn't hold up whoever waits on the cancel, such as a shutdown.
+	defer context.AfterFunc(ctx, func() { conn.Close() })()
 	if err := writeMessage(conn, req); err != nil {
 		return err
 	}
 	// Postgres closes the connection once it has signalled the backend, so until then a statement sent next could get the cancel.
-	if deadline, ok := ctx.Deadline(); ok {
-		conn.SetReadDeadline(deadline)
-	}
 	_, err = io.Copy(io.Discard, conn)
 	return err
 }

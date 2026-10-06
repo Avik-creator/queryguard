@@ -115,7 +115,7 @@ type Server struct {
 	capacity atomic.Uint64 // the server's measured cost units a second, as float64 bits; 0 until measured
 
 	// Each holds back a flood of one kind of line, such as failed handshakes from a port scanner.
-	startupLogs, cancelLogs quietLog
+	startupLogs, cancelLogs, upstreamLogs quietLog
 
 	// Only the Monitor's goroutine uses these.
 	observed   time.Time              // when it last reported
@@ -342,7 +342,9 @@ func (s *Server) handle(ctx context.Context, log *slog.Logger, client net.Conn) 
 			}
 			return
 		}
-		if err := s.Upstream.Cancel(ctx, req); err != nil {
+		cctx, done := context.WithTimeout(ctx, cancelTimeout)
+		defer done()
+		if err := s.Upstream.Cancel(cctx, req); err != nil {
 			if ok, held := s.cancelLogs.allow(time.Now()); ok {
 				log.Warn("forward cancel request", heldBack(held, "client", client.RemoteAddr(), "err", err)...)
 			}
@@ -362,6 +364,19 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	// Postgres connects a client that names no database to the one named after its role.
 	database := pgName(cmp.Or(startup.Parameters["database"], role))
 	throttle, key := s.loginThrottle(), throttleKey{clientAddr(client), role}
+	tried := func() {}
+	if throttle.Failures > 0 {
+		tctx, cancel := context.WithTimeout(ctx, cmp.Or(s.StartupTimeout, DefaultStartupTimeout))
+		done, err := s.throttle.try(tctx, key, throttle.Failures)
+		cancel()
+		if err != nil {
+			wire.SendFatal(client, "53300", "queryguard: too many logins under way from this address")
+			return
+		}
+		tried = done
+		defer tried()
+	}
+	// Checked once this login's turn comes, since those it waited for may have started a cool-off.
 	if wait := s.throttle.coolingOff(key, time.Now()); wait > 0 && throttle.Failures > 0 {
 		wire.SendFatal(client, "28000", fmt.Sprintf("queryguard: too many failed logins; retry in about %s", wait.Round(time.Second)))
 		return
@@ -414,6 +429,7 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	capped := authenticated
 	authenticated = func() *wire.Error {
 		s.throttle.succeeded(key)
+		tried()
 		if capped != nil {
 			return capped()
 		}
@@ -426,7 +442,9 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 	server, err := s.Upstream.Acquire(actx, startup)
 	connected()
 	if err != nil {
-		log.Error("connect to upstream", "client", client.RemoteAddr(), "err", err)
+		if ok, held := s.upstreamLogs.allow(time.Now()); ok {
+			log.Error("connect to upstream", heldBack(held, "client", client.RemoteAddr(), "err", err)...)
+		}
 		wire.SendFatal(client, "08006", "queryguard: cannot connect to the database server")
 		return
 	}
@@ -442,6 +460,7 @@ func (s *Server) relay(ctx context.Context, log *slog.Logger, client net.Conn, s
 		Authenticated:  authenticated,
 		// A wrong password and a pg_hba.conf rejection count, before the client can try again; a server starting up or full doesn't.
 		Refused: func(code string) {
+			defer tried()
 			if (code == "28P01" || code == "28000") && throttle.Failures > 0 && s.throttle.failed(key, time.Now(), throttle) {
 				log.Warn("refusing logins after repeated failures", "client", client.RemoteAddr(), "role", role,
 					"failures", throttle.Failures, "cool_off", time.Duration(throttle.CoolOff))

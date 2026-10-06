@@ -177,12 +177,13 @@ func (f *Fleet) ID() int {
 	return f.reply.ID
 }
 
-// Peer returns the address of the live instance with id.
+// Peer returns the address of the live instance with id, unless it is this instance's own, as during a rolling restart, where
+// sending to it would reach only this instance.
 func (f *Fleet) Peer(id int) (string, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	addr, ok := f.reply.Peers[id]
-	return addr, ok && addr != ""
+	return addr, ok && addr != "" && addr != f.Addr
 }
 
 // Release gives up the instance's leases; call it once nothing uses them, as after sessions have drained.

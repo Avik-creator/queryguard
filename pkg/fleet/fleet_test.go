@@ -119,6 +119,21 @@ func TestInstancesGetDistinctIDsAndKnowEachOther(t *testing.T) {
 	})
 }
 
+func TestPeerAtTheInstancesOwnAddressIsNoPeer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// During a rolling restart the old and new processes share an address; sending there reaches only the new one.
+		store := &Memory{}
+		old, next := &Fleet{Store: store, Name: "old", Addr: "10.0.0.1:6543"}, &Fleet{Store: store, Name: "next", Addr: "10.0.0.1:6543"}
+		go old.Run(t.Context(), wanting(100, 1), nil)
+		go next.Run(t.Context(), wanting(100, 1), nil)
+		time.Sleep(2*DefaultInterval + time.Millisecond)
+
+		if addr, ok := next.Peer(old.ID()); ok {
+			t.Errorf("peer %d is %q; want none, since that address is the instance's own", old.ID(), addr)
+		}
+	})
+}
+
 func TestWarnsWhenMoreInstancesRunThanTheFallbackShareAllowsFor(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var logs lockedBuffer

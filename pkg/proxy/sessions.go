@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"maps"
 	"net/netip"
 	"sync"
@@ -155,8 +156,10 @@ const maxThrottled = 10000
 
 // loginThrottle counts failed logins by client address and role.
 type loginThrottle struct {
-	mu   sync.Mutex
-	seen map[throttleKey]*loginFailures
+	mu     sync.Mutex
+	seen   map[throttleKey]*loginFailures
+	trying map[throttleKey]int // logins under way
+	freed  chan struct{}       // closed when one ends
 }
 
 // throttleKey is an address and role; keying by role too keeps one misconfigured app behind a NAT from locking out the others.
@@ -179,6 +182,42 @@ func (l *loginThrottle) coolingOff(k throttleKey, now time.Time) time.Duration {
 		return f.blockedUntil.Sub(now)
 	}
 	return 0
+}
+
+// try waits while limit of k's logins are under way, so no more passwords are guessed at once than may fail, then counts one
+// more until done is called.
+func (l *loginThrottle) try(ctx context.Context, k throttleKey, limit int) (done func(), err error) {
+	for {
+		l.mu.Lock()
+		if l.trying[k] < limit {
+			if l.trying == nil {
+				l.trying = map[throttleKey]int{}
+			}
+			l.trying[k]++
+			l.mu.Unlock()
+			return sync.OnceFunc(func() {
+				l.mu.Lock()
+				if l.trying[k]--; l.trying[k] == 0 {
+					delete(l.trying, k)
+				}
+				if l.freed != nil {
+					close(l.freed)
+					l.freed = nil
+				}
+				l.mu.Unlock()
+			}), nil
+		}
+		if l.freed == nil {
+			l.freed = make(chan struct{})
+		}
+		freed := l.freed
+		l.mu.Unlock()
+		select {
+		case <-freed:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
 
 // failed counts a failed login by k and reports whether it starts a cool-off.

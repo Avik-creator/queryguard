@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"maps"
@@ -79,7 +80,6 @@ func TestAsksPostgresForTighterKeepalive(t *testing.T) {
 		"tcp_keepalives_idle":     "15",
 		"tcp_keepalives_interval": "5",
 		"tcp_keepalives_count":    "3",
-		"tcp_user_timeout":        "30000",
 	}
 	for name, tc := range map[string]struct {
 		keepAlive net.KeepAliveConfig
@@ -88,8 +88,8 @@ func TestAsksPostgresForTighterKeepalive(t *testing.T) {
 	}{
 		"added":               {DefaultKeepAlive, nil, defaults},
 		"client's value kept": {DefaultKeepAlive, map[string]string{"tcp_keepalives_idle": "60"}, with(defaults, "tcp_keepalives_idle", "60")},
-		"client's options kept": {DefaultKeepAlive, map[string]string{"options": "-c tcp_user_timeout=0"},
-			with(defaults, "tcp_user_timeout", "")},
+		"client's options kept": {DefaultKeepAlive, map[string]string{"options": "-c tcp_keepalives_count=9"},
+			with(defaults, "tcp_keepalives_count", "")},
 		"off when disabled": {net.KeepAliveConfig{}, nil, map[string]string{}},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -103,6 +103,10 @@ func TestAsksPostgresForTighterKeepalive(t *testing.T) {
 				if got[param] != tc.want[param] {
 					t.Errorf("upstream got %s=%q; want %q", param, got[param], tc.want[param])
 				}
+			}
+			// A client that stops reading for a while, its window shut, would be cut off by a user timeout.
+			if v, ok := got["tcp_user_timeout"]; ok {
+				t.Errorf("upstream got tcp_user_timeout=%q; want none", v)
 			}
 		})
 	}
@@ -339,6 +343,35 @@ func TestGivesClientItsOwnCancelKey(t *testing.T) {
 	}
 }
 
+func TestCancelStopsWaitingWhenItsContextEnds(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	// A stuck server never closes the connection.
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		<-t.Context().Done()
+	}()
+	ctx, cancel := context.WithCancel(t.Context())
+	time.AfterFunc(100*time.Millisecond, cancel)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- (Dialer{Addr: ln.Addr().String()}).Cancel(ctx, &pgproto3.CancelRequest{ProcessID: 1, SecretKey: []byte{1, 2, 3, 4}})
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Cancel still waits on a stuck server after its context ended")
+	}
+}
+
 func TestCancelWaitsForPostgresToHandleIt(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -528,6 +561,30 @@ func TestStaysQuietWhenClientLeavesDuringLogin(t *testing.T) {
 
 	if logs.Len() > 0 {
 		t.Errorf("proxy logged %q; want nothing", logs.String())
+	}
+}
+
+func TestHoldsBackAFloodOfUpstreamFailures(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	down := ln.Addr().String()
+	ln.Close()
+	var logs syncBuffer
+	s := newServer(t, down)
+	s.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	addr, _ := startProxy(t, s)
+
+	// Each login costs a client nothing while the database is down, so each mustn't cost a log line.
+	for range 3 * quietBurst {
+		conn := dial(t, addr)
+		sendStartup(t, conn)
+		expectFatal(t, conn, "08006")
+	}
+
+	if n := strings.Count(logs.String(), "connect to upstream"); n > quietBurst {
+		t.Errorf("logged %d failures to connect; want at most %d", n, quietBurst)
 	}
 }
 
@@ -775,6 +832,21 @@ func TestMonitorsStatementCountersReachTheStats(t *testing.T) {
 	})
 }
 
+func TestShowStatsWhileNewStatementsArrive(t *testing.T) {
+	s := &Server{Stats: &stats.Table{Max: 1 << 20}}
+	go s.Stats.Run(t.Context())
+	go func() {
+		for i := 0; t.Context().Err() == nil; i++ {
+			s.Stats.Record(stats.Statement{Database: "shop", Role: "alice", SQL: fmt.Sprintf("select * from t%d", i)})
+		}
+	}()
+	for start := time.Now(); time.Since(start) < time.Second; {
+		if _, err := s.adminShow("stats", []string{"1000000"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestRepeatedFailedLoginsAreRefusedBeforeReachingPostgres(t *testing.T) {
 	refused := &pgproto3.ErrorResponse{Severity: "FATAL", Code: "28P01", Message: "password authentication failed"}
 	pg := serveFakePostgres(t, &fakePostgres{greetingFor: map[string][]encoder{"mallory": {refused}}})
@@ -800,6 +872,29 @@ func TestRepeatedFailedLoginsAreRefusedBeforeReachingPostgres(t *testing.T) {
 	}
 	// Another role from the same address, such as another app behind the same NAT, still logs in.
 	loginAs(t, dial(t, addr), "alice")
+}
+
+func TestLoginsAtOnceAreNoMoreGuessesThanTheThrottleAllows(t *testing.T) {
+	// The server asks for a password, which the client never sends, so each login stays under way.
+	pg := serveFakePostgres(t, &fakePostgres{greetingFor: map[string][]encoder{"mallory": {
+		&pgproto3.AuthenticationSASL{AuthMechanisms: []string{"SCRAM-SHA-256"}}}}})
+	s := newServer(t, pg.addr)
+	s.Policy = mustPolicy(t, `{"login_throttle": {"failures": 2, "cool_off": "1m"}}`)
+	addr, _ := startProxy(t, s)
+
+	for range 5 {
+		send(t, dial(t, addr), &pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersion30, Parameters: map[string]string{"user": "mallory", "database": "mallory"}})
+	}
+
+	// Two password guesses at a time; the rest wait to see whether those fail.
+	for range 2 {
+		mustReceive[*pgproto3.StartupMessage](t, pg.received)
+	}
+	select {
+	case msg := <-pg.received:
+		t.Fatalf("Postgres got %#v; want only as many logins at once as failures are allowed", msg)
+	case <-time.After(200 * time.Millisecond):
+	}
 }
 
 func TestASuccessfulLoginClearsFailures(t *testing.T) {
@@ -1983,6 +2078,25 @@ func TestAdminConsoleLogsInThroughPostgresAndKills(t *testing.T) {
 	}
 }
 
+func TestAdminConsoleIdleDoesNotHoldUpADrain(t *testing.T) {
+	pg := serveFakePostgres(t, &fakePostgres{greetingFor: map[string][]encoder{"postgres": {&pgproto3.AuthenticationOk{},
+		&pgproto3.ParameterStatus{Name: "is_superuser", Value: "on"}, fakeServerKey, &pgproto3.ReadyForQuery{TxStatus: 'I'}}}})
+	s := newServer(t, pg.addr)
+	s.AdminDatabase = "qgadmin"
+	s.ShutdownTimeout = 5 * time.Second
+	addr, stop := startProxy(t, s)
+	conn := adminLogin(t, addr, "alice")
+
+	// An operator's psql left open on the console mustn't make every rolling restart wait out the timeout.
+	start := time.Now()
+	stop()
+
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("drain took %v with an idle console session; want it ended at once", took)
+	}
+	expectFatal(t, conn, "57P01")
+}
+
 func TestAdminConsolePassesThePasswordToPostgres(t *testing.T) {
 	pg := serveFakePostgres(t, &fakePostgres{password: "secret", greeting: []encoder{&pgproto3.AuthenticationOk{},
 		&pgproto3.ParameterStatus{Name: "is_superuser", Value: "on"}, fakeServerKey, &pgproto3.ReadyForQuery{TxStatus: 'I'}}})
@@ -2166,4 +2280,22 @@ func TestListenWithReusePortSharesTheAddress(t *testing.T) {
 		third.Close()
 		t.Error("a listener without reuse-port shared the address")
 	}
+}
+
+// syncBuffer is a bytes.Buffer safe for concurrent use, for logs written by sessions.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
 }

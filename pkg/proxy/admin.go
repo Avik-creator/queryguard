@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Avik-creator/queryguard/internal/safe"
@@ -81,12 +82,31 @@ func (s *Server) admin(ctx context.Context, log *slog.Logger, client net.Conn, s
 	defer stop()
 
 	backend := pgproto3.NewBackend(clientIn, client)
+	var answering sync.Mutex // held while a message is answered
+	ended := make(chan struct{})
+	defer close(ended)
+	go func() {
+		defer safe.Recover(func(error) { client.Close() })
+		select {
+		case <-s.draining():
+		case <-ended:
+			return
+		}
+		// A console left open between commands would hold up the drain, so it ends as an idle session does.
+		answering.Lock()
+		defer answering.Unlock()
+		backend.Send(&pgproto3.ErrorResponse{Severity: "FATAL", SeverityUnlocalized: "FATAL", Code: "57P01",
+			Message: "queryguard: terminating connection because the proxy is restarting"})
+		backend.Flush()
+		client.Close()
+	}()
 	failed := false // an extended-protocol message was refused, so the rest up to Sync are skipped
 	for {
 		msg, err := backend.Receive()
 		if err != nil {
 			return
 		}
+		answering.Lock()
 		switch m := msg.(type) {
 		case *pgproto3.Query:
 			res, err := s.adminCommand(m.String, role, log)
@@ -106,9 +126,12 @@ func (s *Server) admin(ctx context.Context, log *slog.Logger, client net.Conn, s
 			failed = false
 			backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 		case *pgproto3.Terminate:
+			answering.Unlock()
 			return
 		}
-		if err := backend.Flush(); err != nil {
+		err = backend.Flush()
+		answering.Unlock()
+		if err != nil {
 			return
 		}
 	}
@@ -271,7 +294,8 @@ func (s *Server) adminShow(what string, rest []string) (result, error) {
 		}
 		r := result{columns: []string{"database", "role", "tenant", "fingerprint", "calls", "rows", "total_ms", "p50_ms", "p95_ms", "p99_ms",
 			"errors", "rejections", "shared_hit", "shared_read", "temp_written", "wal_bytes", "query"}, tag: "SHOW"}
-		for _, row := range s.Stats.Rows()[:min(n, len(s.Stats.Rows()))] {
+		rows := s.Stats.Rows()
+		for _, row := range rows[:min(n, len(rows))] {
 			r.rows = append(r.rows, []string{row.Database, row.Role, row.Tenant, row.Fingerprint, itoa(row.Calls), itoa(row.Rows), ms(row.Total),
 				ms(row.P50), ms(row.P95), ms(row.P99), codes(row.Errors), codes(row.Rejections), itoa(row.Buffers.SharedHit),
 				itoa(row.Buffers.SharedRead), itoa(row.Buffers.TempWritten), num(row.Buffers.WALBytes), row.Query})

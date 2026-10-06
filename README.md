@@ -907,7 +907,10 @@ An address that fails to log in as one role 10 times in a minute (SQLSTATE
 `28P01`, a wrong password, or `28000`, refused by `pg_hba.conf`) is refused at
 the proxy for a minute with `FATAL 28000`, before it can hold a PostgreSQL
 connection. Counting by role as well as address keeps one misconfigured app
-behind a NAT from locking out the others.
+behind a NAT from locking out the others. No more logins from one address as
+one role are under way at once than may fail, so opening many connections at
+once guesses no more passwords; the rest wait their turn, which a pool
+opening its connections barely notices.
 
 ```json
 {"login_throttle": {"failures": 10, "window": "1m", "cool_off": "1m"}}
@@ -934,7 +937,9 @@ Both listen at once while the old one drains (`SO_REUSEPORT`; Linux, macOS
 and the BSDs). On Linux, connections the kernel has already queued for the
 old process's socket are dropped when it closes, so start the new one first
 and give it a moment. Under load in the compatibility tests, a restart this
-way dropped none of 400 transactions across 8 sessions.
+way dropped none of 400 transactions across 8 sessions. The old process's
+console sessions end too, and a cancel request for one of its sessions that
+reaches the new process is dropped, since the old one no longer listens.
 
 ## Connection caps
 
@@ -951,13 +956,17 @@ end notices for a long time: on Linux, TCP keepalive gives up after about
 2 hours 11 minutes. QueryGuard sets keepalive on client connections and on its
 connections to PostgreSQL to probe after 15 seconds of silence, every
 5 seconds, and give up after 3, so a dead peer is found in about 30 seconds.
-On Linux it also sets `TCP_USER_TIMEOUT`, which covers data that is never
-acknowledged.
 
 It sends PostgreSQL the same timing for the server's end of each session, as
-`tcp_keepalives_idle`, `tcp_keepalives_interval`, `tcp_keepalives_count` and
-`tcp_user_timeout`, unless the client set them. `-tcp-keepalive=false` keeps
-the operating system's timing.
+`tcp_keepalives_idle`, `tcp_keepalives_interval` and `tcp_keepalives_count`,
+unless the client set them. `-tcp-keepalive=false` keeps the operating
+system's timing.
+
+Keepalive probes only an idle connection. A peer that dies while data is on
+its way to it is found by the kernel's retransmission limit, about 15 minutes
+on Linux. QueryGuard doesn't shorten that with `TCP_USER_TIMEOUT`: since
+Linux 5.11 that also cuts off a live client that stops reading a large result
+for as long. A client that wants it can set `tcp_user_timeout` itself.
 
 ## Clients that disconnect mid-query
 

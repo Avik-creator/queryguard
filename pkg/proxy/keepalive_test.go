@@ -62,7 +62,8 @@ func expectKeepAlive(t *testing.T, conn net.Conn, cfg net.KeepAliveConfig) {
 		"TCP_KEEPCNT":    {syscall.IPPROTO_TCP, syscall.TCP_KEEPCNT, cfg.Count},
 	}
 	if userTimeoutOpt != 0 {
-		want["TCP_USER_TIMEOUT"] = [3]int{syscall.IPPROTO_TCP, userTimeoutOpt, int(deadPeerTimeout(cfg) / time.Millisecond)}
+		// The kernel's own retransmission limit is left alone, so a client whose window stays shut isn't cut off.
+		want["TCP_USER_TIMEOUT"] = [3]int{syscall.IPPROTO_TCP, userTimeoutOpt, 0}
 	}
 	raw.Control(func(fd uintptr) {
 		// macOS reports the option's flag value rather than 1.
