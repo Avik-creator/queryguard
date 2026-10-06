@@ -546,6 +546,86 @@ func TestOldSnapshotLimitsItsTenantWhileTheQueueBloats(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool { return strings.Contains(logs.String(), "MVCC horizon moved on") })
 }
 
+func TestJobQueueKeepsRunningWhileAnOldSnapshotIsCapped(t *testing.T) {
+	dsn := catalogDSN(t) + " dbname=queryguard"
+	direct := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
+	jobs := fmt.Sprintf("qg_queue_%d", time.Now().UnixNano())
+	mustExec(t, direct, "create table "+jobs+" (id bigserial primary key, payload text) with (autovacuum_enabled = false)")
+	t.Cleanup(func() { direct.Exec(context.Background(), "drop table "+jobs) })
+
+	var logs lockedBuffer
+	qg := startProxyWith(t, func(s *proxy.Server) {
+		s.Policy = mustPolicy(t, `{"trusted_roles": ["postgres"], "scheduler": {"max_active": 20},
+			"mvcc_horizon": {"max_age": "1s", "watch": ["public.`+jobs+`"], "max_dead_tuples": 500}}`)
+		s.Monitor = &plan.Monitor{DSN: dsn, Interval: 100 * time.Millisecond, Watch: s.ActivePolicy().Watched}
+		s.Logger = slog.New(slog.NewTextHandler(io.MultiWriter(&logs, t.Output()), nil))
+	})
+	ctx, stop := context.WithCancel(t.Context())
+	var work sync.WaitGroup
+	defer func() { stop(); work.Wait() }()
+
+	// A producer and four workers churn the queue through the proxy, as the jobs tenant.
+	var done atomic.Int64
+	producer := qg.connect(t, "sslmode=disable")
+	work.Go(func() {
+		for ctx.Err() == nil {
+			producer.Exec(ctx, "insert into "+jobs+" (payload) select 'job' from generate_series(1, 20) /*tenant='jobs'*/")
+		}
+	})
+	for range 4 {
+		worker := qg.connect(t, "sslmode=disable")
+		work.Go(func() {
+			for ctx.Err() == nil {
+				tag, err := worker.Exec(ctx, "delete from "+jobs+" where id = (select id from "+jobs+
+					" order by id for update skip locked limit 1) /*tenant='jobs'*/")
+				if err == nil {
+					done.Add(tag.RowsAffected())
+				}
+			}
+		})
+	}
+	// Four analytics sessions run long reports that overlap, so some snapshot is always older than max_age.
+	analytics, stopAnalytics := context.WithCancel(ctx)
+	var reports sync.WaitGroup
+	for i := range 4 {
+		conn := qg.connect(t, "sslmode=disable")
+		reports.Go(func() {
+			time.Sleep(time.Duration(i) * 400 * time.Millisecond)
+			for analytics.Err() == nil {
+				conn.Exec(analytics, "select pg_sleep(1.5), count(*) from customers /*qg_report*/ /*tenant='analytics'*/")
+			}
+		})
+	}
+
+	waitFor(t, 20*time.Second, func() bool { return strings.Contains(logs.String(), "limiting tenant holding back the MVCC horizon") })
+	if !strings.Contains(logs.String(), "tenant=analytics") {
+		t.Fatalf("log %q; want the analytics tenant limited", logs.String())
+	}
+	// Once the reports that were running end, they run one at a time at Postgres while the queue keeps moving.
+	time.Sleep(2 * time.Second)
+	before, most := done.Load(), 0
+	for end := time.Now().Add(4 * time.Second); time.Now().Before(end); time.Sleep(100 * time.Millisecond) {
+		var n int
+		if err := direct.QueryRow(t.Context(), "select count(*) from pg_stat_activity where state = 'active' and query like '%qg_report%' and pid <> pg_backend_pid()").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		most = max(most, n)
+	}
+	if most > 1 {
+		t.Errorf("%d reports ran at once while capped; want one at a time", most)
+	}
+	if moved := done.Load() - before; moved < 100 {
+		t.Errorf("the queue finished %d jobs in 4s while capped; want it to keep moving", moved)
+	}
+
+	stopAnalytics()
+	reports.Wait()
+	waitFor(t, 10*time.Second, func() bool { return strings.Contains(logs.String(), "MVCC horizon moved on") })
+	if n := strings.Count(logs.String(), "limiting tenant holding back"); n != 1 {
+		t.Errorf("the cap started %d times; want once, held while the reports went on", n)
+	}
+}
+
 func TestQueuedStatementPastItsDeadlineNeverRuns(t *testing.T) {
 	qg := startPolicyProxy(t, `{"scheduler": {"max_active": 1, "queue_timeout": "10s"}}`)
 	direct := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
