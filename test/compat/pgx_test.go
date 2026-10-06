@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,7 @@ import (
 	"github.com/Avik-creator/queryguard/pkg/wire"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 )
 
 func TestPgxConnects(t *testing.T) {
@@ -406,4 +408,85 @@ func postgresCertificate(t *testing.T) (cert, key []byte) {
 		return out
 	}
 	return read("/etc/ssl/certs/ssl-cert-snakeoil.pem"), read("/etc/ssl/private/ssl-cert-snakeoil.key")
+}
+
+func TestOAuthBearerLogsInThroughTheProxy(t *testing.T) {
+	qg := startProxy(t)
+	direct := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
+	var oauth bool
+	if err := direct.QueryRow(t.Context(), "select count(*) > 0 from pg_hba_file_rules where auth_method = 'oauth'").Scan(&oauth); err != nil || !oauth {
+		t.Skipf("the upstream has no oauth line in pg_hba.conf (%v); it needs the pg18 image built from testdata/oauth", err)
+	}
+	if _, err := direct.Exec(t.Context(), "do $$ begin create role qg_oauth login; exception when duplicate_object then null; end $$"); err != nil {
+		t.Fatal(err)
+	}
+
+	for token, wantOK := range map[string]bool{"queryguard-test-token": true, "a-stolen-token": false} {
+		conn, err := net.Dial("tcp", qg.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(10 * time.Second))
+		fe := pgproto3.NewFrontend(conn, conn)
+		receive := func() pgproto3.BackendMessage {
+			t.Helper()
+			msg, err := fe.Receive()
+			if err != nil {
+				t.Fatalf("%s: %v", token, err)
+			}
+			return msg
+		}
+		fe.Send(&pgproto3.StartupMessage{ProtocolVersion: pgproto3.ProtocolVersionNumber, Parameters: map[string]string{"user": "qg_oauth", "database": "queryguard"}})
+		if err := fe.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		if sasl, ok := receive().(*pgproto3.AuthenticationSASL); !ok || !slices.Contains(sasl.AuthMechanisms, "OAUTHBEARER") {
+			t.Fatalf("%s: want AuthenticationSASL offering OAUTHBEARER, got %#v", token, sasl)
+		}
+		// RFC 7628's initial client response: a gs2 header without channel binding, then the bearer token.
+		fe.Send(&pgproto3.SASLInitialResponse{AuthMechanism: "OAUTHBEARER", Data: []byte("n,,\x01auth=Bearer " + token + "\x01\x01")})
+		if err := fe.Flush(); err != nil {
+			t.Fatal(err)
+		}
+
+		if !wantOK {
+			challenge, ok := receive().(*pgproto3.AuthenticationSASLContinue)
+			if !ok || !strings.Contains(string(challenge.Data), "invalid_token") {
+				t.Fatalf("stolen token: want a SASL challenge with invalid_token, got %#v", challenge)
+			}
+			fe.Send(&pgproto3.SASLResponse{Data: []byte{0x01}})
+			if err := fe.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if e, ok := receive().(*pgproto3.ErrorResponse); !ok || e.Code != "28000" {
+				t.Fatalf("stolen token: want ErrorResponse 28000, got %#v", e)
+			}
+			continue
+		}
+		if _, ok := receive().(*pgproto3.AuthenticationOk); !ok {
+			t.Fatalf("good token: want AuthenticationOk")
+		}
+		for {
+			if _, ok := receive().(*pgproto3.ReadyForQuery); ok {
+				break
+			}
+		}
+		fe.Send(&pgproto3.Query{String: "select current_user"})
+		if err := fe.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		var user string
+		for msg := receive(); ; msg = receive() {
+			if row, ok := msg.(*pgproto3.DataRow); ok {
+				user = string(row.Values[0])
+			}
+			if _, ok := msg.(*pgproto3.ReadyForQuery); ok {
+				break
+			}
+		}
+		if user != "qg_oauth" {
+			t.Errorf("good token: current_user is %q, want qg_oauth", user)
+		}
+	}
 }
