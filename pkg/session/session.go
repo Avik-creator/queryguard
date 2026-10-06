@@ -92,9 +92,9 @@ type Admission struct {
 
 // Explain gets the plan of the statement about to run.
 type Explain struct {
-	Generic bool                   // the plan for any parameter values, used when the bound values are too large to send twice
-	Values  string                 // a digest of the bound values, which can change the plan; "" for a simple query, whose values are in its text
-	Run     func() (string, error) // EXPLAIN (FORMAT JSON, VERBOSE)'s output, or ErrNoPlan
+	Generic bool                             // the plan for any parameter values, used when the bound values are too large to send twice
+	Values  string                           // a digest of the bound values, which can change the plan; "" for a simple query, whose values are in its text
+	Run     func(sql string) (string, error) // EXPLAIN (FORMAT JSON, VERBOSE)'s output for sql, the statement's text or one statement in it, or ErrNoPlan
 }
 
 // ErrNoPlan says Postgres gave no plan: it refused the statement, whose error the session passes on, or it is skipping to Sync.
@@ -655,9 +655,13 @@ func (s *session) checkQueryCost(sql string, gate Gate) (handled bool, err error
 		return false, nil
 	}
 	var refused *pgproto3.ErrorResponse
-	rej := s.admit(gate, 'Q', Explain{Run: func() (string, error) {
+	rej := s.admit(gate, 'Q', Explain{Run: func(text string) (string, error) {
 		var out string
-		out, refused, err = s.explain(len(explainPrefix), &pgproto3.Query{String: explainPrefix + sql})
+		out, refused, err = s.explain(len(explainPrefix), &pgproto3.Query{String: explainPrefix + text})
+		if refused != nil && text != sql {
+			// The error points into text, not the client's own.
+			refused.Position = 0
+		}
 		return out, err
 	}})
 	switch {
@@ -731,16 +735,19 @@ func (s *session) checkBind(n int) error {
 	}
 
 	var refused *pgproto3.ErrorResponse
-	rej := s.admit(st.gate, 'E', Explain{Generic: prefix == genericPrefix, Values: values, Run: func() (string, error) {
+	rej := s.admit(st.gate, 'E', Explain{Generic: prefix == genericPrefix, Values: values, Run: func(text string) (string, error) {
 		var out string
 		out, refused, err = s.explain(len(prefix),
 			&pgproto3.Close{ObjectType: 'S', Name: explainName},
-			&pgproto3.Parse{Name: explainName, Query: prefix + st.sql, ParameterOIDs: st.types},
+			&pgproto3.Parse{Name: explainName, Query: prefix + text, ParameterOIDs: st.types},
 			bind,
 			&pgproto3.Execute{Portal: explainName},
 			// Closing the statement closes its portal too.
 			&pgproto3.Close{ObjectType: 'S', Name: explainName},
 			&pgproto3.Flush{})
+		if refused != nil && text != st.sql {
+			refused.Position = 0
+		}
 		return out, err
 	}})
 	if lost(err) {

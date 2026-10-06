@@ -115,11 +115,15 @@ before it reaches PostgreSQL:
 | `require_where` | `UPDATE` or `DELETE` without `WHERE`, and `TRUNCATE`; `WHERE true` changes every row on purpose |
 | `index_concurrently` | `CREATE INDEX`, `DROP INDEX` and `REINDEX` without `CONCURRENTLY`; `CREATE INDEX ON ONLY`, the first step in indexing a partitioned table, is allowed |
 | `schema_allowlist` | Naming a schema outside `schemas`, in a statement or in `search_path`, including a `search_path` set at login; `pg_catalog`, `information_schema` and the session's temporary schema are always allowed |
-| `deny_functions` | Calling a function in `functions`, by name with or without its schema, even in a `SELECT`; without `functions`, the built-ins with effects beyond the statement: ending sessions (`pg_terminate_backend`), the server's files (`pg_read_file`, `lo_export`), other servers (`dblink_exec`), settings and roles (`set_config`), WAL and replication control, session advisory locks, and SQL run from text (`query_to_xml`) |
+| `deny_functions` | Calling a function in `functions`, by name with or without its schema, even in a `SELECT`; without `functions`, the built-ins with effects beyond the statement: ending sessions (`pg_terminate_backend`), the server's files (`pg_read_file`, `lo_export`), other servers (`dblink_exec`), settings and roles (`set_config`), WAL and replication control, session advisory locks, SQL run from text (`query_to_xml`, `ts_stat`), and tables, schemas or databases read whole by a name passed as a value (`table_to_xml`, `database_to_xml`) |
 
 `deny_functions` sees the calls written in the statement. A function, view or
-trigger that calls one in turn, or `EXECUTE` of text built at run time, is
-out of its sight; for those, revoke `EXECUTE` in PostgreSQL itself.
+trigger that calls one in turn, `EXECUTE` of text built at run time, or a
+one-argument function called on a row as if it were a column
+(`select o.purge_order from orders o`), is out of its sight; for those,
+revoke `EXECUTE` in PostgreSQL itself. Likewise `schema_allowlist` sees
+schemas named in the statement, not those inside a string or `regclass`
+value.
 
 Every statement in a query string is checked, including those inside CTEs,
 `EXPLAIN` and `PREPARE`. A rule, or a tenant, in `warn` mode only logs what it
@@ -189,7 +193,7 @@ Read-only modes in such servers have been bypassed by ending the transaction
 they opened (`COMMIT; DROP …`), by `BEGIN READ WRITE`, by turning
 `default_transaction_read_only` off, by `set_config`, by `COPY … TO PROGRAM`,
 and by functions that write, such as `nextval` or `lo_import`.
-`presets/ai-agent-bypass.sql` holds 72 such statements and ordinary reads;
+`presets/ai-agent-bypass.sql` holds 78 such statements and ordinary reads;
 every release checks that the preset refuses the first and allows the second:
 
 ```sh
@@ -233,6 +237,14 @@ PostgreSQL just before the statement runs:
 A blocked statement fails with SQLSTATE `54000` (`program_limit_exceeded`),
 and the detail gives the planned cost or the table's size next to the limit.
 Like the other rules, these can run in `warn` mode.
+
+The plan judged is that of the statement doing the work: the query an
+`EXPLAIN ANALYZE` or `COPY … TO` runs, the prepared statement an `EXECUTE`
+runs, or the one statement among `BEGIN` and `COMMIT` in a query string.
+Several statements in one query string that each do work have no one plan,
+since `EXPLAIN` plans one at a time and a later statement may need what an
+earlier one does, so a cost rule that applies refuses them with SQLSTATE
+`42501`; send them one at a time.
 
 How QueryGuard gets the plan:
 

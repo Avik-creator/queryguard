@@ -239,6 +239,36 @@ func TestStartupSearchPath(t *testing.T) {
 	}
 }
 
+func TestStartupSettingEachValueIsJudged(t *testing.T) {
+	c := mustParse(t, allRules).Checker("alice", discard)
+	// Postgres matches names in any case and applies the packet's last value, which a map of parameters may hide.
+	twice := func(yield func(string, string) bool) {
+		_ = yield("search_path", "billing") && yield("search_path", "public")
+	}
+	if got := c.CheckStartup(twice); ruleOf(got) != "schema_allowlist" {
+		t.Errorf("CheckStartup of search_path billing then public = %v; want blocked by schema_allowlist", got)
+	}
+}
+
+func TestStartupSettingsThatEndReadOnlyMode(t *testing.T) {
+	c := mustParse(t, `{"rules": [{"check": "read_only"}]}`).Checker("agent", discard)
+	for _, tc := range []struct {
+		settings map[string]string
+		want     string
+	}{
+		{map[string]string{"default_transaction_read_only": "on"}, ""},
+		{map[string]string{"default_transaction_read_only": "off"}, "read_only"},
+		{map[string]string{"transaction_read_only": "0"}, "read_only"},
+		{map[string]string{"role": "admin"}, "read_only"},
+		{map[string]string{"session_authorization": "admin"}, "read_only"},
+		{map[string]string{"application_name": "agent"}, ""},
+	} {
+		if got := c.CheckStartup(maps.All(tc.settings)); ruleOf(got) != tc.want {
+			t.Errorf("CheckStartup(%v) = %v; want blocked by %q", tc.settings, got, tc.want)
+		}
+	}
+}
+
 const costRules = `{"rules": [{"check": "max_cost", "cost": 1000}, {"check": "max_scan_rows", "rows": 50000}]}`
 
 func TestCostCheckOnlyForStatementsEXPLAINCanPlan(t *testing.T) {
@@ -253,7 +283,7 @@ func TestCostCheckOnlyForStatementsEXPLAINCanPlan(t *testing.T) {
 		explained := false
 		// DDL passes a gate too, which explains nothing but forgets cached plans once it ran.
 		if _, gate := c.Check(sql, standard); gate != nil {
-			gate(t.Context(), session.Explain{Run: func() (string, error) { explained = true; return orderLookup, nil }}, false)
+			gate(t.Context(), session.Explain{Run: func(string) (string, error) { explained = true; return orderLookup, nil }}, false)
 		}
 		if explained != want {
 			t.Errorf("Check(%q) explained = %v; want %v", sql, explained, want)
@@ -292,6 +322,42 @@ func TestCostRules(t *testing.T) {
 		if got != nil && got.Code != "54000" {
 			t.Errorf("%s: code %s; want 54000 program_limit_exceeded", name, got.Code)
 		}
+	}
+}
+
+func TestCostRulesPlanTheStatementThatDoesTheWork(t *testing.T) {
+	for sql, want := range map[string]string{
+		"begin read only; select * from orders where note = 'x'; commit": "select * from orders where note = 'x'",
+		"explain analyze select * from orders where note = 'x'":          "SELECT * FROM orders WHERE note = 'x'",
+		"copy (select * from orders) to stdout":                          "SELECT * FROM orders",
+		"execute q(1)":                                                   "execute q(1)",
+	} {
+		c := costChecker(t, costRules, nil, discard)
+		_, cost := c.Check(sql, standard)
+		if cost == nil {
+			t.Errorf("Check(%q) gave no gate; want its cost checked", sql)
+			continue
+		}
+		var got string
+		costOf(cost, session.Explain{Run: func(text string) (string, error) {
+			got = text
+			return `[{"Plan": {"Node Type": "Index Scan", "Total Cost": 8.4}}]`, nil
+		}})
+		if got != want {
+			t.Errorf("Check(%q) explained %q; want %q", sql, got, want)
+		}
+	}
+}
+
+func TestCostRulesRejectWorkNoPlanCovers(t *testing.T) {
+	c := costChecker(t, costRules, nil, discard)
+	rej, _ := c.Check("select 1; select count(*) from orders a, orders b", standard)
+	if ruleOf(rej) != "max_cost" {
+		t.Errorf("two statements doing work got %v; want max_cost to reject them", rej)
+	}
+	other := mustParse(t, `{"rules": [{"check": "max_cost", "cost": 1000, "match": {"roles": ["bob"]}}]}`).Checker("alice", discard)
+	if rej, _ := other.Check("select 1; select 2", standard); rej != nil {
+		t.Errorf("a role no cost rule matches got %v; want it run", rej)
 	}
 }
 
@@ -509,7 +575,7 @@ func TestGateSpendsBudget(t *testing.T) {
 
 func TestGateChargesStatementsWithoutPlan(t *testing.T) {
 	c := gateChecker(t, `{"tenants": {"alice": {"budget": {"rate": 1, "burst": 15, "min_charge": 10, "when_over": "reject"}}}}`, "alice", discard)
-	never := session.Explain{Run: func() (string, error) {
+	never := session.Explain{Run: func(string) (string, error) {
 		t.Error("explained a statement EXPLAIN can't plan")
 		return "", session.ErrNoPlan
 	}}
@@ -706,7 +772,7 @@ func TestSlowRunExplainsStatementAgain(t *testing.T) {
 	var logs bytes.Buffer
 	c := gateChecker(t, `{"scheduler": {"slow_lane": {"max_active": 1, "queue_timeout": "10ms"}}}`, "alice", logger(&logs))
 	explains := 0
-	lookup := session.Explain{Run: func() (string, error) { explains++; return orderLookup, nil }}
+	lookup := session.Explain{Run: func(string) (string, error) { explains++; return orderLookup, nil }}
 	train(t, c, lookupSQL, lookup, 5, time.Millisecond)
 
 	// Postgres ran a generic plan, or the index went away outside the proxy, so the cached plan no longer says how it runs.
@@ -746,7 +812,7 @@ func TestCursorIsNotLearned(t *testing.T) {
 func TestSchemaChangeForgetsCachedPlans(t *testing.T) {
 	c := costChecker(t, `{"rules": [{"check": "max_cost", "cost": 1000000}]}`, nil, discard)
 	explains := 0
-	lookup := session.Explain{Run: func() (string, error) { explains++; return orderLookup, nil }}
+	lookup := session.Explain{Run: func(string) (string, error) { explains++; return orderLookup, nil }}
 	for _, sql := range []string{lookupSQL, lookupSQL, "drop index orders_pkey", lookupSQL, "analyze orders", lookupSQL} {
 		_, gate := c.Check(sql, standard)
 		if gate == nil {
@@ -1418,7 +1484,7 @@ func costChecker(t *testing.T, config string, sizes tables, log *slog.Logger) *C
 
 // explained is an Explain whose Run returns out and err.
 func explained(out string, err error) session.Explain {
-	return session.Explain{Run: func() (string, error) { return out, err }}
+	return session.Explain{Run: func(string) (string, error) { return out, err }}
 }
 
 // tables are table sizes keyed by schema.name.
@@ -1921,6 +1987,30 @@ func TestAllowlistLearnsThenEnforces(t *testing.T) {
 	}
 	if l := list.List(); len(l) != 1 || l[0].Role != "agent" || l[0].Query != "select * from orders where id = $1" {
 		t.Errorf("List = %+v; want agent's one statement", l)
+	}
+}
+
+func TestAllowlistLearnsOnlyWhatTheRulesLetRun(t *testing.T) {
+	list := &Allowlist{}
+	c := mustParse(t, `{"allowlist": {"mode": "learn", "roles": ["agent"]}, "rules": [{"check": "read_only"}]}`).Checker("agent", discard)
+	c.Env = Env{Database: "shop", Allowlist: list}
+
+	if rej, _ := c.Check("drop table orders", standard); codeOf(rej) != "42501" {
+		t.Fatalf("drop got %v; want read_only to reject it", rej)
+	}
+	c.Check("select * from orders", standard)
+
+	if l := list.List(); len(l) != 1 || l[0].Query != "select * from orders" {
+		t.Errorf("List = %+v; want only the statement that ran", l)
+	}
+}
+
+func TestAllowlistOnlyWarnsForATenantInWarnMode(t *testing.T) {
+	c := mustParse(t, `{"allowlist": {"mode": "enforce", "roles": ["agent"]}, "tenants": {"agent": {"mode": "warn"}}}`).Checker("agent", discard)
+	c.Env = Env{Database: "shop", Allowlist: &Allowlist{}}
+
+	if rej, _ := c.Check("select * from orders", standard); rej != nil {
+		t.Errorf("unlearned statement of a warned tenant got %v; want it run", rej)
 	}
 }
 

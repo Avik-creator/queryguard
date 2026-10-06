@@ -20,7 +20,9 @@ type Query struct {
 	BlockingIndexChange bool     // CREATE INDEX, DROP INDEX or REINDEX without CONCURRENTLY, which blocks writes
 	Schemas             []string // schemas named explicitly, sorted, without duplicates
 	UnknownSearchPath   bool     // set_config('search_path', …) with a value known only when it runs
-	Explainable         bool     // a single statement EXPLAIN can plan: SELECT, INSERT, UPDATE, DELETE, MERGE, DECLARE or CREATE TABLE AS
+	Explainable         bool     // Plan is set
+	Plan                string   // the one statement whose plan is the query's: SELECT, INSERT, UPDATE, DELETE, MERGE, DECLARE, CREATE TABLE AS or EXECUTE, alone or among transaction control, or the query EXPLAIN ANALYZE or COPY TO runs
+	Unplanned           bool     // it does work that no one plan covers, as several statements doing some do
 	Analyzes            bool     // VACUUM or ANALYZE, which refresh the planner's statistics
 	Cursor              bool     // DECLARE, whose query runs in the FETCHes that follow
 	TransactionControl  bool     // only BEGIN, COMMIT, ROLLBACK, SAVEPOINT and the like, which do no work of their own
@@ -35,7 +37,7 @@ type Query struct {
 }
 
 // writingFunctions change state although a SELECT may call them, which a read-only transaction refuses too.
-var writingFunctions = []string{"nextval", "setval", "set_config"}
+var writingFunctions = []string{"nextval", "setval", "set_config", "pg_notify"}
 
 // readOnlySettings turn a session's or transaction's read-only mode off when set or reset.
 var readOnlySettings = []string{"default_transaction_read_only", "transaction_read_only"}
@@ -64,12 +66,9 @@ func Analyze(sql string) (Query, error) {
 		return Query{}, err
 	}
 	var q Query
+	q.Plan, q.Unplanned = planOf(sql, tree)
+	q.Explainable = q.Plan != ""
 	if len(tree.Stmts) == 1 {
-		switch tree.Stmts[0].GetStmt().GetNode().(type) {
-		case *pg_query.Node_SelectStmt, *pg_query.Node_InsertStmt, *pg_query.Node_UpdateStmt, *pg_query.Node_DeleteStmt,
-			*pg_query.Node_MergeStmt, *pg_query.Node_DeclareCursorStmt, *pg_query.Node_CreateTableAsStmt:
-			q.Explainable = true
-		}
 		_, q.Cursor = tree.Stmts[0].GetStmt().GetNode().(*pg_query.Node_DeclareCursorStmt)
 		switch tree.Stmts[0].GetStmt().GetNode().(type) {
 		case *pg_query.Node_FetchStmt, *pg_query.Node_ExecuteStmt:
@@ -120,6 +119,11 @@ func Analyze(sql string) (Query, error) {
 			q.ChangesEveryRow = q.ChangesEveryRow || n.WhereClause == nil
 		case *pg_query.TruncateStmt:
 			q.ChangesEveryRow = true
+		case *pg_query.DiscardStmt:
+			// DISCARD ALL runs RESET ALL and SET SESSION AUTHORIZATION DEFAULT.
+			if n.Target == pg_query.DiscardMode_DISCARD_ALL {
+				writes, q.ChangesRole, q.ChangesTimeout = true, true, true
+			}
 		case *pg_query.IndexStmt:
 			// ON ONLY (inh false) builds nothing; it starts indexing a partitioned table, which CONCURRENTLY can't do.
 			q.BlockingIndexChange = q.BlockingIndexChange || (!n.Concurrent && n.GetRelation().GetInh())
@@ -325,6 +329,85 @@ func concurrently(params []*pg_query.Node) bool {
 }
 
 // walk calls visit on m and on every message below it.
+// planOf returns the text of the one statement in tree, sql's, whose plan is sql's, and whether sql does work no one plan covers.
+func planOf(sql string, tree *pg_query.ParseResult) (plan string, unplanned bool) {
+	var plans []string
+	others := false
+	deparse := func(n *pg_query.Node) string {
+		text, err := pg_query.Deparse(&pg_query.ParseResult{Version: tree.Version, Stmts: []*pg_query.RawStmt{{Stmt: n}}})
+		if n == nil || err != nil {
+			return ""
+		}
+		return text
+	}
+	stmts := tree.Stmts
+	for _, st := range stmts {
+		switch n := st.GetStmt().GetNode().(type) {
+		case *pg_query.Node_SelectStmt, *pg_query.Node_InsertStmt, *pg_query.Node_UpdateStmt, *pg_query.Node_DeleteStmt,
+			*pg_query.Node_MergeStmt, *pg_query.Node_DeclareCursorStmt, *pg_query.Node_CreateTableAsStmt, *pg_query.Node_ExecuteStmt:
+			plans = append(plans, statementText(sql, st, len(stmts)))
+		case *pg_query.Node_ExplainStmt:
+			if analyzes(n.ExplainStmt) {
+				plans = append(plans, deparse(n.ExplainStmt.GetQuery()))
+			}
+		case *pg_query.Node_CopyStmt:
+			// COPY FROM costs what its data does, which no plan knows.
+			if c := n.CopyStmt; !c.IsFrom && c.Query != nil {
+				plans = append(plans, deparse(c.Query))
+			} else if !c.IsFrom && c.Relation != nil {
+				plans = append(plans, deparse(&pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: &pg_query.SelectStmt{
+					TargetList: []*pg_query.Node{pg_query.MakeResTargetNodeWithVal(pg_query.MakeColumnRefNode([]*pg_query.Node{pg_query.MakeAStarNode()}, 0), 0)},
+					FromClause: []*pg_query.Node{{Node: &pg_query.Node_RangeVar{RangeVar: c.Relation}}},
+				}}}))
+			}
+		case *pg_query.Node_TransactionStmt:
+		default:
+			others = true
+		}
+	}
+	// A statement before the planned one, such as SET search_path, could change its plan, and EXPLAIN plans only one.
+	if len(plans) > 1 || (len(plans) == 1 && others) || slices.Contains(plans, "") {
+		return "", true
+	}
+	if len(plans) == 1 {
+		return plans[0], false
+	}
+	return "", false
+}
+
+// statementText returns st's own text in sql, which holds n statements.
+func statementText(sql string, st *pg_query.RawStmt, n int) string {
+	if n == 1 {
+		return sql
+	}
+	start := int(st.StmtLocation)
+	end := len(sql)
+	if st.StmtLen > 0 {
+		end = start + int(st.StmtLen)
+	}
+	return strings.TrimSpace(sql[start:end])
+}
+
+// analyzes reports whether an EXPLAIN runs its statement, as with ANALYZE.
+func analyzes(e *pg_query.ExplainStmt) bool {
+	for _, o := range e.GetOptions() {
+		d := o.GetDefElem()
+		if !strings.EqualFold(d.GetDefname(), "analyze") {
+			continue
+		}
+		switch arg := d.GetArg(); {
+		case arg == nil:
+			return true
+		case arg.GetBoolean() != nil:
+			return arg.GetBoolean().GetBoolval()
+		default:
+			v := strings.ToLower(arg.GetString_().GetSval())
+			return v != "" && (strings.HasPrefix("true", v) || strings.HasPrefix("yes", v) || v == "on" || v == "1")
+		}
+	}
+	return false
+}
+
 func walk(m protoreflect.Message, visit func(protoreflect.Message)) {
 	visit(m)
 	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {

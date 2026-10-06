@@ -91,6 +91,21 @@ func TestSimulateLetsAWarnTenantOverBudgetRun(t *testing.T) {
 	}
 }
 
+func TestSimulateChargesNothingForTransactionControl(t *testing.T) {
+	p := mustParse(t, `{"tenants": {"app": {"budget": {"rate": 10, "burst": 10, "min_charge": 10, "when_over": "reject"}}}}`)
+	at := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	recs := []stats.Record{
+		{At: at, Database: "shop", Role: "app", Tenant: "app", Query: "begin"},
+		{At: at, Database: "shop", Role: "app", Tenant: "app", Query: "select $1", Units: 1},
+		{At: at, Database: "shop", Role: "app", Tenant: "app", Query: "commit"},
+	}
+
+	// Live, BEGIN and COMMIT pass the scheduler without a charge, so the minimum charge goes only on the SELECT.
+	if b := Simulate(p, nil, recs).Budgets["app"]; b != nil && b.Rejected != 0 {
+		t.Errorf("budget %+v; want BEGIN and COMMIT to cost nothing", b)
+	}
+}
+
 func TestSimulateRefusesAWaitPastTheQueueTimeout(t *testing.T) {
 	p := mustParse(t, `{"tenants": {"app": {"budget": {"rate": 10, "burst": 10}}}}`)
 	at := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)

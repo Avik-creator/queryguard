@@ -992,7 +992,7 @@ func (c fakeChecker) Check(sql string, set Settings) (*pgproto3.ErrorResponse, G
 		return nil, func(_ context.Context, e Explain, running bool) Admission {
 			c.admit.running <- running
 			if strings.Contains(sql, "plan") && e.Run != nil {
-				e.Run()
+				e.Run(sql)
 			}
 			a := Admission{Timeout: c.admit.timeout, IdleInTransaction: c.admit.idle, TransactionTimeout: c.admit.tx,
 				MaxRows: c.admit.maxRows, MaxBytes: c.admit.maxBytes, Returned: func(rows, bytes int64) { c.admit.returned <- [2]int64{rows, bytes} },
@@ -1014,7 +1014,7 @@ func (c fakeChecker) Check(sql string, set Settings) (*pgproto3.ErrorResponse, G
 		if e.Run == nil {
 			return Admission{}
 		}
-		out, _ := e.Run()
+		out, _ := e.Run(sql)
 		if c.generic != nil {
 			c.generic <- e.Generic
 		}

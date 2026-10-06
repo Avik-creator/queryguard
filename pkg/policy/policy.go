@@ -627,7 +627,8 @@ var checks = map[string]check{
 	},
 }
 
-// deniedFunctions are the built-ins with effects beyond the statement's own rows, and those that run SQL text given as a value.
+// deniedFunctions are the built-ins with effects beyond the statement's own rows, those that run SQL text given as a value, and
+// those that read whole tables, schemas or databases named by a value, which schema_allowlist can't see.
 var deniedFunctions = []string{
 	"pg_terminate_backend", "pg_cancel_backend", "pg_reload_conf", "pg_rotate_logfile", "pg_promote",
 	"pg_switch_wal", "pg_create_restore_point", "pg_backup_start", "pg_backup_stop", "pg_logical_emit_message",
@@ -639,7 +640,9 @@ var deniedFunctions = []string{
 	"lo_create", "lo_creat", "lo_open", "lowrite", "lo_truncate", "lo_truncate64",
 	"dblink", "dblink_exec", "dblink_connect", "dblink_connect_u", "dblink_send_query",
 	"set_config", "pg_advisory_lock", "pg_advisory_lock_shared", "pg_try_advisory_lock", "pg_try_advisory_lock_shared",
-	"query_to_xml", "query_to_xmlschema", "query_to_xml_and_xmlschema", "cursor_to_xml",
+	"query_to_xml", "query_to_xmlschema", "query_to_xml_and_xmlschema", "cursor_to_xml", "cursor_to_xmlschema", "ts_stat", "ts_rewrite",
+	"table_to_xml", "table_to_xmlschema", "table_to_xml_and_xmlschema", "schema_to_xml", "schema_to_xmlschema",
+	"schema_to_xml_and_xmlschema", "database_to_xml", "database_to_xmlschema", "database_to_xml_and_xmlschema",
 }
 
 // bareName returns a function's name without its schema.
@@ -1132,22 +1135,34 @@ func (c *Checker) killedNow(p *Policy, sql string) *pgproto3.ErrorResponse {
 // check is Check without the kills made after it.
 func (c *Checker) check(sql string, set session.Settings) (*pgproto3.ErrorResponse, session.Gate) {
 	p := c.policy()
-	if l := p.cfg.Allowlist; l.applies(c.role) && c.Env.Allowlist != nil {
-		fp := sqlparse.Fingerprint(sql)
-		switch {
-		case l.Mode == "learn" && fp != "" && !c.Env.Allowlist.allowed(c.role, fp):
-			switch learned, full := c.Env.Allowlist.learn(c.role, fp, sqlparse.Normalize(sql)); {
-			case learned:
-				c.log.Info("learned a statement for the allowlist", "query", sqlparse.Normalize(sql))
-			case full:
-				c.log.Warn("the allowlist is full, so it learns no more statements", "max", maxAllowlisted)
-			}
-		case l.Mode == "enforce" && !c.Env.Allowlist.allowed(c.role, fp):
-			c.log.Warn("rejected statement", "rule", "allowlist", "query", sqlparse.Normalize(sql))
+	l := p.cfg.Allowlist
+	if !l.applies(c.role) || c.Env.Allowlist == nil {
+		return c.judgeStatement(p, sql, set)
+	}
+	fp := sqlparse.Fingerprint(sql)
+	if l.Mode == "enforce" && !c.Env.Allowlist.allowed(c.role, fp) {
+		warn := p.cfg.Tenants[c.tenant(p, sqlparse.Tags(sql))].Mode == Warn
+		c.log.Warn("rejected statement", "rule", "allowlist", "query", sqlparse.Normalize(sql), "rejected", !warn)
+		if !warn {
 			return rejection("42501", "queryguard: statement is not on the role's allowlist",
 				"Only statements learned for this role may run.", "Learn it first with the allowlist in learn mode."), nil
 		}
 	}
+	rej, gate := c.judgeStatement(p, sql, set)
+	// Only what the rules let run is learned, so the list holds nothing an operator would have to weed out.
+	if l.Mode == "learn" && rej == nil && fp != "" && !c.Env.Allowlist.allowed(c.role, fp) {
+		switch learned, full := c.Env.Allowlist.learn(c.role, fp, sqlparse.Normalize(sql)); {
+		case learned:
+			c.log.Info("learned a statement for the allowlist", "query", sqlparse.Normalize(sql))
+		case full:
+			c.log.Warn("the allowlist is full, so it learns no more statements", "max", maxAllowlisted)
+		}
+	}
+	return rej, gate
+}
+
+// judgeStatement is check without the allowlist.
+func (c *Checker) judgeStatement(p *Policy, sql string, set session.Settings) (*pgproto3.ErrorResponse, session.Gate) {
 	if rej := c.killedNow(p, sql); rej != nil {
 		return rej, nil
 	}
@@ -1190,13 +1205,21 @@ func (c *Checker) check(sql string, set session.Settings) (*pgproto3.ErrorRespon
 
 	var fingerprint string
 	blocked := c.judge(p, who, warn, "statement", func(r Rule) bool {
+		// A cost rule can't judge work that no one plan covers, so it blocks it.
+		if q.Unplanned && checks[r.Check].overBy != nil {
+			return true
+		}
 		f := checks[r.Check].violatedBy
 		return f != nil && f(q, r)
 	}, func() []any {
 		fingerprint = sqlparse.Fingerprint(sql)
 		return []any{"tenant", who.tenant, "fingerprint", fingerprint, "query", sqlparse.Normalize(sql)}
 	})
-	if blocked != nil {
+	switch {
+	case blocked != nil && checks[blocked.Check].overBy != nil:
+		return rejection("42501", "queryguard: rule "+blocked.Check+" can't judge statements no one plan covers", "Statement fingerprint "+fingerprint+".",
+			"Send each statement on its own, so that its plan can be judged."), nil
+	case blocked != nil:
 		return rejection("42501", "queryguard: rule "+blocked.Check+" blocks this statement", "Statement fingerprint "+fingerprint+".",
 			checks[blocked.Check].hint), nil
 	}
@@ -1368,7 +1391,7 @@ func (c *Checker) admit(p *Policy, sql string, q sqlparse.Query, who subject) se
 		// A session that can't explain the statement here passes no Run, and it is judged without a plan.
 		if q.Explainable && e.Run != nil && (p.costRules || (s != nil && p.needsCost)) {
 			fingerprint = sqlparse.Fingerprint(sql)
-			pl, rej, ok := c.plan(p, sql, fingerprint, who, warn, e)
+			pl, rej, ok := c.plan(p, sql, q.Plan, fingerprint, who, warn, e)
 			switch {
 			case rej != nil:
 				return session.Admission{Reject: rej}
@@ -1507,8 +1530,9 @@ func (c *Checker) refuse(err error, who subject, rule string, rej *pgproto3.Erro
 	return session.Admission{Reject: rej}
 }
 
-// plan gets sql's plan, cached or explained by the session, and judges it by the cost rules; ok is false when Postgres refused sql.
-func (c *Checker) plan(p *Policy, sql, fingerprint string, who subject, warn bool, e session.Explain) (_ plan.Plan, rej *pgproto3.ErrorResponse, ok bool) {
+// plan gets sql's plan, of its statement text, cached or explained by the session, and judges it by the cost rules; ok is false
+// when Postgres refused sql.
+func (c *Checker) plan(p *Policy, sql, text, fingerprint string, who subject, warn bool, e session.Explain) (_ plan.Plan, rej *pgproto3.ErrorResponse, ok bool) {
 	// A generic plan holds for any values.
 	key := c.statementKey(fingerprint) + "\x00" + strconv.FormatBool(e.Generic)
 	if !e.Generic && p.enforcesCost(who, warn) {
@@ -1517,7 +1541,7 @@ func (c *Checker) plan(p *Policy, sql, fingerprint string, who subject, warn boo
 		key += "\x00" + string(h[:]) + e.Values
 	}
 	explain := func() (plan.Plan, error) {
-		out, err := e.Run()
+		out, err := e.Run(text)
 		if err != nil {
 			return plan.Plan{}, err
 		}
@@ -1666,27 +1690,48 @@ func (c *Checker) CheckStartup(settings iter.Seq2[string, string]) *pgproto3.Err
 	p := c.policy()
 	who := subject{role: c.role, tenant: c.role, client: c.Env.Client, trusted: p.trusted(c.role)}
 	warn := p.cfg.Tenants[c.role].Mode == Warn
-	all := maps.Collect(settings)
-	who.app = all["application_name"]
-	if d, ok := pgDuration(all["statement_timeout"]); ok {
-		c.clientTimeout = d
+	for name, value := range settings {
+		switch name {
+		case "application_name":
+			who.app = value
+		case "statement_timeout":
+			if d, ok := pgDuration(value); ok {
+				c.clientTimeout = d
+			}
+		case "role", "session_authorization":
+			c.changedRole()
+		}
 	}
-	for name, value := range all {
-		if name != "search_path" {
+	// Postgres matches names in any case and applies the last value, which the packet's order decides; each value is judged.
+	for name, value := range settings {
+		var q sqlparse.Query
+		switch name {
+		case "search_path":
+			q.Schemas = sqlparse.SearchPath(value)
+		case "role", "session_authorization":
+			q.Writes, q.ChangesRole = true, true
+		case "default_transaction_read_only", "transaction_read_only":
+			q.Writes = !pgTrue(value)
+		default:
 			continue
 		}
-		q := sqlparse.Query{Schemas: sqlparse.SearchPath(value)}
 		blocked := c.judge(p, who, warn, "login", func(r Rule) bool {
 			f := checks[r.Check].violatedBy
 			return f != nil && f(q, r)
-		}, func() []any { return []any{"search_path", value} })
+		}, func() []any { return []any{name, value} })
 		if blocked != nil {
-			e := rejection("42501", "queryguard: rule "+blocked.Check+" blocks this search_path", "", checks[blocked.Check].hint)
+			e := rejection("42501", "queryguard: rule "+blocked.Check+" blocks this "+name, "", checks[blocked.Check].hint)
 			e.Severity, e.SeverityUnlocalized = "FATAL", "FATAL"
 			return e
 		}
 	}
 	return nil
+}
+
+// pgTrue reports whether Postgres reads v as true, as parse_bool does, accepting any unique prefix.
+func pgTrue(v string) bool {
+	v = strings.ToLower(strings.TrimSpace(v))
+	return v != "" && (strings.HasPrefix("true", v) || strings.HasPrefix("yes", v) || v == "on" || v == "1")
 }
 
 // judge logs every rule matching who that violated reports, with what describe returns, and returns the first that blocks, or nil.

@@ -19,7 +19,7 @@ func TestAnalyze(t *testing.T) {
 		{"commit", Query{TransactionControl: true}},
 		{"rollback to savepoint a", Query{TransactionControl: true}},
 		{"begin; savepoint a", Query{TransactionControl: true}},
-		{"select 1; commit", Query{}},
+		{"select 1; commit", Query{Explainable: true}},
 		{"set statement_timeout = '5s'", Query{ChangesTimeout: true}},
 		{"set local statement_timeout to 0", Query{ChangesTimeout: true}},
 		{"reset statement_timeout", Query{ChangesTimeout: true}},
@@ -40,7 +40,7 @@ func TestAnalyze(t *testing.T) {
 		{"delete from orders using customers", Query{ChangesEveryRow: true, Explainable: true}},
 		{"select 1; delete from orders", Query{ChangesEveryRow: true}},
 		{"with gone as (delete from orders returning id) select count(*) from gone", Query{ChangesEveryRow: true, Explainable: true}},
-		{"explain analyze delete from orders", Query{ChangesEveryRow: true}},
+		{"explain analyze delete from orders", Query{ChangesEveryRow: true, Explainable: true}},
 		{"prepare wipe as delete from orders", Query{ChangesEveryRow: true}},
 		{"create table notes (id int)", Query{DDL: true}},
 		{"create temp table scratch (id int)", Query{DDL: true}},
@@ -48,7 +48,7 @@ func TestAnalyze(t *testing.T) {
 		{"drop table orders", Query{DDL: true}},
 		{"grant select on orders to reporting", Query{DDL: true}},
 		{"select * into orders_copy from orders", Query{DDL: true, Explainable: true}},
-		{"explain analyze create table orders_copy as select * from orders", Query{DDL: true}},
+		{"explain analyze create table orders_copy as select * from orders", Query{DDL: true, Explainable: true}},
 		{"create index on orders (customer_id)", Query{DDL: true, BlockingIndexChange: true}},
 		{"create index concurrently on orders (customer_id)", Query{DDL: true}},
 		// ON ONLY builds nothing; it is the first step of indexing a partitioned table without blocking writes.
@@ -71,7 +71,7 @@ func TestAnalyze(t *testing.T) {
 		{"declare c cursor for select * from orders", Query{Explainable: true, Cursor: true}},
 		{"create table orders_copy as select * from orders", Query{DDL: true, Explainable: true}},
 		// EXECUTE runs a statement prepared earlier in the session, so its text says nothing about its plan.
-		{"execute wipe(1)", Query{Named: true}},
+		{"execute wipe(1)", Query{Named: true, Explainable: true}},
 		{"select 1;", Query{Explainable: true}},
 		{"select * from billing.invoices join public.orders using (id)", Query{Schemas: []string{"billing", "public"}, Explainable: true}},
 		{"select * from public.orders o join public.customers c on c.id = o.customer_id", Query{Schemas: []string{"public"}, Explainable: true}},
@@ -103,8 +103,8 @@ func TestAnalyze(t *testing.T) {
 			t.Errorf("Analyze(%q): %v", tc.sql, err)
 			continue
 		}
-		// The functions called and whether it only reads or may write have tests of their own.
-		got.Functions, got.ReadOnly, got.Writes = nil, false, false
+		// The functions called, whether it only reads or may write, and what is planned have tests of their own.
+		got.Functions, got.ReadOnly, got.Writes, got.Plan, got.Unplanned = nil, false, false, "", false
 		if !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("Analyze(%q) = %+v; want %+v", tc.sql, got, tc.want)
 		}
@@ -324,6 +324,34 @@ func TestAnalyzeKnowsWhichStatementsRunOneNamedElsewhere(t *testing.T) {
 	}
 }
 
+func TestAnalyzeFindsTheStatementToPlan(t *testing.T) {
+	for sql, want := range map[string]struct {
+		plan      string
+		unplanned bool
+	}{
+		"select * from orders":                              {plan: "select * from orders"},
+		"begin read only; select * from orders; commit":     {plan: "select * from orders"},
+		"explain analyze select * from orders":              {plan: "SELECT * FROM orders"},
+		"copy (select id from orders) to stdout":            {plan: "SELECT id FROM orders"},
+		"copy shop.orders (id, total) to stdout":            {plan: "SELECT * FROM shop.orders"},
+		"execute q(1)":                                      {plan: "execute q(1)"},
+		"select 1; select count(*) from orders a, orders b": {unplanned: true},
+		"set search_path = app; select * from orders":       {unplanned: true},
+		"explain select * from orders":                      {},
+		"copy orders from stdin":                            {},
+		"show work_mem":                                     {},
+		"begin":                                             {},
+	} {
+		q, err := Analyze(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if q.Plan != want.plan || q.Unplanned != want.unplanned {
+			t.Errorf("Analyze(%q) plans %q, unplanned %v; want %q, %v", sql, q.Plan, q.Unplanned, want.plan, want.unplanned)
+		}
+	}
+}
+
 func TestAnalyzeKnowsWhatMayWrite(t *testing.T) {
 	for sql, want := range map[string]bool{
 		"select * from orders":                            false,
@@ -344,7 +372,7 @@ func TestAnalyzeKnowsWhatMayWrite(t *testing.T) {
 		"prepare q as select * from orders where id = $1": false,
 		"execute q(1)":                                    false,
 		"deallocate q":                                    false,
-		"discard all":                                     false,
+		"discard plans":                                   false,
 		"copy orders to stdout":                           false,
 		"copy (select 1) to stdout":                       false,
 		"insert into orders values (1)":                   true,
@@ -376,6 +404,8 @@ func TestAnalyzeKnowsWhatMayWrite(t *testing.T) {
 		"select set_config('default_transaction_read_only', 'off', false)":   true,
 		"select pg_catalog.set_config('transaction_read_only', 'off', true)": true,
 		"select nextval('orders_id_seq')":                                    true,
+		"select pg_notify('jobs', 'run')":                                    true,
+		"discard all":                                                        true,
 		"select setval('orders_id_seq', 1)":                                  true,
 		"do $$ begin delete from orders; end $$":                             true,
 		"call cleanup()":                                                     true,

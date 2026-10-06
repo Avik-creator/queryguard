@@ -36,6 +36,8 @@ RESET default_transaction_read_only;
 -- reject read_only
 RESET ALL;
 -- reject read_only
+discard all;
+-- reject read_only
 select set_config('default_transaction_read_only', 'off', false);
 -- reject read_only
 select pg_catalog.set_config('transaction_read_only', 'off', true);
@@ -111,6 +113,14 @@ select lo_export(1234, '/tmp/x');
 select * from dblink_exec('dbname=queryguard', 'drop table orders');
 -- reject deny_functions
 select query_to_xml('delete from orders returning id', true, false, '');
+-- reject deny_functions
+select * from ts_stat('select to_tsvector(email) from secret.users');
+-- reject deny_functions
+select ts_rewrite('a'::tsquery, 'select ''a''::tsquery, ''b''::tsquery from secret.users');
+-- reject deny_functions
+select table_to_xml('secret.users', true, false, '');
+-- reject deny_functions
+select database_to_xml(true, false, '');
 
 -- Ending other sessions or the server's work.
 -- reject deny_functions
@@ -125,6 +135,8 @@ checkpoint;
 vacuum full orders;
 -- reject read_only
 notify jobs, 'run';
+-- reject read_only
+select pg_notify('jobs', 'run');
 -- reject read_only
 load 'auto_explain';
 

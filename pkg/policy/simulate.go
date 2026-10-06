@@ -10,6 +10,7 @@ import (
 
 	"github.com/Avik-creator/queryguard/pkg/sched"
 	"github.com/Avik-creator/queryguard/pkg/session"
+	"github.com/Avik-creator/queryguard/pkg/sqlparse"
 	"github.com/Avik-creator/queryguard/pkg/stats"
 )
 
@@ -100,8 +101,8 @@ func Simulate(p *Policy, list *Allowlist, records []stats.Record) Simulation {
 				r.Examples = append(r.Examples, rec.Query)
 			}
 			refused = true
-		} else if !rec.NotRun {
-			// Rules go by the tenant the new config names, so budgets do too.
+		} else if q, err := sqlparse.Analyze(rec.Query); !rec.NotRun && (err != nil || !q.TransactionControl) {
+			// Rules go by the tenant the new config names, so budgets do too; transaction control is never charged.
 			rec.Tenant = p.TenantOf(rec.Role, rec.Query)
 			refused = sim.spend(p, buckets, rec)
 		}
