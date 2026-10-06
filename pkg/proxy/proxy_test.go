@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -839,6 +840,34 @@ func TestCapacityBudgetsFollowTheMeasuredCapacity(t *testing.T) {
 	// A second's worth is saved up, so spending 60000 owes 40000: two seconds.
 	if d := retryAfterSpending(s, "reporting", 60000); d < 1900*time.Millisecond || d > 2100*time.Millisecond {
 		t.Errorf("owes for %v; want about 2s at 20000 units a second", d)
+	}
+}
+
+func TestCapacityDoesNotUndoAPolicyLoadedWhileItMeasured(t *testing.T) {
+	s := newServer(t, startFakePostgres(t).addr)
+	s.SetPolicy(mustPolicy(t, `{"scheduler": {"max_active": 4}, "tenant_defaults": {"budget": {"capacity": 0.5, "when_over": "reject"}}}`))
+	for range 10 {
+		s.History.Ran("", "s", plan.Plan{Cost: 1000, Shape: 1}, 100*time.Millisecond, true, plan.Tuning{})
+	}
+
+	// Holding mu stops applyCapacity after it read the old policy, where a reload may slip in, as SetPolicy does under mu.
+	s.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		s.applyCapacity()
+		close(done)
+	}()
+	for s.capacity.Load() == 0 {
+		runtime.Gosched()
+	}
+	reloaded := mustPolicy(t, `{"scheduler": {"max_active": 4}}`)
+	s.sched.Configure(s.schedConfig(reloaded))
+	s.policies.Store(reloaded)
+	s.mu.Unlock()
+	<-done
+
+	if d := retryAfterSpending(s, "reporting", 1e9); d != 0 {
+		t.Errorf("owes for %v; want no budget, as the reloaded policy has none", d)
 	}
 }
 
