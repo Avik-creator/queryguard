@@ -355,11 +355,12 @@ func (h *History) factor(sh *shape, t Tuning) float64 {
 }
 
 // server returns the server's mean ln(seconds ÷ cost), each tenant's weighing by its runs up to tenantRuns, so one busy tenant
-// can't drag every other tenant's costs and charges toward its own; false before any run; the caller holds mu.
+// can't drag every other tenant's costs and charges toward its own, times its mean cost, so a cheap statement's long wait counts
+// for little across tenants too; false before any run; the caller holds mu.
 func (h *History) server() (float64, bool) {
 	var sum, weight float64
 	for _, g := range h.tenants {
-		w := float64(min(g.runs, tenantRuns))
+		w := float64(min(g.runs, tenantRuns)) * g.cost
 		sum += w * g.logRatio / g.cost
 		weight += w
 	}

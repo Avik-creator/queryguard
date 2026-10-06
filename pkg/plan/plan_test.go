@@ -310,6 +310,20 @@ func TestHistoryServerTimingWeighsRunsByCost(t *testing.T) {
 	}
 }
 
+func TestHistoryServerTimingWeighsTenantsByCost(t *testing.T) {
+	var h History
+	full := Plan{Cost: 169_000, Shape: 1}
+	for range 6 {
+		h.Ran("rogue", "full", full, time.Second, true, Tuning{})
+	}
+	// Another tenant's lookup waits once on a busy server; it says little about how fast the server works through cost units.
+	h.Ran("innocent", "lookup", Plan{Cost: 4.45, Shape: 2}, 135*time.Millisecond, true, Tuning{})
+
+	if c, _ := h.CostOf(time.Second); c < 169_000/1.5 {
+		t.Errorf("CostOf(1s) = %.0f after one cheap statement's long wait; want about 169000", c)
+	}
+}
+
 func TestHistoryCostOfTime(t *testing.T) {
 	var h History
 	if c, ok := h.CostOf(time.Second); ok {
