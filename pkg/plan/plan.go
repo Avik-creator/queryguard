@@ -39,13 +39,12 @@ const (
 	globalWindow = 1000             // runs a tenant's timing is averaged over
 	// tenantRuns is how many runs a tenant's timing needs to count fully in the server's; past it, no tenant counts more than another.
 	tenantRuns = 100
-	// tenantCost is the mean plan cost at which a tenant's runs count fully in the server's timing: a cheap statement's time is
-	// mostly waiting and the round trip, but a costlier one's counts no more, so one plan of huge cost can't set it for all.
-	tenantCost = 1000
-	maxTenants = 1000 // tenants whose timing is kept; the one least recently run goes first
-	maxFactor  = 100  // the most a statement's timing moves its cost either way
-	maxShapes  = 8    // plans remembered for each statement
-	slowRatio  = 10   // a run this many times slower than its plan's usual timing is flagged
+	// disabledCost is what PostgreSQL before 18 adds to a plan that must use a disabled plan type; such a cost says nothing of time.
+	disabledCost = 1e10
+	maxTenants   = 1000 // tenants whose timing is kept; the one least recently run goes first
+	maxFactor    = 100  // the most a statement's timing moves its cost either way
+	maxShapes    = 8    // plans remembered for each statement
+	slowRatio    = 10   // a run this many times slower than its plan's usual timing is flagged
 	// slowFloor is the shortest run flagged as slow: under load a quick statement now and then takes tens of milliseconds.
 	slowFloor = 100 * time.Millisecond
 	// learnFloor is the shortest run costs are learned from: a quicker one is mostly the round trip and the work every
@@ -341,7 +340,9 @@ func (h *History) Ran(tenant, key string, p Plan, took time.Duration, finished b
 	if took >= learnFloor {
 		sh.costSamples++
 		sh.costRatio += (ratio - sh.costRatio) / float64(min(sh.costSamples, planWindow))
-		h.tenant(tenant).add(ratio, max(p.Cost, 1))
+		if p.Cost < disabledCost {
+			h.tenant(tenant).add(ratio, max(p.Cost, 1))
+		}
 	}
 	return turnedSlow
 }
@@ -358,12 +359,12 @@ func (h *History) factor(sh *shape, t Tuning) float64 {
 }
 
 // server returns the server's mean ln(seconds ÷ cost), each tenant's weighing by its runs up to tenantRuns, so one busy tenant
-// can't drag every other tenant's costs and charges toward its own, times its mean cost over tenantCost up to 1, so a cheap
-// statement's long wait counts for little across tenants too; false before any run; the caller holds mu.
+// can't drag every other tenant's costs and charges toward its own, times its mean cost, so a cheap statement's long wait counts
+// for little across tenants too; false before any run; the caller holds mu.
 func (h *History) server() (float64, bool) {
 	var sum, weight float64
 	for _, g := range h.tenants {
-		w := float64(min(g.runs, tenantRuns)) * min(g.cost, tenantCost)
+		w := float64(min(g.runs, tenantRuns)) * g.cost
 		sum += w * g.logRatio / g.cost
 		weight += w
 	}

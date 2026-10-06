@@ -324,6 +324,23 @@ func TestHistoryServerTimingWeighsTenantsByCost(t *testing.T) {
 	}
 }
 
+func TestHistoryServerTimingFollowsCostlyScansOverManyWaitingLookups(t *testing.T) {
+	var h History
+	for range 6 {
+		h.Ran("rogue", "full", Plan{Cost: 169_000, Shape: 1}, time.Second, true, Tuning{})
+	}
+	// Next to the rogue, every innocent tenant's lookups wait their turn.
+	for _, tenant := range []string{"a", "b", "c", "d"} {
+		for range 100 {
+			h.Ran(tenant, "lookup", Plan{Cost: 4.45, Shape: 2}, 10*time.Millisecond, true, Tuning{})
+		}
+	}
+
+	if c, _ := h.CostOf(time.Second); c < 169_000/1.5 {
+		t.Errorf("CostOf(1s) = %.0f after many waiting lookups; want about 169000", c)
+	}
+}
+
 func TestHistoryServerTimingOutlastsOnePlanOfHugeCost(t *testing.T) {
 	var h History
 	for range 100 {

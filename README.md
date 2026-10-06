@@ -676,10 +676,11 @@ QueryGuard averages the time per cost unit over its last 50 or so runs of
 unit over the server's. Each tenant's runs are averaged in log terms and
 weighted by cost, so a cheap statement that waited long on a lock barely
 moves it. The server's is the mean of the tenants' averages, each counting
-for its runs up to 100, times its mean cost up to 1000 units, so one busy
-tenant whose statements run slow, on its own locks say, can't move every
-other tenant's costs and charges toward its own, and nor can one plan of
-huge cost. A quicker run is mostly the round trip and the work every
+for its runs up to 100, times its mean cost, so one busy tenant whose
+statements run slow, on its own locks say, can't move every other tenant's
+costs and charges toward its own. A plan that must use a disabled plan type,
+which PostgreSQL before 18 costs at 10 billion units more, is left out of the
+server's average. A quicker run is mostly the round trip and the work every
 statement does, and would make long plans look cheap next to it;
 `min_charge` covers it instead. A plan seen only a
 few times leans on the server's average instead: its own timing counts for
