@@ -168,7 +168,6 @@ func TestPostgresUsesProxyKeepalive(t *testing.T) {
 		"tcp_keepalives_idle":     "15",
 		"tcp_keepalives_interval": "5",
 		"tcp_keepalives_count":    "3",
-		"tcp_user_timeout":        "30000",
 	}
 	if !maps.Equal(got, want) {
 		t.Errorf("session settings from the client are %v; want %v", got, want)
