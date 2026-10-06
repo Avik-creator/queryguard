@@ -8,7 +8,7 @@ PG ?= 18
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build test compat overhead rogue vet up down reset certs clean
+.PHONY: help build test compat overhead rogue bench vet up down reset certs clean
 
 help: ## List the available targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-8s %s\n", $$1, $$2}'
@@ -27,6 +27,13 @@ overhead: ## Measure p50/p99 query latency with and without the proxy (PG as for
 
 rogue: ## Measure innocent tenants' latency next to a rogue tenant, with and without the proxy (PG as for compat)
 	QG_ROGUE=1 QG_TEST_UPSTREAM=127.0.0.1:54$(PG) go test -run TestRogueTenant -count 1 -v -timeout 10m ./test/compat/
+
+bench: ## Run overhead and rogue on PG 16, 17 and 18, three runs each, into bench/ (takes about 40 minutes)
+	mkdir -p bench
+	for pg in 16 17 18; do for run in 1 2 3; do \
+		$(MAKE) --no-print-directory overhead PG=$$pg | tee bench/overhead-pg$$pg-$$run.txt; \
+		$(MAKE) --no-print-directory rogue PG=$$pg | tee bench/rogue-pg$$pg-$$run.txt; \
+	done; done
 
 vet: ## Run go vet
 	go vet ./...

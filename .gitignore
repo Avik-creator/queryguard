@@ -16,3 +16,6 @@ coverage.html
 
 # Local TLS certificates from make certs
 /certs/
+
+# Benchmark output from make bench
+/bench/
