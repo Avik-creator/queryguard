@@ -795,3 +795,81 @@ func (b *lockedBuffer) String() string {
 	defer b.mu.Unlock()
 	return b.buf.String()
 }
+
+func TestRepackTakesTheUncheckedPathOnPG19(t *testing.T) {
+	direct := connectTo(t, os.Getenv("QG_TEST_UPSTREAM"), "sslmode=disable")
+	requirePG19(t, direct)
+	name := fmt.Sprintf("qg_repack_%d", time.Now().UnixNano())
+	mustExec(t, direct, "create table "+name+" (id int primary key)")
+	t.Cleanup(func() { direct.Exec(context.Background(), "drop table "+name) })
+
+	// The parser doesn't read PG19's REPACK yet, so the unchecked setting decides, even under deny_ddl.
+	for unchecked, wantRun := range map[string]bool{"reject": false, "allow": true} {
+		conn := startPolicyProxy(t, `{"unchecked": "`+unchecked+`", "rules": [{"check": "deny_ddl"}]}`).connect(t, "sslmode=disable")
+		for _, sql := range []string{"repack " + name, "repack (concurrently) " + name} {
+			_, err := conn.Exec(t.Context(), sql)
+			switch {
+			case wantRun && err != nil:
+				t.Errorf("unchecked %s: %s: %v", unchecked, sql, err)
+			case !wantRun && (sqlState(err) != "42501" || !strings.Contains(err.Error(), "could not be checked")):
+				t.Errorf("unchecked %s: %s: got %v; want 42501, could not be checked", unchecked, sql, err)
+			}
+			expectSelectOne(t, conn)
+		}
+	}
+}
+
+func TestMonitorCountsFinishedLockWaitsOnPG19(t *testing.T) {
+	upstream := os.Getenv("QG_TEST_UPSTREAM")
+	locker, waiter := connectTo(t, upstream, "sslmode=disable"), connectTo(t, upstream, "sslmode=disable")
+	requirePG19(t, locker)
+	name := fmt.Sprintf("qg_lockstat_%d", time.Now().UnixNano())
+	mustExec(t, locker, "create table "+name+" (id int)")
+	t.Cleanup(func() { locker.Exec(context.Background(), "drop table "+name) })
+
+	m := &plan.Monitor{DSN: catalogDSN(t) + " dbname=queryguard", Interval: 100 * time.Millisecond}
+	ctx, stop := context.WithCancel(t.Context())
+	defer stop()
+	finished := make(chan float64, 100)
+	go m.Run(ctx, func(a plan.Activity) {
+		if a.FinishedWaits > 0 {
+			select {
+			case finished <- a.FinishedWaits:
+			default:
+			}
+		}
+	})
+
+	// pg_stat_lock counts only waits that outlast deadlock_timeout, 1s by default.
+	mustExec(t, locker, "begin")
+	mustExec(t, locker, "lock table "+name+" in access exclusive mode")
+	waited := make(chan error, 1)
+	go func() {
+		_, err := waiter.Exec(context.Background(), "select * from "+name)
+		waited <- err
+	}()
+	time.Sleep(1500 * time.Millisecond)
+	mustExec(t, locker, "rollback")
+	if err := <-waited; err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-finished:
+		t.Logf("finished lock waits: %.1f sessions on average", got)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the monitor saw no finished lock wait in 10s")
+	}
+}
+
+// requirePG19 skips the test unless conn's server is PostgreSQL 19 or later.
+func requirePG19(t testing.TB, conn *pgx.Conn) {
+	t.Helper()
+	var version int
+	if err := conn.QueryRow(t.Context(), "select current_setting('server_version_num')::int").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version < 190000 {
+		t.Skipf("needs PostgreSQL 19, the server is %d", version)
+	}
+}
