@@ -37,6 +37,16 @@ jobs:
       - run: make vet
       - run: make test
 
+  image:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the image and run it
+        run: |
+          docker build --build-arg VERSION=${{ github.sha }} -t queryguard .
+          docker run --rm queryguard -version
+
   postgres:
     name: Postgres ${{ matrix.pg }}
     runs-on: ubuntu-latest
