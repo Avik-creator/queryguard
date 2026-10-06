@@ -5,6 +5,11 @@ speaks the Postgres wire protocol. It estimates what each query will cost before
 it runs and gives every tenant a budget, so one tenant's expensive queries can't
 starve everyone else.
 
+[![QueryGuard in 15 seconds: a rogue tenant's full scan stalls everyone, QueryGuard prices it, and the benchmark's numbers](docs/queryguard.gif)](docs/queryguard.mp4)
+
+*QueryGuard in 15 seconds. The numbers are from `make bench`, below. Select
+the preview for the [MP4 with sound](docs/queryguard.mp4).*
+
 > **Status:** heading for v1.0. QueryGuard relays sessions, cancel requests
 > and TLS; blocks statements by rule or by their planned cost; gives each
 > tenant a cost budget, a fair share of the server and time limits; learns
